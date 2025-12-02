@@ -85,9 +85,6 @@ B_SPLINE_0 = np.array([[1]]).T
 def bspline_basis(t: float, der: int = 0):
     assert der in {0, 1, 2, 3}, "Derivate must be 0, 1, 2 or 3"
 
-    if t < 0 or t > 1:
-        return np.zeros(4)
-
     if der == 0:
         T = np.array([t**3, t**2, t, 1])
 
