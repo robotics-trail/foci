@@ -19,17 +19,16 @@ def test_visualizer():
         obstacle_positions=obstacle_means,
         obstacle_covs=obstacle_covs,
         robot_cov=robot_cov,
-        num_control_points=8,
-        num_samples=15,
-        weights={"jerk": 0.01, "goal": 20.0, "obstacle": 0.0},
-        wmax=5.0,
-        vmax=0.5,
-        amax=2.0,
+        num_control_points=12,
+        num_samples=25,
+        weights={"jerk": 0.01, "goal": 40.0, "obstacle": 0.0},
+        wmax=3.0,
+        vmax=3.0,
+        amax=5.0,
     )
 
     theta_start = np.zeros(planner.n_joints)
-    # ee_goal = np.array([0.4, 0.2, 0.6])
-    ee_goal = np.array([0.3, 0.3, 1.0])
+    ee_goal = np.array([0.4, 0.2, 0.6])
 
     curve = planner.plan(theta_start, ee_goal)
 

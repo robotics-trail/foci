@@ -73,7 +73,7 @@ class Planner:
         params_val = np.concatenate((theta_start, ee_goal))
         res = self.solver(x0=init_guess, lbg=self.lbg, ubg=self.ubg, p=params_val)
 
-        print(res)
+        # print(res)
 
         control_points_opt = np.array(res["x"]).reshape(
             self.num_control_points, self.n_joints
