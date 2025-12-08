@@ -1,5 +1,4 @@
 import numpy as np
-import casadi as cas
 
 from .basis import bspline_basis
 

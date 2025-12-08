@@ -54,7 +54,7 @@ def create_solver(
     dddcurve = (m_t_to_s**3) * bspline.spline_eval(num_samples, der=3)
 
     # --- Kinematics ---
-    q_sym = cas.MX.sym("q", n_joints)
+    q_sym = SYM_TYPE.sym("q", n_joints)
     fk_function = cas.Function("fk", [q_sym], [robot.forward_kinematics(q_sym)])
 
     kinematics_functor = fk_function.map(num_samples, "openmp")
@@ -87,7 +87,7 @@ def create_solver(
         n_joints,
         vel_hulls,
         acc_hulls,
-        start_limit=0.05,
+        start_limit=0.01,
         vel_limit=wmax**2,
         acc_limit=amax**2,
     )
@@ -116,7 +116,7 @@ def create_solver(
     ipopt_options = {
         "ipopt.print_level": 5,
         "ipopt.max_iter": 500,
-        "ipopt.tol": 1e-2,
+        "ipopt.tol": 1e-1,
         "print_time": 0,
         "ipopt.acceptable_tol": 1e-1,
         "ipopt.acceptable_obj_change_tol": 1e-1,

@@ -8,18 +8,16 @@ from .basis import MINVO_3, MINVO_2, MINVO_1, MINVO_0
 def _diff(V):
     V_type = type(V).__name__
 
-    # Compatible with casadi
     if V_type == "MX":
         result = cas.MX.zeros(V.shape[0] - 1, V.shape[1])
 
-        for i in range(V.shape[0] - 1):
-            result[i] = V[i + 1] - V[i]
-
-        return result
-
-    # Compatible with numpy
     else:
-        return V[1:] - V[:-1]
+        result = np.zeros((V.shape[0] - 1, V.shape[1]))
+
+    for i in range(V.shape[0] - 1):
+        result[i, :] = V[i + 1, :] - V[i, :]
+
+    return result
 
 
 def minvo_hulls(control_points, derivative=0):
@@ -34,7 +32,7 @@ def minvo_hulls(control_points, derivative=0):
     hulls = []
 
     if derivative == 0:
-        for i in range(V.shape[0] - 3):
+        for i in range(control_points.shape[0] - 3):
             hull = np.linalg.inv(MINVO_3) @ BSPLINE_3 @ V[i : i + 4, :]
             hulls.append(hull)
 
