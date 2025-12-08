@@ -73,12 +73,11 @@ class Planner:
         params_val = np.concatenate((theta_start, ee_goal))
         res = self.solver(x0=init_guess, lbg=self.lbg, ubg=self.ubg, p=params_val)
 
-        # print(res)
+        print(res)
 
-        control_points_opt = np.array(res["x"]).reshape(
-            self.num_control_points, self.n_joints
+        control_points_opt = (
+            np.array(res["x"]).reshape(self.n_joints, self.num_control_points).T
         )
-
         bspline = BSpline(control_points_opt)
         opt_curve = bspline.spline_eval(self.num_samples)
 

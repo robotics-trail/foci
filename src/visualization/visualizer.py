@@ -55,18 +55,70 @@ class Visualizer:
                 else:
                     break
 
-    def visualize_goal(self, goal: np.ndarray, radius: float = 0.03):
+    def visualize_goal(
+        self, goal: np.ndarray, radius: float = 0.05, color: tuple = (0, 0, 255)
+    ):
         self.server.scene.add_icosphere(
-            name="Goal", position=goal, radius=radius, color=[1, 0, 0]
+            name="Goal", position=goal, radius=radius, color=color
         )
 
     def visualize_obstacles(
-        self, means: np.ndarray, covariances: np.ndarray, radius: float = 1.0
+        self,
+        means: np.ndarray,
+        covariances: np.ndarray,
+        n_std: float = 2.0,
+        color: tuple = (255, 100, 100),
+        opacity: float = 0.6,
     ):
-        for mean in means:
-            self.server.scene.add_icosphere(
-                name="", position=mean, radius=radius, color=[1, 0, 0]
+        for i, (mean, cov) in enumerate(zip(means, covariances)):
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            radii = n_std * np.sqrt(np.abs(eigvals))
+
+            rotation_matrix = eigvecs
+
+            if np.linalg.det(rotation_matrix) < 0:
+                rotation_matrix[:, 0] *= -1
+
+            rotation = R.from_matrix(rotation_matrix)
+
+            quat_xyzw = rotation.as_quat()
+            quat_wxyz = np.array(
+                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
             )
+
+            self.server.scene.add_mesh_simple(
+                name=f"Obstacle_{i}",
+                vertices=self._create_ellipsoid_mesh(radii),
+                faces=self._create_ellipsoid_faces(),
+                position=mean,
+                wxyz=quat_wxyz,
+                color=color,
+                opacity=opacity,
+            )
+
+    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
+        u = np.linspace(0, 2 * np.pi, resolution)
+        v = np.linspace(0, np.pi, resolution)
+
+        u_grid, v_grid = np.meshgrid(u, v)
+
+        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
+        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
+        z = radii[2] * np.cos(v_grid)
+
+        vertices = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+        return vertices
+
+    def _create_ellipsoid_faces(self, resolution: int = 20):
+        faces = []
+
+        for i in range(resolution - 1):
+            for j in range(resolution - 1):
+                idx = i * resolution + j
+                faces.append([idx, idx + resolution, idx + 1])
+                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
+
+        return np.array(faces, dtype=np.uint32)
 
     def get_positions(self, curve: np.ndarray):
         num_samples, n_joints = curve.shape
