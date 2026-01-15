@@ -3,6 +3,9 @@
 *.npy
 *.csv
 
+# .ply 3D GS
+data/
+
 # vs code
 .vscode/
 
