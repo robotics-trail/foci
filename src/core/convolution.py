@@ -3,7 +3,7 @@ from casadi import *
 import numpy as np
 
 wp.init()
-wp.set_device("cpu")
+wp.set_device("cuda:0")
 
 # Integral over Gaussians https://arxiv.org/pdf/1811.04751v1
 # https://web.ist.utl.pt/susanavinga/renyi/convolution_normal.pdf

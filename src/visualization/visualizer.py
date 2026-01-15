@@ -148,6 +148,17 @@ class Visualizer:
 
         return midpoints
 
+    def add_gaussians(self, means, covs, color = [0,1,0], opacity = 1.0):
+        if  len(color) == 3:
+            color = self.z_colormap(means)
+        if type(opacity) == float:
+            opacity = np.tile(opacity, (len(means), 1))
+
+        means = np.ascontiguousarray(means)
+        
+        print(f"means: {means.shape}, covs: {covs.shape}, color: {color.shape}, opacity: {opacity.shape}")
+        self.server.add_gaussian_splats("Scene Splat", means, covs, color, opacity, visible=True)
+        
     # @staticmethod
     # def covariance_to_ellipsoid(mean, cov, color=[1, 0, 0], scale=1.0):
     #     eigvals, eigvecs = np.linalg.eigh(cov)
