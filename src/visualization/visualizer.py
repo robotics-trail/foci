@@ -69,6 +69,7 @@ class Visualizer:
         n_std: float = 2.0,
         color: tuple = (255, 100, 100),
         opacity: float = 0.6,
+        name="Obstacle",
     ):
         for i, (mean, cov) in enumerate(zip(means, covariances)):
             eigvals, eigvecs = np.linalg.eigh(cov)
@@ -87,7 +88,7 @@ class Visualizer:
             )
 
             self.server.scene.add_mesh_simple(
-                name=f"Obstacle_{i}",
+                name=f"{name}_{i}",
                 vertices=self._create_ellipsoid_mesh(radii),
                 faces=self._create_ellipsoid_faces(),
                 position=mean,
