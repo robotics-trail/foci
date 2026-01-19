@@ -2,9 +2,7 @@
 *.pyc
 *.npy
 *.csv
-
-# .ply 3D GS
-data/
+*.ply
 
 # vs code
 .vscode/
