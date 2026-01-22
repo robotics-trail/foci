@@ -11,8 +11,17 @@ def coffe_table_demo(ply_file: str, urdf_path: str, ee_goal: np.ndarray, scale_f
     
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
     
+    altura_min = obstacle_means[:, 2].min()
+    altura_max = obstacle_means[:, 2].max()
+    altura_total = altura_max - altura_min
+    
+       
     obstacle_means += translation
+    obstacle_means *= scale_factor
     obstacle_covs = obstacle_covs * scale_factor**2
+    
+    
+    
     robot_cov = np.eye(3) * 0.2**2
 
     planner = Planner(
@@ -37,21 +46,24 @@ def coffe_table_demo(ply_file: str, urdf_path: str, ee_goal: np.ndarray, scale_f
     theta_start = np.zeros(planner.n_joints)
     curve = planner.plan(theta_start, ee_goal)
 
-    subset = np.random.choice(len(obstacle_means), size=int(len(obstacle_means)*subsample_rate), replace=False)
-    means = obstacle_means[subset]
-    covs = obstacle_covs[subset]
-    colors = colors[subset]
-    opacities = opacities[subset]
+   # subset = np.random.choice(len(obstacle_means), size=int(len(obstacle_means)*subsample_rate), replace=False)
+   # means = obstacle_means[subset]
+   # covs = obstacle_covs[subset]
+   # colors = colors[subset]
+   # opacities = opacities[subset]
+   
+    print(f"Altura min: {altura_min}, Altura max: {altura_max}, Altura total: {altura_total}")
+        
 
     vis = Visualizer(planner.robot, robot_cov, curve)
     vis.visualize_goal(ee_goal, radius=0.05)
-    vis.add_gaussians(means, covs, color = colors)
-    vis.visualize_trajectory()
+    vis.add_gaussians(obstacle_means, obstacle_covs, color = colors)
+    vis.visualize_trajectory(save_recording=True, recording_path="videos/coffee_table.viser")
 
 if __name__ == "__main__":
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     ply_file = os.path.join(PROJECT_ROOT, "data", "Coffee_Table.ply")
 
-    urdf_path = "urdfs/ur5_extended.urdf"
+    urdf_path = "urdfs/ur5.urdf"
 
-    coffe_table_demo(ply_file, urdf_path, ee_goal = np.array([1.35, 1.25, 1.0]), scale_factor=0.05, subsample_rate=0.1, translation=np.array([1.0, 1.0, 0.5]))
+    coffe_table_demo(ply_file, urdf_path, ee_goal = np.array([1.35, 1.25, 1.0]), scale_factor=1.0, subsample_rate=0.1, translation=np.array([1.0, 1.0, 0.5]))
