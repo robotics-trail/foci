@@ -5,6 +5,7 @@ from scipy.spatial.transform import Rotation as R
 
 import viser
 from viser.extras import ViserUrdf
+from pathlib import Path
 
 from yourdfpy import URDF
 
@@ -35,25 +36,19 @@ class Visualizer:
         urdf = URDF.load(self.robot.get_robot_path())
         self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
 
-    def visualize_trajectory(self, dt=0.1, loop=True):
-        self.viser_urdf.update_cfg(np.zeros(self.n_joints))
+    def visualize_trajectory(
+        self,
+        dt: float = 0.1,
+        loop: bool = True,
+        save_recording: bool = False,
+        recording_path: str = "trajectory.viser",
+    ):
 
-        num_samples: int = self.curve.shape[0]
-        i = 0
+        if save_recording:
+            self._save_trajectory_recording(recording_path, dt)
 
-        while True:
-            q = self.curve[i]  # (n_joints, )
-            self.viser_urdf.update_cfg(q)
-
-            time.sleep(dt)
-
-            i += 1
-            if i >= num_samples:
-                if loop:
-                    i = 0
-
-                else:
-                    break
+        else:
+            self._visualize_trajectory_live(dt, loop)
 
     def visualize_goal(
         self, goal: np.ndarray, radius: float = 0.05, color: tuple = (0, 0, 255)
@@ -148,32 +143,52 @@ class Visualizer:
 
         return midpoints
 
-    def add_gaussians(self, means, covs, color = [0,1,0], opacity = 1.0):
-        if  len(color) == 3:
+    def add_gaussians(self, means, covs, color=[0, 1, 0], opacity=1.0):
+        if len(color) == 3:
             color = self.z_colormap(means)
         if type(opacity) == float:
             opacity = np.tile(opacity, (len(means), 1))
 
         means = np.ascontiguousarray(means)
-        
-        print(f"means: {means.shape}, covs: {covs.shape}, color: {color.shape}, opacity: {opacity.shape}")
-        self.server.add_gaussian_splats("Scene Splat", means, covs, color, opacity, visible=True)
-        
-    # @staticmethod
-    # def covariance_to_ellipsoid(mean, cov, color=[1, 0, 0], scale=1.0):
-    #     eigvals, eigvecs = np.linalg.eigh(cov)
 
-    #     # Open3D sphere
-    #     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.0)
-    #     sphere.compute_vertex_normals()
-    #     sphere.paint_uniform_color(color)
+        print(
+            f"means: {means.shape}, covs: {covs.shape}, color: {color.shape}, opacity: {opacity.shape}"
+        )
+        self.server.add_gaussian_splats(
+            "Scene Splat", means, covs, color, opacity, visible=True
+        )
 
-    #     # Scale using eigenvalues
-    #     scales = scale * np.sqrt(eigvals)
-    #     sphere.scale(1.0, center=np.zeros(3))
-    #     sphere.vertices = o3d.utility.Vector3dVector(
-    #         np.asarray(sphere.vertices) @ np.diag(scales) @ eigvecs.T
-    #     )
+    def _visualize_trajectory_live(self, dt: float, loop: bool):
+        self.viser_urdf.update_cfg(np.zeros(self.n_joints))
 
-    #     sphere.translate(mean)
-    #     return sphere
+        num_samples: int = self.curve.shape[0]
+        i = 0
+
+        while True:
+            q = self.curve[i]  # (n_joints, )
+            self.viser_urdf.update_cfg(q)
+
+            time.sleep(dt)
+
+            i += 1
+            if i >= num_samples:
+                if loop:
+                    i = 0
+
+                else:
+                    break
+
+    def _save_trajectory_recording(self, recording_path: str, dt: float):
+        serializer = self.server.get_scene_serializer()
+
+        num_samples: int = self.curve.shape[0]
+        self.viser_urdf.update_cfg(np.zeros(self.n_joints))
+
+        for i in range(num_samples):
+            q = self.curve[i]  # (n_joints, )
+            self.viser_urdf.update_cfg(q)
+
+            serializer.insert_sleep(dt)
+
+        data = serializer.serialize()
+        Path(recording_path).write_bytes(data)
