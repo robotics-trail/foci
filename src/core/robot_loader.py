@@ -162,14 +162,6 @@ class ManipulatorRobotURDF(BaseRobot):
         return self.robot_path
 
 
-# class MovileRobot(BaseRobot):
-#     def __init__(self, robot_path, root_link="base_link"):
-#         super().__init__(robot_path)
-
-#         self.parser = URDFparser()
-#         self.parser.from_file(robot_path)
-
-#         self.joints = self.parser.get_joint_names()
-#         self.links = self.parser.get_link_names()
-
-#     def forward_kinematics(self, q: np.ndarray):
+class MobileManipulatorRobotURDF(ManipulatorRobotURDF):
+    def __init__(self, robot_path, root_link="world", tip_link="end_effector"):
+        super().__init__(robot_path, root_link, tip_link)
