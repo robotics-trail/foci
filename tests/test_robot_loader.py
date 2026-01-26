@@ -3,7 +3,7 @@ import casadi as cas
 
 import pytest
 
-from src.core.robot_loader import ManipulatorRobotURDF
+from src.core.robot_loader import ManipulatorRobotURDF, MobileManipulatorRobotURDF
 
 
 @pytest.mark.order(0)
@@ -46,6 +46,30 @@ def test_robot_loader() -> None:
     assert np.allclose(
         np.array([positions[-3], positions[-2], positions[-1]]).flatten(),
         np.array([0.0, 0.2, 1.205]),
+        atol=5e-2,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.order(1)
+def test_robot_movile_loader() -> None:
+    ur5_mobile_path: str = "urdfs/ur5_extended_move.urdf"
+
+    ur5_loader = ManipulatorRobotURDF(
+        ur5_mobile_path, root_link="world", tip_link="ee_link"
+    )
+
+    if ur5_loader.n_joints != 9:
+        assert False, f"The number of joints is {ur5_loader.n_joints}, should be 9"
+
+    q = cas.DM.zeros(ur5_loader.n_joints, 1)
+    positions = ur5_loader.forward_kinematics(q)
+
+    assert positions.dim() == "36x1"
+
+    assert np.allclose(
+        np.array([positions[0], positions[1], positions[2]]).flatten(),
+        np.array([0.0, 0.0, 0.0]),
         atol=5e-2,
         rtol=1e-5,
     )
