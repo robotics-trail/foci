@@ -73,3 +73,24 @@ def test_robot_movile_loader() -> None:
         atol=5e-2,
         rtol=1e-5,
     )
+
+
+@pytest.mark.order(2)
+def test_robot_get_joint_limits() -> None:
+    ur5_mobile_path: str = "urdfs/ur5_extended_move.urdf"
+
+    ur5_loader = ManipulatorRobotURDF(
+        ur5_mobile_path, root_link="world", tip_link="ee_link"
+    )
+
+    n_joint_limits = ur5_loader.get_joint_limits()
+    if len(n_joint_limits) != 9:
+        assert False, f"The number of limit joints is {n_joint_limits}, should be 9"
+
+    assert np.allclose(
+        np.array(n_joint_limits[0]), np.array([-10.0, 10.0]), atol=5e-2, rtol=1e-5
+    )
+
+    assert np.allclose(
+        np.array(n_joint_limits[-1]), np.array([-np.pi, np.pi]), atol=5e-2, rtol=1e-5
+    )

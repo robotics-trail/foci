@@ -152,14 +152,25 @@ class ManipulatorRobotURDF(BaseRobot):
     def get_joint_map(self):
         return self.joint_map
 
-    def get_n_links(self):
+    def get_n_links(self) -> int:
         return self.n_links
 
-    def get_n_joints(self):
+    def get_n_joints(self) -> int:
         return self.n_joints
 
     def get_robot_path(self):
         return self.robot_path
+
+    def get_joint_limits(self):
+        joint_limits = []
+
+        for _, joint in self.joint_map.items():
+            if joint.type in ["revolute", "prismatic"]:
+                lower = joint.limit.lower if joint.limit is not None else -np.inf
+                upper = joint.limit.upper if joint.limit is not None else np.inf
+                joint_limits.append((lower, upper))
+
+        return joint_limits
 
 
 class MobileManipulatorRobotURDF(ManipulatorRobotURDF):
