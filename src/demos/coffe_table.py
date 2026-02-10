@@ -60,15 +60,10 @@ def coffe_table_demo(
         f"Altura min: {altura_min}, Altura max: {altura_max}, Altura total: {altura_total}"
     )
 
-    scene_center = (obstacle_means.mean(axis=0) + ee_goal) / 2
-    camera_position = scene_center + np.array([2.0, 2.0, 1.5])
-
     vis = Visualizer(
         planner.robot,
         robot_cov,
         curve,
-        camera_position=camera_position,
-        camera_look_at=scene_center,
     )
     vis.visualize_goal(ee_goal, radius=0.05)
     vis.add_gaussians(obstacle_means, obstacle_covs, color=colors)

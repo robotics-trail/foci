@@ -19,8 +19,6 @@ class Visualizer:
         # robot_midpoints: np.ndarray,
         robot_cov: np.ndarray,
         curve: np.ndarray,
-        camera_position: np.ndarray = None,
-        camera_look_at: np.ndarray = None,
     ):
         self.robot = robot
         self.n_links = self.robot.get_n_links()
@@ -38,8 +36,6 @@ class Visualizer:
         urdf = URDF.load(self.robot.get_robot_path())
         self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
 
-        if camera_position is not None and camera_look_at is not None:
-            self._setup_camera(camera_position, camera_look_at)
 
     def visualize_trajectory(
         self,
@@ -197,10 +193,3 @@ class Visualizer:
 
         data = serializer.serialize()
         Path(recording_path).write_bytes(data)
-
-    def _setup_camera(self, position: np.ndarray, look_at: np.ndarray):
-        direction = look_at - position
-        # distance = np.linalg.norm(direction)
-
-        with self.server.scene.atomic():
-            self.server.scene.set_up_direction("+z")
