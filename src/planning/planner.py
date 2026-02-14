@@ -18,7 +18,7 @@ class Planner:
         tip_link: str,
         obstacle_positions: np.ndarray,
         obstacle_covs: np.ndarray,
-        robot_cov: np.ndarray,
+        robot_cov: np.ndarray,  # (3, 3) / (n_link, 3, 3)
         num_control_points: int = 8,
         num_samples: int = 30,
         weights: dict = {"jerk": 0.1, "goal": 40.0, "obstacle": 40.0},
@@ -46,7 +46,18 @@ class Planner:
         self.robot_cov = robot_cov
 
         # --- Precompute covs ---
-        covs_sum = obstacle_covs + robot_cov
+        covs_sum = obstacle_covs.copy()
+        if robot_cov.ndim == 2:
+            for _ in range(self.n_links):
+                covs_sum += robot_cov
+
+        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
+            for i in range(self.n_links):
+                covs_sum += robot_cov[i]
+
+        else:
+            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+
         self.covs_det = np.array([np.linalg.det(c) for c in covs_sum])
         self.covs_inv = np.array([np.linalg.inv(c) for c in covs_sum])
 
