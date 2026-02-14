@@ -47,16 +47,13 @@ matplotlib==3.10.7
 matplotlib-inline==0.2.1
 mdurl==0.1.2
 msgspec==0.20.0
-mss==10.1.0
 narwhals==2.12.0
 nbformat==5.10.4
 nest-asyncio==1.6.0
 networkx==3.4.2
 nodeenv==1.9.1
-numpy==2.2.6
-ompl==1.7.0
+numpy==1.26.4
 open3d==0.19.0
-opencv-python-headless==4.13.0.90
 packaging==25.0
 pandas==2.3.3
 parso==0.8.5
