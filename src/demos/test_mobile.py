@@ -24,7 +24,22 @@ def mobile_robot_demo():
         ]
     )
 
-    robot_cov = np.eye(3) * 0.2**2
+    # robot_cov = np.eye(3) * 0.2**2
+    robot_cov = np.array(
+        [
+            np.zeros((3, 3)),
+            np.zeros((3, 3)),
+            np.zeros((3, 3)),
+            np.eye(3) * 0.2,
+            np.eye(3) * 0.3,
+            np.eye(3) * 0.1,
+            np.eye(3) * 0.4,
+            np.eye(3) * 0.2,
+            np.eye(3) * 0.1,
+            np.eye(3) * 0.1,
+            np.eye(3) * 0.1,
+        ]
+    )
 
     w_jerk = 0.00001
     w_goal = 100.0
