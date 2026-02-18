@@ -24,7 +24,16 @@ class Visualizer:
         self.n_joints = self.robot.get_n_joints()
 
         # self.robot_midpoints = robot_midpoints  # (num_samples, num_links, 3)
-        self.robot_cov = robot_cov  # (3, 3)
+        self.robot_cov = robot_cov  # (3, 3) / (n_links, 3, 3)
+
+        if robot_cov.ndim == 2:
+            self.multiple_gaussians = False
+
+        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
+            self.multiple_gaussians = True
+
+        else:
+            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
 
         self.curve = curve
 
@@ -105,37 +114,72 @@ class Visualizer:
         name: str = "RobotGaussian",
     ):
 
-        self._robot_gauss_handles = []
+        if not self.multiple_gaussians:
 
-        for i in range(self.n_links):
-            midpoint = self.midpoints[0, i, :]
+            self._robot_gauss_handles = []
 
-            eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
-            radii = n_std * np.sqrt(np.abs(eigvals))
+            for i in range(self.n_links):
+                midpoint = self.midpoints[0, i, :]
 
-            rotation_matrix = eigvecs
+                eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
+                radii = n_std * np.sqrt(np.abs(eigvals))
 
-            if np.linalg.det(rotation_matrix) < 0:
-                rotation_matrix[:, 0] *= -1
+                rotation_matrix = eigvecs
 
-            rotation = R.from_matrix(rotation_matrix)
+                if np.linalg.det(rotation_matrix) < 0:
+                    rotation_matrix[:, 0] *= -1
 
-            quat_xyzw = rotation.as_quat()
-            quat_wxyz = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-            )
+                rotation = R.from_matrix(rotation_matrix)
 
-            handle = self.server.scene.add_mesh_simple(
-                name=f"{name}_{i}",
-                vertices=self._create_ellipsoid_mesh(radii),
-                faces=self._create_ellipsoid_faces(),
-                position=midpoint,
-                wxyz=quat_wxyz,
-                color=color,
-                opacity=opacity,
-            )
+                quat_xyzw = rotation.as_quat()
+                quat_wxyz = np.array(
+                    [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+                )
 
-            self._robot_gauss_handles.append(handle)
+                handle = self.server.scene.add_mesh_simple(
+                    name=f"{name}_{i}",
+                    vertices=self._create_ellipsoid_mesh(radii),
+                    faces=self._create_ellipsoid_faces(),
+                    position=midpoint,
+                    wxyz=quat_wxyz,
+                    color=color,
+                    opacity=opacity,
+                )
+
+                self._robot_gauss_handles.append(handle)
+
+        else:
+            self._robot_gauss_handles = []
+
+            for i in range(self.n_links):
+                midpoint = self.midpoints[0, i, :]
+
+                eigvals, eigvecs = np.linalg.eigh(self.robot_cov[i])
+                radii = n_std * np.sqrt(np.abs(eigvals))
+
+                rotation_matrix = eigvecs
+
+                if np.linalg.det(rotation_matrix) < 0:
+                    rotation_matrix[:, 0] *= -1
+
+                rotation = R.from_matrix(rotation_matrix)
+
+                quat_xyzw = rotation.as_quat()
+                quat_wxyz = np.array(
+                    [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+                )
+
+                handle = self.server.scene.add_mesh_simple(
+                    name=f"{name}_{i}",
+                    vertices=self._create_ellipsoid_mesh(radii),
+                    faces=self._create_ellipsoid_faces(),
+                    position=midpoint,
+                    wxyz=quat_wxyz,
+                    color=color,
+                    opacity=opacity,
+                )
+
+                self._robot_gauss_handles.append(handle)
 
     def _update_robot_gaussians(self, i: int, n_std=2.0):
         if self._robot_gauss_handles is None or len(self._robot_gauss_handles) == 0:
@@ -144,8 +188,11 @@ class Visualizer:
         for j in range(self.n_links):
             mean = self.midpoints[i, j, :]
 
-            eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
-            # radii = n_std * np.sqrt(np.abs(eigvals))
+            if not self.multiple_gaussians:
+                eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
+
+            else:
+                eigvals, eigvecs = np.linalg.eigh(self.robot_cov[j])
 
             rotation_matrix = eigvecs
 
