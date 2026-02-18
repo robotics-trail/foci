@@ -16,7 +16,6 @@ class Visualizer:
     def __init__(
         self,
         robot: ManipulatorRobotURDF,
-        # robot_midpoints: np.ndarray,
         robot_cov: np.ndarray,
         curve: np.ndarray,
     ):
@@ -28,14 +27,19 @@ class Visualizer:
         self.robot_cov = robot_cov  # (3, 3)
 
         self.curve = curve
-        self.midpoints = self.get_midpoints(self.curve)
-        self.positions = self.get_positions(self.curve)
+
+        # print(self.midpoints)
+        # print(self.midpoints.shape)
 
         self.server = viser.ViserServer()
 
-        urdf = URDF.load(self.robot.get_robot_path())
-        self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
+        self.urdf = URDF.load(self.robot.get_robot_path())
+        self.viser_urdf = ViserUrdf(self.server, urdf_or_path=self.urdf)
 
+        # self._link_names = [l.name for l in self.urdf.links]
+        self.chain_links = self.robot.get_links()
+        self.midpoints = self.get_midpoints(self.curve)
+        self.positions = self.get_positions(self.curve)
 
     def visualize_trajectory(
         self,
@@ -93,6 +97,72 @@ class Visualizer:
                 opacity=opacity,
             )
 
+    def visualize_robot_gaussians(
+        self,
+        n_std: float = 2.0,
+        color: tuple = (80, 160, 255),
+        opacity: float = 0.35,
+        name: str = "RobotGaussian",
+    ):
+
+        self._robot_gauss_handles = []
+
+        for i in range(self.n_links):
+            midpoint = self.midpoints[0, i, :]
+
+            eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
+            radii = n_std * np.sqrt(np.abs(eigvals))
+
+            rotation_matrix = eigvecs
+
+            if np.linalg.det(rotation_matrix) < 0:
+                rotation_matrix[:, 0] *= -1
+
+            rotation = R.from_matrix(rotation_matrix)
+
+            quat_xyzw = rotation.as_quat()
+            quat_wxyz = np.array(
+                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+            )
+
+            handle = self.server.scene.add_mesh_simple(
+                name=f"{name}_{i}",
+                vertices=self._create_ellipsoid_mesh(radii),
+                faces=self._create_ellipsoid_faces(),
+                position=midpoint,
+                wxyz=quat_wxyz,
+                color=color,
+                opacity=opacity,
+            )
+
+            self._robot_gauss_handles.append(handle)
+
+    def _update_robot_gaussians(self, i: int, n_std=2.0):
+        if self._robot_gauss_handles is None or len(self._robot_gauss_handles) == 0:
+            return
+
+        for j in range(self.n_links):
+            mean = self.midpoints[i, j, :]
+
+            eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
+            # radii = n_std * np.sqrt(np.abs(eigvals))
+
+            rotation_matrix = eigvecs
+
+            if np.linalg.det(rotation_matrix) < 0:
+                rotation_matrix[:, 0] *= -1
+
+            rotation = R.from_matrix(rotation_matrix)
+
+            quat_xyzw = rotation.as_quat()
+            quat_wxyz = np.array(
+                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+            )
+
+            h = self._robot_gauss_handles[j]
+            h.position = mean
+            h.wxyz = quat_wxyz
+
     def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
         u = np.linspace(0, 2 * np.pi, resolution)
         v = np.linspace(0, np.pi, resolution)
@@ -133,31 +203,20 @@ class Visualizer:
 
     def get_midpoints(self, curve):
         num_samples = curve.shape[0]
-        midpoints = np.zeros((num_samples, self.n_links, 3))
+        midpoints = np.zeros((num_samples, self.n_links, 3), dtype=float)
 
         for i in range(num_samples):
             q = curve[i]
-            joint_positions = self.robot.forward_kinematics(q)  # (n_links + 1,)
+
+            fk_flat = (
+                np.array(self.robot.forward_kinematics(q)).astype(float).reshape(-1)
+            )
+            joint_positions = fk_flat.reshape(self.n_links + 1, 3)  # (n_links+1,3)
 
             for j in range(self.n_links):
-                midpoints[i, j, :] = (joint_positions[j] + joint_positions[j + 1]) / 2.0
+                midpoints[i, j] = 0.5 * (joint_positions[j] + joint_positions[j + 1])
 
         return midpoints
-
-    def add_gaussians(self, means, covs, color=[0, 1, 0], opacity=1.0):
-        if len(color) == 3:
-            color = self.z_colormap(means)
-        if type(opacity) == float:
-            opacity = np.tile(opacity, (len(means), 1))
-
-        means = np.ascontiguousarray(means)
-
-        print(
-            f"means: {means.shape}, covs: {covs.shape}, color: {color.shape}, opacity: {opacity.shape}"
-        )
-        self.server.add_gaussian_splats(
-            "Scene Splat", means, covs, color, opacity, visible=True
-        )
 
     def _visualize_trajectory_live(self, dt: float, loop: bool):
         self.viser_urdf.update_cfg(np.zeros(self.n_joints))
@@ -168,6 +227,7 @@ class Visualizer:
         while True:
             q = self.curve[i]  # (n_joints, )
             self.viser_urdf.update_cfg(q)
+            self._update_robot_gaussians(i)
 
             time.sleep(dt)
 
@@ -188,6 +248,7 @@ class Visualizer:
         for i in range(num_samples):
             q = self.curve[i]  # (n_joints, )
             self.viser_urdf.update_cfg(q)
+            self._update_robot_gaussians(i)
 
             serializer.insert_sleep(dt)
 

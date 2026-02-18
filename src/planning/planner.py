@@ -46,17 +46,18 @@ class Planner:
         self.robot_cov = robot_cov
 
         # --- Precompute covs ---
-        covs_sum = obstacle_covs.copy()
-        if robot_cov.ndim == 2:
-            for _ in range(self.n_links):
-                covs_sum += robot_cov
+        # covs_sum = obstacle_covs.copy()  # (n_obstacles, 3, 3)
+        # if robot_cov.ndim == 2:
+        #     covs_sum += robot_cov
 
-        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
-            for i in range(self.n_links):
-                covs_sum += robot_cov[i]
+        # elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
+        #     for i in range(self.n_links):
+        #         covs_sum += robot_cov[i]
 
-        else:
-            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+        # else:
+        #     raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+
+        covs_sum = self.obstacle_covs + robot_cov
 
         self.covs_det = np.array([np.linalg.det(c) for c in covs_sum])
         self.covs_inv = np.array([np.linalg.inv(c) for c in covs_sum])
