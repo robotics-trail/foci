@@ -18,7 +18,7 @@ class Planner:
         tip_link: str,
         obstacle_positions: np.ndarray,
         obstacle_covs: np.ndarray,
-        robot_cov: np.ndarray,  # (3, 3) / (n_link, 3, 3)
+        robot_cov: np.ndarray,  # (3, 3) / (n_links, 3, 3)
         num_control_points: int = 8,
         num_samples: int = 30,
         weights: dict = {"jerk": 0.1, "goal": 40.0, "obstacle": 40.0},
@@ -46,18 +46,21 @@ class Planner:
         self.robot_cov = robot_cov
 
         # --- Precompute covs ---
-        # covs_sum = obstacle_covs.copy()  # (n_obstacles, 3, 3)
-        # if robot_cov.ndim == 2:
-        #     covs_sum += robot_cov
+        if robot_cov.ndim == 2:
+            self.multiple_gaussians = False
+            covs_sum = self.obstacle_covs + robot_cov  # (n_obstacles, 3, 3)
 
-        # elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
-        #     for i in range(self.n_links):
-        #         covs_sum += robot_cov[i]
+        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
+            self.multiple_gaussians = True
+            covs_sum = np.zeros(
+                (self.n_links, obstacle_covs.shape[0], 3, 3)
+            )  # (n_links, n_obstacles, 3, 3)
 
-        # else:
-        #     raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+            for i in range(self.n_links):
+                covs_sum[i, :, :, :] = self.obstacle_covs + robot_cov[i]
 
-        covs_sum = self.obstacle_covs + robot_cov
+        else:
+            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
 
         self.covs_det = np.array([np.linalg.det(c) for c in covs_sum])
         self.covs_inv = np.array([np.linalg.inv(c) for c in covs_sum])
@@ -73,6 +76,7 @@ class Planner:
             obstacle_means=self.obstacle_positions,
             covs_det=self.covs_det,
             covs_inv=self.covs_inv,
+            multiple_gaussians=self.multiple_gaussians,
             num_samples=self.num_samples,
             weights=self.weights,
             wmax=self.wmax,

@@ -17,6 +17,7 @@ def create_solver(
     obstacle_means,
     covs_det,
     covs_inv,
+    multiple_gaussians,
     num_samples=30,
     weights={"jerk": 1.0, "goal": 1.0, "obstacle": 1.0},
     wmax=1.0,
@@ -94,18 +95,39 @@ def create_solver(
 
     # --- Costs ---
     final_ee_pos = robot.get_ee_endpoint(curve[-1, :])
-    convolution_functor = ConvolutionFunctorWarp(
-        "conv",
-        3,
-        n_links * num_samples,
-        obstacle_means,
-        covs_det,
-        covs_inv,
-    )
+
+    if not multiple_gaussians:
+        convolution_functor = ConvolutionFunctorWarp(
+            "conv",
+            3,
+            n_links * num_samples,
+            obstacle_means,
+            covs_det,
+            covs_inv,
+        )
+
+    else:
+        convolution_functor = []
+        for i in range(n_links):
+            conv_func = ConvolutionFunctorWarp(
+                "conv",
+                3,
+                num_samples,
+                obstacle_means,
+                covs_det[i],
+                covs_inv[i],
+            )
+
+            convolution_functor.append(conv_func)
 
     cost_goal = get_cost_goal(final_ee_pos, goal_ee_position, weight=weights["goal"])
+
     cost_obstacles = get_cost_obstacles(
-        midpoints, convolution_functor, weight=weights["obstacle"]
+        midpoints,
+        convolution_functor,
+        multiple_gaussians,
+        n_links,
+        weight=weights["obstacle"],
     )
     cost_jerk = get_cost_jerk(dddcurve, weight=weights["jerk"])
 
