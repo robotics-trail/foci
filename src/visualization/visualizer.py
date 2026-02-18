@@ -1,15 +1,19 @@
 import time
 import numpy as np
 
-from scipy.spatial.transform import Rotation as R
-
-import viser
+from viser import ViserServer
 from viser.extras import ViserUrdf
 from pathlib import Path
 
 from yourdfpy import URDF
 
 from src.core.robot_loader import ManipulatorRobotURDF
+from src.visualization.utils import (
+    CasadiFKMidpoints,
+    SharedCovariance,
+    PerLinkCovariances,
+    EllipsoidFactory,
+)
 
 
 class Visualizer:
@@ -18,37 +22,33 @@ class Visualizer:
         robot: ManipulatorRobotURDF,
         robot_cov: np.ndarray,
         curve: np.ndarray,
+        n_std: float = 2.0,
     ):
+
         self.robot = robot
         self.n_links = self.robot.get_n_links()
         self.n_joints = self.robot.get_n_joints()
 
-        # self.robot_midpoints = robot_midpoints  # (num_samples, num_links, 3)
-        self.robot_cov = robot_cov  # (3, 3) / (n_links, 3, 3)
-
-        if robot_cov.ndim == 2:
-            self.multiple_gaussians = False
-
-        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
-            self.multiple_gaussians = True
-
+        if robot_cov.shape == (3, 3):
+            self.gaussian_model = SharedCovariance(robot_cov)
+        elif robot_cov.ndim == 3 and robot_cov.shape == (self.n_links, 3, 3):
+            self.gaussian_model = PerLinkCovariances(robot_cov)
         else:
-            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+            raise ValueError(
+                f"robot_cov must be (3,3) or ({self.n_links},3,3), got {robot_cov.shape}"
+            )
+
+        self.kinematics = CasadiFKMidpoints(self.robot, self.n_links)
 
         self.curve = curve
+        self.midpoints = self.kinematics.midpoints(curve)
 
-        # print(self.midpoints)
-        # print(self.midpoints.shape)
+        self.server = ViserServer()
 
-        self.server = viser.ViserServer()
+        urdf = URDF.load(self.robot.get_robot_path())
+        self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
 
-        self.urdf = URDF.load(self.robot.get_robot_path())
-        self.viser_urdf = ViserUrdf(self.server, urdf_or_path=self.urdf)
-
-        # self._link_names = [l.name for l in self.urdf.links]
-        self.chain_links = self.robot.get_links()
-        self.midpoints = self.get_midpoints(self.curve)
-        self.positions = self.get_positions(self.curve)
+        self._ellipsoid_faces = self._create_ellipsoid_faces()
 
     def visualize_trajectory(
         self,
@@ -80,26 +80,16 @@ class Visualizer:
         opacity: float = 0.6,
         name="Obstacle",
     ):
+
+        factory = EllipsoidFactory(n_std=float(n_std))
+
         for i, (mean, cov) in enumerate(zip(means, covariances)):
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            radii = n_std * np.sqrt(np.abs(eigvals))
-
-            rotation_matrix = eigvecs
-
-            if np.linalg.det(rotation_matrix) < 0:
-                rotation_matrix[:, 0] *= -1
-
-            rotation = R.from_matrix(rotation_matrix)
-
-            quat_xyzw = rotation.as_quat()
-            quat_wxyz = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-            )
+            radii, quat_wxyz = factory.cov_to_ellipsoid(cov)
 
             self.server.scene.add_mesh_simple(
                 name=f"{name}_{i}",
                 vertices=self._create_ellipsoid_mesh(radii),
-                faces=self._create_ellipsoid_faces(),
+                faces=self._ellipsoid_faces,
                 position=mean,
                 wxyz=quat_wxyz,
                 color=color,
@@ -108,162 +98,30 @@ class Visualizer:
 
     def visualize_robot_gaussians(
         self,
-        n_std: float = 2.0,
-        color: tuple = (80, 160, 255),
-        opacity: float = 0.35,
         name: str = "RobotGaussian",
+        n_std: float = 2.0,
+        color=(80, 160, 255),
+        opacity: float = 0.35,
     ):
+        self._robot_gauss_handles = []
+        self._ellipsoid_factory = EllipsoidFactory(n_std=float(n_std))
 
-        if not self.multiple_gaussians:
-
-            self._robot_gauss_handles = []
-
-            for i in range(self.n_links):
-                midpoint = self.midpoints[0, i, :]
-
-                eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
-                radii = n_std * np.sqrt(np.abs(eigvals))
-
-                rotation_matrix = eigvecs
-
-                if np.linalg.det(rotation_matrix) < 0:
-                    rotation_matrix[:, 0] *= -1
-
-                rotation = R.from_matrix(rotation_matrix)
-
-                quat_xyzw = rotation.as_quat()
-                quat_wxyz = np.array(
-                    [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-                )
-
-                handle = self.server.scene.add_mesh_simple(
-                    name=f"{name}_{i}",
-                    vertices=self._create_ellipsoid_mesh(radii),
-                    faces=self._create_ellipsoid_faces(),
-                    position=midpoint,
-                    wxyz=quat_wxyz,
-                    color=color,
-                    opacity=opacity,
-                )
-
-                self._robot_gauss_handles.append(handle)
-
-        else:
-            self._robot_gauss_handles = []
-
-            for i in range(self.n_links):
-                midpoint = self.midpoints[0, i, :]
-
-                eigvals, eigvecs = np.linalg.eigh(self.robot_cov[i])
-                radii = n_std * np.sqrt(np.abs(eigvals))
-
-                rotation_matrix = eigvecs
-
-                if np.linalg.det(rotation_matrix) < 0:
-                    rotation_matrix[:, 0] *= -1
-
-                rotation = R.from_matrix(rotation_matrix)
-
-                quat_xyzw = rotation.as_quat()
-                quat_wxyz = np.array(
-                    [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-                )
-
-                handle = self.server.scene.add_mesh_simple(
-                    name=f"{name}_{i}",
-                    vertices=self._create_ellipsoid_mesh(radii),
-                    faces=self._create_ellipsoid_faces(),
-                    position=midpoint,
-                    wxyz=quat_wxyz,
-                    color=color,
-                    opacity=opacity,
-                )
-
-                self._robot_gauss_handles.append(handle)
-
-    def _update_robot_gaussians(self, i: int, n_std=2.0):
-        if self._robot_gauss_handles is None or len(self._robot_gauss_handles) == 0:
-            return
-
+        i0 = 0
         for j in range(self.n_links):
-            mean = self.midpoints[i, j, :]
+            mean = self.midpoints[i0, j, :]
+            cov = self.gaussian_model.cov(j)
+            radii, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
 
-            if not self.multiple_gaussians:
-                eigvals, eigvecs = np.linalg.eigh(self.robot_cov)
-
-            else:
-                eigvals, eigvecs = np.linalg.eigh(self.robot_cov[j])
-
-            rotation_matrix = eigvecs
-
-            if np.linalg.det(rotation_matrix) < 0:
-                rotation_matrix[:, 0] *= -1
-
-            rotation = R.from_matrix(rotation_matrix)
-
-            quat_xyzw = rotation.as_quat()
-            quat_wxyz = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+            h = self.server.scene.add_mesh_simple(
+                name=f"{name}_{j}",
+                vertices=self._create_ellipsoid_mesh(radii),
+                faces=self._ellipsoid_faces,
+                position=mean,
+                wxyz=quat_wxyz,
+                color=color,
+                opacity=opacity,
             )
-
-            h = self._robot_gauss_handles[j]
-            h.position = mean
-            h.wxyz = quat_wxyz
-
-    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
-        u = np.linspace(0, 2 * np.pi, resolution)
-        v = np.linspace(0, np.pi, resolution)
-
-        u_grid, v_grid = np.meshgrid(u, v)
-
-        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
-        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
-        z = radii[2] * np.cos(v_grid)
-
-        vertices = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
-        return vertices
-
-    def _create_ellipsoid_faces(self, resolution: int = 20):
-        faces = []
-
-        for i in range(resolution - 1):
-            for j in range(resolution - 1):
-                idx = i * resolution + j
-                faces.append([idx, idx + resolution, idx + 1])
-                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
-
-        return np.array(faces, dtype=np.uint32)
-
-    def get_positions(self, curve: np.ndarray):
-        num_samples, n_joints = curve.shape
-        positions = []
-
-        for i in range(num_samples):
-            q = curve[i]
-            sample_positions = np.array(
-                self.robot.forward_kinematics(q)
-            )  # (n_links + 1,)
-
-            positions.append(sample_positions)
-
-        return positions
-
-    def get_midpoints(self, curve):
-        num_samples = curve.shape[0]
-        midpoints = np.zeros((num_samples, self.n_links, 3), dtype=float)
-
-        for i in range(num_samples):
-            q = curve[i]
-
-            fk_flat = (
-                np.array(self.robot.forward_kinematics(q)).astype(float).reshape(-1)
-            )
-            joint_positions = fk_flat.reshape(self.n_links + 1, 3)  # (n_links+1,3)
-
-            for j in range(self.n_links):
-                midpoints[i, j] = 0.5 * (joint_positions[j] + joint_positions[j + 1])
-
-        return midpoints
+            self._robot_gauss_handles.append(h)
 
     def _visualize_trajectory_live(self, dt: float, loop: bool):
         self.viser_urdf.update_cfg(np.zeros(self.n_joints))
@@ -301,3 +159,39 @@ class Visualizer:
 
         data = serializer.serialize()
         Path(recording_path).write_bytes(data)
+
+    def _update_robot_gaussians(self, i: int):
+        if not self._robot_gauss_handles:
+            return
+
+        for j, h in enumerate(self._robot_gauss_handles):
+            mean = self.midpoints[i, j, :]
+            cov = self.gaussian_model.cov(j)
+            _, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
+
+            h.position = mean
+            h.wxyz = quat_wxyz
+
+    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
+        u = np.linspace(0, 2 * np.pi, resolution)
+        v = np.linspace(0, np.pi, resolution)
+
+        u_grid, v_grid = np.meshgrid(u, v)
+
+        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
+        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
+        z = radii[2] * np.cos(v_grid)
+
+        vertices = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+        return vertices
+
+    def _create_ellipsoid_faces(self, resolution: int = 20):
+        faces = []
+
+        for i in range(resolution - 1):
+            for j in range(resolution - 1):
+                idx = i * resolution + j
+                faces.append([idx, idx + resolution, idx + 1])
+                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
+
+        return np.array(faces, dtype=np.uint32)
