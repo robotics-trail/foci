@@ -24,26 +24,27 @@ def mobile_robot_demo():
         ]
     )
 
-    # robot_cov = np.eye(3) * 0.2**2
-    robot_cov = np.array(
-        [
-            np.zeros((3, 3)),
-            np.zeros((3, 3)),
-            np.zeros((3, 3)),
-            np.eye(3) * 0.2,
-            np.eye(3) * 0.3,
-            np.eye(3) * 0.1,
-            np.eye(3) * 0.4,
-            np.eye(3) * 0.2,
-            np.eye(3) * 0.1,
-            np.eye(3) * 0.1,
-            np.eye(3) * 0.1,
-        ]
-    )
+    robot_cov = np.eye(3) * 0.2**2
+    # robot_cov = np.array(
+    #     [
+    #         np.zeros((3, 3)),
+    #         np.zeros((3, 3)),
+    #         np.zeros((3, 3)),
+    #         np.eye(3) * 0.2,
+    #         np.eye(3) * 0.3,
+    #         np.eye(3) * 0.1,
+    #         np.eye(3) * 0.4,
+    #         np.eye(3) * 0.2,
+    #         np.eye(3) * 0.1,
+    #         np.eye(3) * 0.1,
+    #         np.eye(3) * 0.1,
+    #     ]
+    # )
 
     w_jerk = 0.00001
     w_goal = 100.0
-    w_obstacle = 0.01
+    w_obstacle = 0.01  # w_jerk * alfa + w_goal * beta + w_obstacle * c
+    # alfa + w_goal' * beta + w_obstacle' * c
 
     planner = Planner(
         urdf_file=urdf_path,
@@ -73,6 +74,7 @@ def mobile_robot_demo():
     vis.visualize_goal(ee_goal, radius=0.05)
     # vis.visualize_obstacles(table_means, table_covs, name="Table")
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(100, 255, 100))
+    vis.visualize_robot_gaussians()
     vis.visualize_trajectory()
 
 
