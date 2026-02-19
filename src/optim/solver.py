@@ -18,6 +18,7 @@ def create_solver(
     covs_det,
     covs_inv,
     multiple_gaussians,
+    active_link_indices,
     num_samples=30,
     weights={"jerk": 1.0, "goal": 1.0, "obstacle": 1.0},
     wmax=1.0,
@@ -29,6 +30,7 @@ def create_solver(
     n_joints = robot.get_n_joints()
     n_links = robot.get_n_links()
     n_midpoints = n_links
+    n_active_links = len(active_link_indices)
 
     # --- Decision variables ---
     control_points = SYM_TYPE.sym("control_points", num_control_points, n_joints)
@@ -64,13 +66,15 @@ def create_solver(
         joint_positions, num_samples * (n_links + 1), 3
     )
 
-    midpoints = SYM_TYPE.zeros(num_samples * n_midpoints, 3)
+    midpoints = SYM_TYPE.zeros(num_samples * n_active_links, 3)
     for sample_idx in range(num_samples):
-        for segment_idx in range(n_midpoints):
-            joint1_idx = sample_idx * (n_links + 1) + segment_idx
-            joint2_idx = sample_idx * (n_links + 1) + segment_idx + 1
+        base = sample_idx * (n_links + 1)
 
-            midpoint_idx = sample_idx * n_midpoints + segment_idx
+        for local_idx, link_idx in enumerate(active_link_indices):
+            joint1_idx = base + link_idx
+            joint2_idx = base + link_idx + 1
+
+            midpoint_idx = sample_idx * n_active_links + local_idx
             midpoints[midpoint_idx, :] = (
                 joint_positions_reshaped[joint1_idx, :]
                 + joint_positions_reshaped[joint2_idx, :]
@@ -100,7 +104,7 @@ def create_solver(
         convolution_functor = ConvolutionFunctorWarp(
             "conv",
             3,
-            n_links * num_samples,
+            n_active_links * num_samples,
             obstacle_means,
             covs_det,
             covs_inv,
@@ -108,14 +112,14 @@ def create_solver(
 
     else:
         convolution_functor = []
-        for i in range(n_links):
+        for k in range(n_active_links):
             conv_func = ConvolutionFunctorWarp(
                 "conv",
                 3,
                 num_samples,
                 obstacle_means,
-                covs_det[i],
-                covs_inv[i],
+                covs_det[k],
+                covs_inv[k],
             )
 
             convolution_functor.append(conv_func)
@@ -126,7 +130,7 @@ def create_solver(
         midpoints,
         convolution_functor,
         multiple_gaussians,
-        n_links,
+        n_active_links,
         weight=weights["obstacle"],
     )
     cost_jerk = get_cost_jerk(dddcurve, weight=weights["jerk"])

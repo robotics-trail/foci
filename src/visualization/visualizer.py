@@ -7,6 +7,8 @@ from pathlib import Path
 
 from yourdfpy import URDF
 
+from typing import List, Optional
+
 from src.core.robot_loader import ManipulatorRobotURDF
 from src.visualization.utils import (
     CasadiFKMidpoints,
@@ -22,12 +24,21 @@ class Visualizer:
         robot: ManipulatorRobotURDF,
         robot_cov: np.ndarray,
         curve: np.ndarray,
-        n_std: float = 2.0,
+        ignore_link_indices: Optional[List[int]] = None,
     ):
 
         self.robot = robot
         self.n_links = self.robot.get_n_links()
         self.n_joints = self.robot.get_n_joints()
+
+        ignore_link_indices = ignore_link_indices or []
+        ignore_link_indices = sorted(set(ignore_link_indices))
+
+        self.ignore_link_indices = ignore_link_indices
+        self.active_link_indices = [
+            i for i in range(self.n_links) if i not in ignore_link_indices
+        ]
+        self.n_active_links = len(self.active_link_indices)
 
         if robot_cov.shape == (3, 3):
             self.gaussian_model = SharedCovariance(robot_cov)
@@ -41,7 +52,9 @@ class Visualizer:
         self.kinematics = CasadiFKMidpoints(self.robot, self.n_links)
 
         self.curve = curve
-        self.midpoints = self.kinematics.midpoints(curve)
+        self.midpoints = self.kinematics.midpoints(curve)[
+            :, self.active_link_indices, :
+        ]
 
         self.server = ViserServer()
 
@@ -107,13 +120,13 @@ class Visualizer:
         self._ellipsoid_factory = EllipsoidFactory(n_std=float(n_std))
 
         i0 = 0
-        for j in range(self.n_links):
-            mean = self.midpoints[i0, j, :]
-            cov = self.gaussian_model.cov(j)
+        for local_j, link_idx in enumerate(self.active_link_indices):
+            mean = self.midpoints[i0, local_j, :]
+            cov = self.gaussian_model.cov(link_idx)
             radii, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
 
             h = self.server.scene.add_mesh_simple(
-                name=f"{name}_{j}",
+                name=f"{name}_{local_j}",
                 vertices=self._create_ellipsoid_mesh(radii),
                 faces=self._ellipsoid_faces,
                 position=mean,
@@ -164,9 +177,10 @@ class Visualizer:
         if not self._robot_gauss_handles:
             return
 
-        for j, h in enumerate(self._robot_gauss_handles):
-            mean = self.midpoints[i, j, :]
-            cov = self.gaussian_model.cov(j)
+        for local_j, h in enumerate(self._robot_gauss_handles):
+            mean = self.midpoints[i, local_j, :]
+            link_idx = self.active_link_indices[local_j]
+            cov = self.gaussian_model.cov(link_idx)
             _, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
 
             h.position = mean
