@@ -25,6 +25,7 @@ class Planner:
         wmax: float = 1.0,
         vmax: float = 1.0,
         amax: float = 1.0,
+        ignore_link_indices: list = None,
     ):
 
         # --- Robot ---
@@ -33,6 +34,7 @@ class Planner:
         self.n_links = self.robot.get_n_links()
 
         self.joint_limits = self.robot.get_joint_limits()
+        self.chain_links = self.robot.get_links()
 
         # --- Planning params ---
         self.num_control_points = num_control_points
@@ -45,6 +47,13 @@ class Planner:
         self.obstacle_covs = obstacle_covs
         self.robot_cov = robot_cov
 
+        ignore_link_indices = ignore_link_indices or []
+        self.ignore_link_indices = sorted(set(ignore_link_indices))
+        self.active_link_indices = [
+            i for i in range(self.n_links) if i not in ignore_link_indices
+        ]
+        self.n_active_links = len(self.active_link_indices)
+
         # --- Precompute covs ---
         if robot_cov.ndim == 2:
             self.multiple_gaussians = False
@@ -53,17 +62,19 @@ class Planner:
         elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
             self.multiple_gaussians = True
             covs_sum = np.zeros(
-                (self.n_links, obstacle_covs.shape[0], 3, 3)
-            )  # (n_links, n_obstacles, 3, 3)
+                (self.n_active_links, obstacle_covs.shape[0], 3, 3)
+            )  # (n_active_links, n_obstacles, 3, 3)
 
-            for i in range(self.n_links):
-                covs_sum[i, :, :, :] = self.obstacle_covs + robot_cov[i]
+            for k, link_idx in enumerate(self.active_link_indices):
+                covs_sum[k, :, :, :] = self.obstacle_covs + robot_cov[link_idx]
 
         else:
-            raise ValueError("Robot cov must have shape (3, 3) or (n_links, 3, 3)")
+            raise ValueError(
+                f"robot_cov must be (3,3) or (n_active_links,3,3) with n_links={self.n_active_links}. Got {robot_cov.shape}"
+            )
 
-        self.covs_det = np.array([np.linalg.det(c) for c in covs_sum])
-        self.covs_inv = np.array([np.linalg.inv(c) for c in covs_sum])
+        self.covs_det = np.linalg.det(covs_sum)
+        self.covs_inv = np.linalg.inv(covs_sum)
 
         self.solver, self.lbg, self.ubg, self.convolution_functor = (
             self._create_solver()
@@ -77,6 +88,7 @@ class Planner:
             covs_det=self.covs_det,
             covs_inv=self.covs_inv,
             multiple_gaussians=self.multiple_gaussians,
+            active_link_indices=self.active_link_indices,
             num_samples=self.num_samples,
             weights=self.weights,
             wmax=self.wmax,

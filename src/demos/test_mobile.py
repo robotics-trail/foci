@@ -27,9 +27,9 @@ def mobile_robot_demo():
     # robot_cov = np.eye(3) * 0.2**2
     robot_cov = np.array(
         [
-            np.eye(3) * 0.0**2,
-            np.eye(3) * 0.0**2,
-            np.eye(3) * 0.0**2,
+            np.eye(3) * 0.1**2,
+            np.eye(3) * 0.1**2,
+            np.eye(3) * 0.1**2,
             np.eye(3) * 0.1**2,
             np.eye(3) * 0.1**2,
             np.eye(3) * 0.25**2,
@@ -63,6 +63,7 @@ def mobile_robot_demo():
         wmax=5.0,
         vmax=5.0,
         amax=5.0,
+        ignore_link_indices=[0, 1, 2],
     )
 
     theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -70,7 +71,7 @@ def mobile_robot_demo():
 
     curve = planner.plan(theta_start, ee_goal)
 
-    vis = Visualizer(planner.robot, robot_cov, curve)
+    vis = Visualizer(planner.robot, robot_cov, curve, ignore_link_indices=[0, 1, 2])
     vis.visualize_goal(ee_goal, radius=0.05)
     # vis.visualize_obstacles(table_means, table_covs, name="Table")
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(100, 255, 100))
