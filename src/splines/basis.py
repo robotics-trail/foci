@@ -1,5 +1,15 @@
 import numpy as np
 
+"""
+Basis matrices used for cubic B-spline evaluation and MINVO hull conversion.
+
+Conventions
+-----------
+- BSPLINE_k stores the polynomial basis matrix for the k-th derivative order.
+- MINVO_k stores the MINVO conversion matrix for the k-th derivative order.
+- All matrices are expressed in power basis form.
+"""
+
 # ===================== MINVO MATRICES ======================
 MINVO_3 = np.array(
     [
@@ -59,6 +69,12 @@ MINVO_0 = np.array(
     ]
 ).T
 
+INV_MINVO_3 = np.linalg.inv(MINVO_3)
+INV_MINVO_2 = np.linalg.inv(MINVO_2)
+INV_MINVO_1 = np.linalg.inv(MINVO_1)
+INV_MINVO_0 = np.linalg.inv(MINVO_0)
+
+
 # ===================== B-SPLINE MATRICES ======================
 BSPLINE_3 = np.array(
     [
@@ -76,25 +92,47 @@ BSPLINE_3 = np.array(
 
 BSPLINE_2 = np.array([[0.5, -1.0, 0.5], [-1.0, 1.0, 0.5], [0.5, 0, 0]]).T
 
-B_SPLINE_1 = np.array([[-1, 1], [1, 0]]).T
+BSPLINE_1 = np.array([[-1, 1], [1, 0]]).T
 
-B_SPLINE_0 = np.array([[1]]).T
+BSPLINE_0 = np.array([[1]]).T
 
 
 # ===================== BASIS FUNCTION ======================
-def bspline_basis(t: float, der: int = 0):
-    assert der in {0, 1, 2, 3}, "Derivate must be 0, 1, 2 or 3"
+def bspline_basis(t: float, derivative_order: int = 0):
+    """
+    Evaluate the cubic B-spline basis (or one of its derivatives) at a local
+    parameter t in [0, 1].
 
-    if der == 0:
-        T = np.array([t**3, t**2, t, 1])
+    Parameters
+    ----------
+    t : float
+        Local spline parameter inside a segment.
+    derivative_order : int, default=0
+        Derivative order to evaluate. Supported values are 0, 1, 2, and 3.
 
-    elif der == 1:
-        T = np.array([3 * t**2, 2 * t, 1, 0])
+    Returns
+    -------
+    np.ndarray
+        Basis weight vector of shape (4,).
 
-    elif der == 2:
-        T = np.array([6 * t, 2, 0, 0])
+    Raises
+    ------
+    ValueError
+        If `derivative_order` is not in {0, 1, 2, 3}.
+    """
 
+    if derivative_order not in {0, 1, 2, 3}:
+        raise ValueError(
+            f"derivative_order must be one of {{0, 1, 2, 3}}, got {derivative_order}"
+        )
+
+    if derivative_order == 0:
+        power_vector = np.array([t**3, t**2, t, 1.0])
+    elif derivative_order == 1:
+        power_vector = np.array([3.0 * t**2, 2.0 * t, 1.0, 0.0])
+    elif derivative_order == 2:
+        power_vector = np.array([6.0 * t, 2.0, 0.0, 0.0])
     else:
-        T = np.array([6, 0, 0, 0])
+        power_vector = np.array([6.0, 0.0, 0.0, 0.0])
 
-    return T @ BSPLINE_3
+    return power_vector @ BSPLINE_3

@@ -1,27 +1,77 @@
 import numpy as np
+import casadi as cas
 
-from .basis import bspline_basis
+from src.splines.basis import bspline_basis
 
 
 class BSpline:
-    def __init__(self, control_points):
-        self.control_points = control_points  # (N, dim)
-        self.n_control_points = self.control_points.shape[0]
+    """
+    Uniform cubic B-spline defined by a set of control points.
 
-        self.upper_bound = self.n_control_points - 3
+    Parameters
+    ----------
+    control_points : cas.MX
+        CasADi matrix of shape (num_control_points, dim), where each row is a control point.
+    """
 
-    def _basis_mat(self, ts, der=0):
-        mat = np.zeros((ts.shape[0], self.n_control_points))
-        for i, t in enumerate(ts):
-            offset = max(min(int(np.floor(t)), self.upper_bound - 1), 0)
-            u = t - offset
+    def __init__(self, control_points: cas.MX):
+        self.control_points = control_points
+        self.n_control_points = control_points.shape[0]
+        self.dimension = control_points.shape[1]
+        self.max_parameter = self.n_control_points - 3
 
-            mat[i][offset : offset + 4] = bspline_basis(u, der=der)
+    def _build_basis_matrix(
+        self,
+        sample_parameters: np.ndarray,
+        derivative_order: int = 0,
+    ) -> np.ndarray:
+        """
+        Build the global basis matrix for a set of sample parameters.
 
-        return mat
+        Parameters
+        ----------
+        sample_parameters : np.ndarray
+            1D array of parameter values in [0, max_parameter].
+        derivative_order : int, default=0
+            Derivative order of the spline basis.
 
-    def spline_eval(self, N: int, der: int = 0) -> np.ndarray:
-        ts = np.linspace(0, self.upper_bound, N)
-        basis = self._basis_mat(ts, der=der)
+        Returns
+        -------
+        np.ndarray
+            Basis matrix of shape (num_samples, num_control_points).
+        """
 
-        return basis @ self.control_points
+        basis_matrix = np.zeros((sample_parameters.shape[0], self.n_control_points))
+
+        for i, t in enumerate(sample_parameters):
+            segment_idx = max(min(int(np.floor(t)), self.max_parameter - 1), 0)
+            local_t = t - segment_idx
+            basis_matrix[i, segment_idx : segment_idx + 4] = bspline_basis(
+                local_t,
+                derivative_order=derivative_order,
+            )
+
+        return basis_matrix
+
+    def spline_eval(self, num_samples: int, derivative_order: int = 0) -> np.ndarray:
+        """
+        Evaluate the spline or one of its derivatives.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of samples along the full spline domain.
+        derivative_order : int, default=0
+            Derivative order to evaluate.
+
+        Returns
+        -------
+        np.ndarray
+            Evaluated points with shape (num_samples, dim).
+        """
+        sample_parameters = np.linspace(0.0, self.max_parameter, num_samples)
+        basis_matrix = self._build_basis_matrix(
+            sample_parameters,
+            derivative_order=derivative_order,
+        )
+        return basis_matrix @ self.control_points
