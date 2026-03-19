@@ -1,13 +1,12 @@
 import numpy as np
 import casadi as cas
 
-from src.planning.planner import MultipleGaussiansPlanner
+from src.planning.config import ProblemConfig, PlannerWeights, PlannerLimits
+from src.planning.planner import Planner, MultipleGaussiansPlanner
 from src.visualization.visualizer import MultipleGaussiansVisualizer
 
 
 def mobile_robot_demo():
-    urdf_path = "urdfs/ur5_extended_move.urdf"
-
     obstacle_means = np.array(
         [
             [2.0, 0.0, 1.0],
@@ -41,11 +40,6 @@ def mobile_robot_demo():
         ]
     )
 
-    w_jerk = 0.00001
-    w_goal = 100.0
-    w_obstacle = 0.01  # w_jerk * alfa + w_goal * beta + w_obstacle * c
-    # alfa + w_goal' * beta + w_obstacle' * c
-
     gaussians_per_link = [
         (4, [0.3, 0.5, 0.7]),
         (5, [0.2, 0.5, 0.8]),
@@ -54,38 +48,40 @@ def mobile_robot_demo():
         (8, [0.5, 0.7]),
     ]
 
-    planner = MultipleGaussiansPlanner(
-        urdf_file=urdf_path,
+    ignore_link_indices = [0, 1, 2]
+
+    theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    ee_goal = np.array([3.0, 3.0, 4.5])
+
+    planner_weights = PlannerWeights(jerk=0.00001, goal=100.0, obstacle=0.01)
+    planner_limits = PlannerLimits(wmax=5.0, vmax=5.0, amax=5.0)
+
+    problem_config = ProblemConfig(
+        urdf_file="urdfs/ur5_extended_move.urdf",
         root_link="world",
         tip_link="ee_link",
         obstacle_positions=obstacle_means,
         obstacle_covs=obstacle_covs,
         robot_cov=robot_cov,
-        gaussians_per_link=gaussians_per_link,
+        theta_start=theta_start,
+        ee_goal=ee_goal,
         num_control_points=12,
         num_samples=25,
-        weights={
-            "jerk": w_jerk,
-            "goal": w_goal,
-            "obstacle": w_obstacle,
-        },  # TODO: CAMBIAR A QUE DEPENDE DE 1 PESO
-        wmax=5.0,
-        vmax=5.0,
-        amax=5.0,
-        ignore_link_indices=[0, 1, 2],
+        weights=planner_weights,
+        limits=planner_limits,
+        ignore_link_indices=ignore_link_indices,
+        gaussians_per_link=gaussians_per_link,
     )
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    ee_goal = np.array([3.0, 3.0, 4.5])
-
-    curve = planner.plan(theta_start, ee_goal)
+    planner = MultipleGaussiansPlanner(config=problem_config)
+    curve = planner.plan()
 
     vis = MultipleGaussiansVisualizer(
         planner.robot,
         robot_cov,
         curve,
         gaussians_per_link,
-        ignore_link_indices=[0, 1, 2],
+        ignore_link_indices=ignore_link_indices,
     )
     vis.visualize_goal(ee_goal, radius=0.05)
     # vis.visualize_obstacles(table_means, table_covs, name="Table")
