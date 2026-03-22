@@ -1,17 +1,82 @@
-import numpy as np
+"""
+Utilities to build CasADi/IPOPT trajectory optimization solvers.
+
+This module provides:
+- a shared NLP construction pipeline
+- collision-point builders for different robot obstacle models
+- obstacle-cost builders for midpoint and multi-Gaussian formulations
+- public solver factories for the two supported planning modes
+"""
+
+from typing import Callable, Dict, List, Optional, Tuple
+
 import casadi as cas
+import numpy as np
 
-from src.core.robot_loader import ManipulatorRobotURDF
 from src.core.convolution import ConvolutionFunctorWarp
-
+from src.core.robot_loader import ManipulatorRobotURDF
+from src.optim.constraints import build_constraints
+from src.optim.cost_functions import get_cost_goal, get_cost_obstacles, get_cost_jerk
 from src.splines.bspline import BSpline
 from src.splines.minvo import minvo_hulls
 
-from src.optim.constraints import build_constraints
-from src.optim.cost_functions import get_cost_goal, get_cost_obstacles, get_cost_jerk
+
+DEFAULT_WEIGHTS = {
+    "jerk": 1.0,
+    "goal": 1.0,
+    "obstacle": 1.0,
+}
 
 
-def _get_ipopt_options():
+def _normalize_weights(weights: Optional[Dict[str, float]]) -> Dict[str, float]:
+    """
+    Fill missing optimization weights with default values.
+
+    Parameters
+    ----------
+    weights : dict or None
+        Optional dictionary with keys ``jerk``, ``goal``, and ``obstacle``.
+
+    Returns
+    -------
+    dict
+        Complete weights dictionary.
+    """
+    if weights is None:
+        return DEFAULT_WEIGHTS.copy()
+
+    return {**DEFAULT_WEIGHTS, **weights}
+
+
+def _validate_solver_inputs(
+    num_control_points: int,
+    num_samples: int,
+    vmax: float,
+) -> None:
+    """
+    Validate common public solver inputs.
+
+    Raises
+    ------
+    ValueError
+        If any required input is invalid.
+    """
+    if num_control_points < 4:
+        raise ValueError(
+            f"num_control_points must be at least 4 for a cubic B-spline, got {num_control_points}."
+        )
+
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}.")
+
+    if vmax <= 0:
+        raise ValueError(f"vmax must be positive, got {vmax}.")
+
+
+def _get_ipopt_options() -> Dict[str, object]:
+    """
+    Return IPOPT options used for the trajectory optimization problem.
+    """
     return {
         "ipopt.print_level": 5,
         "ipopt.max_iter": 500,
@@ -27,34 +92,81 @@ def _get_ipopt_options():
 
 
 def _create_solver_common(
-    robot,
-    num_control_points,
+    robot: ManipulatorRobotURDF,
+    num_control_points: int,
     obstacle_means,
     covs_det,
     covs_inv,
-    multiple_gaussians,
-    active_link_indices,
-    num_samples,
-    weights,
-    wmax,
-    vmax,
-    amax,
-    point_builder,
-    obstacle_cost_builder,
-    solver_name,
-    fk_name="fk",
+    multiple_gaussians: bool,
+    active_link_indices: List[int],
+    num_samples: int,
+    weights: Dict[str, float],
+    wmax: float,
+    vmax: float,
+    amax: float,
+    point_builder: Callable,
+    obstacle_cost_builder: Callable,
+    solver_name: str,
+    fk_name: str = "fk",
 ):
-    SYM_TYPE = cas.MX
+    """
+    Build a trajectory-optimization NLP using a shared construction pipeline.
+
+    This function assembles:
+    - spline decision variables
+    - start/goal parameters
+    - time-scaled spline derivatives
+    - forward kinematics along the trajectory
+    - collision evaluation points via ``point_builder``
+    - velocity and acceleration hull constraints
+    - goal, obstacle, and jerk costs
+    - the final IPOPT solver
+
+    Parameters
+    ----------
+    robot : ManipulatorRobotURDF
+        Robot model used for forward kinematics.
+    num_control_points : int
+        Number of spline control points.
+    obstacle_means : np.ndarray
+        Obstacle Gaussian means.
+    covs_det, covs_inv :
+        Precomputed covariance determinants and inverses.
+    multiple_gaussians : bool
+        Whether link-dependent covariance models are used.
+    active_link_indices : list[int]
+        Links considered in obstacle evaluation.
+    num_samples : int
+        Number of spline samples used in the optimization.
+    weights : dict
+        Optimization weights with keys ``goal``, ``obstacle``, and ``jerk``.
+    wmax, vmax, amax : float
+        Motion limits used in scaling and constraints.
+    point_builder : callable
+        Function that builds collision evaluation points.
+    obstacle_cost_builder : callable
+        Function that builds the obstacle term and its convolution functor(s).
+    solver_name : str
+        Name of the CasADi NLP solver instance.
+    fk_name : str, default="fk"
+        Name of the internal FK CasADi function.
+
+    Returns
+    -------
+    tuple
+        ``(solver, lbg, ubg, convolution_functor)``.
+    """
+    symbolic_type = cas.MX
     n_joints = robot.get_n_joints()
     n_links = robot.get_n_links()
 
     # --- Decision variables ---
-    control_points = SYM_TYPE.sym("control_points", num_control_points, n_joints)
-    dec_vars = cas.vertcat(cas.vec(control_points))
+    control_points = symbolic_type.sym("control_points", num_control_points, n_joints)
+    decision_variables = cas.vertcat(cas.vec(control_points))
 
     # --- Parameters ---
-    start_conf = SYM_TYPE.sym("start_conf", n_joints, 1)
-    goal_ee_position = SYM_TYPE.sym("goal_ee_position", 3, 1)
+    start_conf = symbolic_type.sym("start_conf", n_joints, 1)
+    goal_ee_position = symbolic_type.sym("goal_ee_position", 3, 1)
     params = cas.vertcat(cas.vec(start_conf), cas.vec(goal_ee_position))
 
     # --- Spline evaluation ---
@@ -62,26 +174,34 @@ def _create_solver_common(
     curve = bspline.spline_eval(num_samples)
 
     start_ee_position = robot.get_ee_endpoint(curve[0, :])
-    T_val = cas.norm_2(goal_ee_position - start_ee_position) / vmax
-    S = num_control_points - 4
-    m_t_to_s = S / T_val
 
-    dcurve = m_t_to_s * bspline.spline_eval(num_samples, derivative_order=1)
-    ddcurve = (m_t_to_s**2) * bspline.spline_eval(num_samples, derivative_order=2)
-    dddcurve = (m_t_to_s**3) * bspline.spline_eval(num_samples, derivative_order=3)
+    estimated_duration = cas.norm_2(goal_ee_position - start_ee_position) / vmax
+    num_segments = num_control_points - 4
+    time_to_spline_scale = num_segments / estimated_duration
+
+    dcurve = time_to_spline_scale * bspline.spline_eval(num_samples, derivative_order=1)
+    ddcurve = (time_to_spline_scale**2) * bspline.spline_eval(
+        num_samples, derivative_order=2
+    )
+    dddcurve = (time_to_spline_scale**3) * bspline.spline_eval(
+        num_samples, derivative_order=3
+    )
 
     # --- Kinematics ---
-    q_sym = SYM_TYPE.sym("q", n_joints)
+    q_sym = symbolic_type.sym("q", n_joints)
     fk_function = cas.Function(fk_name, [q_sym], [robot.forward_kinematics(q_sym)])
     kinematics_functor = fk_function.map(num_samples, "openmp")
+
     joint_positions = kinematics_functor(curve.T).T
     joint_positions_reshaped = cas.reshape(
-        joint_positions, num_samples * (n_links + 1), 3
+        joint_positions,
+        num_samples * (n_links + 1),
+        3,
     )
 
     # --- Collision evaluation points ---
     collision_points, aux_data = point_builder(
-        SYM_TYPE=SYM_TYPE,
+        symbolic_type=symbolic_type,
         joint_positions_reshaped=joint_positions_reshaped,
         num_samples=num_samples,
         n_links=n_links,
@@ -89,14 +209,18 @@ def _create_solver_common(
     )
 
     # --- Hulls ---
-    vel_hulls = [m_t_to_s * h for h in minvo_hulls(control_points, derivative_order=1)]
+    vel_hulls = [
+        time_to_spline_scale * h
+        for h in minvo_hulls(control_points, derivative_order=1)
+    ]
     acc_hulls = [
-        (m_t_to_s**2) * h for h in minvo_hulls(control_points, derivative_order=2)
+        (time_to_spline_scale**2) * h
+        for h in minvo_hulls(control_points, derivative_order=2)
     ]
 
     # --- Constraints ---
-    cons, lbg, ubg = build_constraints(
-        SYM_TYPE,
+    constraints, lbg, ubg = build_constraints(
+        symbolic_type,
         curve,
         start_conf,
         n_joints,
@@ -109,8 +233,17 @@ def _create_solver_common(
 
     # --- Costs ---
     final_ee_pos = robot.get_ee_endpoint(curve[-1, :])
-    cost_goal = get_cost_goal(final_ee_pos, goal_ee_position, weight=weights["goal"])
-    cost_jerk = get_cost_jerk(dddcurve, weight=weights["jerk"])
+
+    cost_goal = get_cost_goal(
+        final_ee_pos,
+        goal_ee_position,
+        weight=weights["goal"],
+    )
+
+    cost_jerk = get_cost_jerk(
+        dddcurve,
+        weight=weights["jerk"],
+    )
 
     cost_obstacles, convolution_functor = obstacle_cost_builder(
         collision_points=collision_points,
@@ -121,34 +254,50 @@ def _create_solver_common(
         multiple_gaussians=multiple_gaussians,
         active_link_indices=active_link_indices,
         num_samples=num_samples,
-        weights=weights,
+        obstacle_weight=weights["obstacle"],
     )
 
     total_cost = cost_goal + cost_obstacles + cost_jerk
 
     # --- NLP ---
-    nlp = {"x": dec_vars, "f": total_cost, "p": params, "g": cons}
-    solver = cas.nlpsol(solver_name, "ipopt", nlp, _get_ipopt_options())
+    nlp = {
+        "x": decision_variables,
+        "f": total_cost,
+        "p": params,
+        "g": constraints,
+    }
 
+    solver = cas.nlpsol(solver_name, "ipopt", nlp, _get_ipopt_options())
     return solver, lbg, ubg, convolution_functor
 
 
 def _build_midpoints(
-    SYM_TYPE,
+    symbolic_type,
     joint_positions_reshaped,
-    num_samples,
-    n_links,
-    active_link_indices,
+    num_samples: int,
+    n_links: int,
+    active_link_indices: List[int],
 ):
+    """
+    Build one collision evaluation point per active link and spline sample.
+
+    Each point is the midpoint of the corresponding robot link segment.
+
+    Returns
+    -------
+    tuple
+        ``(midpoints, None)`` where ``midpoints`` has shape
+        ``(num_samples * n_active_links, 3)``.
+    """
     n_active_links = len(active_link_indices)
-    midpoints = SYM_TYPE.zeros(num_samples * n_active_links, 3)
+    midpoints = symbolic_type.zeros(num_samples * n_active_links, 3)
 
     for sample_idx in range(num_samples):
-        base = sample_idx * (n_links + 1)
+        base_idx = sample_idx * (n_links + 1)
 
         for local_idx, link_idx in enumerate(active_link_indices):
-            joint1_idx = base + link_idx
-            joint2_idx = base + link_idx + 1
+            joint1_idx = base_idx + link_idx
+            joint2_idx = base_idx + link_idx + 1
 
             midpoint_idx = sample_idx * n_active_links + local_idx
             midpoints[midpoint_idx, :] = (
@@ -160,27 +309,44 @@ def _build_midpoints(
 
 
 def _build_gaussian_points(
-    SYM_TYPE,
+    symbolic_type,
     joint_positions_reshaped,
-    num_samples,
-    n_links,
-    active_link_indices,
-    gaussian_specs,
+    num_samples: int,
+    n_links: int,
+    active_link_indices: List[int],
+    gaussian_specs: List[Tuple[int, float]],
 ):
+    """
+    Build arbitrary Gaussian evaluation points along robot links.
+
+    Parameters
+    ----------
+    gaussian_specs : list[tuple[int, float]]
+        List of ``(link_idx, t)`` pairs, where ``t in [0, 1]`` interpolates
+        along the segment joining consecutive link positions.
+
+    Returns
+    -------
+    tuple
+        ``(gaussian_points, aux_data)`` where:
+        - ``gaussian_points`` has shape ``(num_samples * n_total_gaussians, 3)``
+        - ``aux_data["points_by_link"]`` groups points by link index
+        - ``aux_data["gaussian_specs"]`` stores the original point definitions
+    """
     n_total_gaussians = len(gaussian_specs)
-    gaussian_points = SYM_TYPE.zeros(num_samples * n_total_gaussians, 3)
+    gaussian_points = symbolic_type.zeros(num_samples * n_total_gaussians, 3)
     points_by_link = {link_idx: [] for link_idx in active_link_indices}
 
     for sample_idx in range(num_samples):
-        base_joint = sample_idx * (n_links + 1)
+        base_joint_idx = sample_idx * (n_links + 1)
 
-        for g_idx, (link_idx, t) in enumerate(gaussian_specs):
-            p0 = joint_positions_reshaped[base_joint + link_idx, :]
-            p1 = joint_positions_reshaped[base_joint + link_idx + 1, :]
+        for gaussian_idx, (link_idx, t) in enumerate(gaussian_specs):
+            p0 = joint_positions_reshaped[base_joint_idx + link_idx, :]
+            p1 = joint_positions_reshaped[base_joint_idx + link_idx + 1, :]
 
             point = (1.0 - t) * p0 + t * p1
 
-            flat_idx = sample_idx * n_total_gaussians + g_idx
+            flat_idx = sample_idx * n_total_gaussians + gaussian_idx
             gaussian_points[flat_idx, :] = point
             points_by_link[link_idx].append(point)
 
@@ -197,11 +363,23 @@ def _build_obstacle_cost_midpoints(
     obstacle_means,
     covs_det,
     covs_inv,
-    multiple_gaussians,
-    active_link_indices,
-    num_samples,
-    weights,
+    multiple_gaussians: bool,
+    active_link_indices: List[int],
+    num_samples: int,
+    obstacle_weight: float,
 ):
+    """
+    Build obstacle cost for the midpoint-based planner.
+
+    If ``multiple_gaussians`` is False, a single convolution functor is used
+    for all midpoint samples. Otherwise, one functor per active link is created.
+
+    Returns
+    -------
+    tuple
+        ``(cost_obstacles, convolution_functor)``.
+    """
+    del aux_data  # unused in this builder
     n_active_links = len(active_link_indices)
 
     if not multiple_gaussians:
@@ -215,14 +393,14 @@ def _build_obstacle_cost_midpoints(
         )
     else:
         convolution_functor = []
-        for k in range(n_active_links):
+        for local_idx in range(n_active_links):
             conv_func = ConvolutionFunctorWarp(
-                f"conv_link_{k}",
+                f"conv_link_{local_idx}",
                 3,
                 num_samples,
                 obstacle_means,
-                covs_det[k],
-                covs_inv[k],
+                covs_det[local_idx],
+                covs_inv[local_idx],
             )
             convolution_functor.append(conv_func)
 
@@ -231,7 +409,7 @@ def _build_obstacle_cost_midpoints(
         convolution_functor,
         multiple_gaussians,
         n_active_links,
-        weight=weights["obstacle"],
+        weight=obstacle_weight,
     )
 
     return cost_obstacles, convolution_functor
@@ -243,11 +421,25 @@ def _build_obstacle_cost_multi_gauss(
     obstacle_means,
     covs_det,
     covs_inv,
-    multiple_gaussians,
-    active_link_indices,
-    num_samples,
-    weights,
+    multiple_gaussians: bool,
+    active_link_indices: List[int],
+    num_samples: int,
+    obstacle_weight: float,
 ):
+    """
+    Build obstacle cost for the multi-Gaussian planner.
+
+    In the shared-covariance case, a single convolution functor is evaluated
+    over all Gaussian points. In the link-dependent covariance case, one
+    convolution functor per active link is used and the final result is
+    averaged over the total number of points.
+
+    Returns
+    -------
+    tuple
+        ``(cost_obstacles, convolution_functor)``.
+    """
+    del num_samples  # unused in this builder
     points_by_link = aux_data["points_by_link"]
     n_total_points = collision_points.shape[0]
 
@@ -260,11 +452,11 @@ def _build_obstacle_cost_multi_gauss(
             covs_det,
             covs_inv,
         )
-        cost_obstacles = weights["obstacle"] * convolution_functor(collision_points)
+        cost_obstacles = obstacle_weight * convolution_functor(collision_points)
         return cost_obstacles, convolution_functor
 
     active_link_to_local = {
-        link_idx: k for k, link_idx in enumerate(active_link_indices)
+        link_idx: local_idx for local_idx, link_idx in enumerate(active_link_indices)
     }
 
     convolution_functor = []
@@ -295,26 +487,58 @@ def _build_obstacle_cost_multi_gauss(
         total_points += n_link_points
 
     if total_points == 0:
-        raise ValueError("No gaussian points assigned to active links.")
+        raise ValueError("No Gaussian points assigned to active links.")
 
-    cost_obstacles = weights["obstacle"] * (weighted_sum / total_points)
+    cost_obstacles = obstacle_weight * (weighted_sum / total_points)
     return cost_obstacles, convolution_functor
 
 
 def create_solver(
     robot: ManipulatorRobotURDF,
-    num_control_points,
+    num_control_points: int,
     obstacle_means,
     covs_det,
     covs_inv,
-    multiple_gaussians,
-    active_link_indices,
-    num_samples=30,
-    weights={"jerk": 1.0, "goal": 1.0, "obstacle": 1.0},
-    wmax=1.0,
-    vmax=1.0,
-    amax=1.0,
+    multiple_gaussians: bool,
+    active_link_indices: List[int],
+    num_samples: int = 30,
+    weights: Optional[Dict[str, float]] = None,
+    wmax: float = 1.0,
+    vmax: float = 1.0,
+    amax: float = 1.0,
 ):
+    """
+    Create the standard midpoint-based trajectory optimization solver.
+
+    Parameters
+    ----------
+    robot : ManipulatorRobotURDF
+        Robot model.
+    num_control_points : int
+        Number of spline control points.
+    obstacle_means : np.ndarray
+        Obstacle Gaussian means.
+    covs_det, covs_inv :
+        Precomputed obstacle covariance determinants and inverses.
+    multiple_gaussians : bool
+        Whether link-dependent covariance models are used.
+    active_link_indices : list[int]
+        Links considered in obstacle evaluation.
+    num_samples : int, default=30
+        Number of spline samples used in the optimization.
+    weights : dict or None, default=None
+        Optimization weights. Missing keys are filled with defaults.
+    wmax, vmax, amax : float, default=1.0
+        Motion limits used in scaling and constraints.
+
+    Returns
+    -------
+    tuple
+        ``(solver, lbg, ubg, convolution_functor)``.
+    """
+    _validate_solver_inputs(num_control_points, num_samples, vmax)
+    weights = _normalize_weights(weights)
+
     return _create_solver_common(
         robot=robot,
         num_control_points=num_control_points,
@@ -337,19 +561,56 @@ def create_solver(
 
 def create_multiple_gaussians_solver(
     robot: ManipulatorRobotURDF,
-    num_control_points,
+    num_control_points: int,
     obstacle_means,
     covs_det,
     covs_inv,
-    multiple_gaussians,
-    active_link_indices,
-    gaussian_specs,
-    num_samples=30,
-    weights={"jerk": 1.0, "goal": 1.0, "obstacle": 1.0},
-    wmax=1.0,
-    vmax=1.0,
-    amax=1.0,
+    multiple_gaussians: bool,
+    active_link_indices: List[int],
+    gaussian_specs: List[Tuple[int, float]],
+    num_samples: int = 30,
+    weights: Optional[Dict[str, float]] = None,
+    wmax: float = 1.0,
+    vmax: float = 1.0,
+    amax: float = 1.0,
 ):
+    """
+    Create the multi-Gaussian trajectory optimization solver.
+
+    Parameters
+    ----------
+    robot : ManipulatorRobotURDF
+        Robot model.
+    num_control_points : int
+        Number of spline control points.
+    obstacle_means : np.ndarray
+        Obstacle Gaussian means.
+    covs_det, covs_inv :
+        Precomputed obstacle covariance determinants and inverses.
+    multiple_gaussians : bool
+        Whether link-dependent covariance models are used.
+    active_link_indices : list[int]
+        Links considered in obstacle evaluation.
+    gaussian_specs : list[tuple[int, float]]
+        List of Gaussian sampling points along links as ``(link_idx, t)``.
+    num_samples : int, default=30
+        Number of spline samples used in the optimization.
+    weights : dict or None, default=None
+        Optimization weights. Missing keys are filled with defaults.
+    wmax, vmax, amax : float, default=1.0
+        Motion limits used in scaling and constraints.
+
+    Returns
+    -------
+    tuple
+        ``(solver, lbg, ubg, convolution_functor)``.
+    """
+    _validate_solver_inputs(num_control_points, num_samples, vmax)
+    weights = _normalize_weights(weights)
+
+    if len(gaussian_specs) == 0:
+        raise ValueError("gaussian_specs must contain at least one Gaussian point.")
+
     def point_builder(**kwargs):
         return _build_gaussian_points(
             **kwargs,

@@ -1,16 +1,43 @@
-import numpy as np
+"""
+Trajectory planner interfaces built on top of the optimization layer.
+
+This module provides:
+- a shared base planner with common robot/problem setup
+- a standard midpoint-based planner
+- a planner using multiple Gaussian samples along selected links
+"""
 
 from typing import List, Tuple
 
+import numpy as np
+
 from src.core.robot_loader import ManipulatorRobotURDF
-from src.optim.solver import create_solver, create_multiple_gaussians_solver
-from src.splines.bspline import BSpline
-from src.planning.initializer import RRTStarInitializer
+from src.optim.solver import create_multiple_gaussians_solver, create_solver
 from src.planning.config import ProblemConfig
+from src.planning.initializer import RRTStarInitializer
+from src.splines.bspline import BSpline
 
 
 class BasePlanner:
+    """
+    Base class for optimization-based trajectory planners.
+
+    This class owns:
+    - the robot model
+    - common planning parameters
+    - covariance preprocessing
+    - the optimization solve loop
+
+    Subclasses only need to implement `_create_solver()`.
+    """
+
     def __init__(self, config: ProblemConfig):
+        """
+        Parameters
+        ----------
+        config : ProblemConfig
+            Full planning problem definition.
+        """
         self.config = config
 
         # --- Robot ---
@@ -25,7 +52,7 @@ class BasePlanner:
         self.joint_limits = self.robot.get_joint_limits()
         self.chain_links = self.robot.get_links()
 
-        # --- Planning params ---
+        # --- Planning parameters ---
         self.num_control_points = config.num_control_points
         self.num_samples = config.num_samples
         self.weights = config.weights.as_dict()
@@ -40,84 +67,150 @@ class BasePlanner:
 
         self.ignore_link_indices = sorted(set(config.ignore_link_indices))
         self.active_link_indices = [
-            i for i in range(self.n_links) if i not in self.ignore_link_indices
+            link_idx
+            for link_idx in range(self.n_links)
+            if link_idx not in self.ignore_link_indices
         ]
         self.n_active_links = len(self.active_link_indices)
 
-        self.multiple_gaussians, self.covs_det, self.covs_inv = self._precompute_covs()
+        # --- Precomputed obstacle/robot covariance terms ---
+        (
+            self.multiple_gaussians,
+            self.covs_det,
+            self.covs_inv,
+        ) = self._precompute_covariances()
 
+        # --- Solver ---
         self.solver, self.lbg, self.ubg, self.convolution_functor = (
             self._create_solver()
         )
 
-    def _precompute_covs(self):
+    def _precompute_covariances(self):
+        """
+        Precompute determinants and inverses of obstacle+robot covariance sums.
+
+        Returns
+        -------
+        tuple
+            `(multiple_gaussians, covs_det, covs_inv)` where:
+            - `multiple_gaussians` indicates whether the robot covariance is
+              link-dependent
+            - `covs_det` contains covariance determinants
+            - `covs_inv` contains covariance inverses
+
+        Raises
+        ------
+        ValueError
+            If `robot_cov` does not have shape `(3, 3)` or `(n_links, 3, 3)`.
+        """
         robot_cov = self.robot_cov
 
         if robot_cov.ndim == 2:
-            multiple_gaussians = False
-            covs_sum = self.obstacle_covs + robot_cov
+            combined_covs = self.obstacle_covs + robot_cov
+            return False, np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
 
-        elif robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
-            multiple_gaussians = True
-            covs_sum = np.zeros(
+        if robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
+            combined_covs = np.zeros(
                 (self.n_active_links, self.obstacle_covs.shape[0], 3, 3)
             )
 
-            for k, link_idx in enumerate(self.active_link_indices):
-                covs_sum[k] = self.obstacle_covs + robot_cov[link_idx]
+            for local_idx, link_idx in enumerate(self.active_link_indices):
+                combined_covs[local_idx] = self.obstacle_covs + robot_cov[link_idx]
 
-        else:
-            raise ValueError(
-                f"robot_cov must be (3,3) or (n_links,3,3). Got {robot_cov.shape}"
-            )
+            return True, np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
 
-        return multiple_gaussians, np.linalg.det(covs_sum), np.linalg.inv(covs_sum)
+        raise ValueError(
+            "robot_cov must have shape (3, 3) or (n_links, 3, 3). "
+            f"Got {robot_cov.shape}."
+        )
 
-    def plan(self, theta_start: np.ndarray = None, ee_goal: np.ndarray = None):
+    def _build_initializer(self) -> RRTStarInitializer:
+        """
+        Create the initializer used to generate the optimization warm start.
+
+        Returns
+        -------
+        RRTStarInitializer
+            Joint-space RRT* initializer.
+        """
+        return RRTStarInitializer(self.robot)
+
+    def plan(
+        self,
+        theta_start: np.ndarray = None,
+        ee_goal: np.ndarray = None,
+    ) -> np.ndarray:
+        """
+        Solve the trajectory optimization problem.
+
+        Parameters
+        ----------
+        theta_start : np.ndarray, optional
+            Initial joint configuration of shape `(n_joints,)`.
+            If omitted, `config.theta_start` is used.
+        ee_goal : np.ndarray, optional
+            Target end-effector position of shape `(3,)`.
+            If omitted, `config.ee_goal` is used.
+
+        Returns
+        -------
+        np.ndarray
+            Optimized spline samples with shape `(num_samples, n_joints)`.
+        """
         theta_start = self.config.theta_start if theta_start is None else theta_start
         ee_goal = self.config.ee_goal if ee_goal is None else ee_goal
 
-        rrt_star = RRTStarInitializer(self.robot)
-        init_guess = rrt_star.generate_initial_path(
+        initializer = self._build_initializer()
+        initial_guess = initializer.generate_initial_path(
             theta_start,
             ee_goal,
             self.num_control_points,
         )
 
         params_val = np.concatenate((theta_start, ee_goal))
-        res = self.solver(x0=init_guess, lbg=self.lbg, ubg=self.ubg, p=params_val)
-
-        control_points_opt = (
-            np.array(res["x"]).reshape(self.n_joints, self.num_control_points).T
+        result = self.solver(
+            x0=initial_guess,
+            lbg=self.lbg,
+            ubg=self.ubg,
+            p=params_val,
         )
 
-        bspline = BSpline(control_points_opt)
+        optimal_control_points = (
+            np.array(result["x"]).reshape(self.n_joints, self.num_control_points).T
+        )
+
+        bspline = BSpline(optimal_control_points)
         return bspline.spline_eval(self.num_samples)
 
-    def _path_to_numpy(self, path):
-        states = []
-        for i in range(path.getStateCount()):
-            state = path.getState(i)
-            q = np.array([state[j] for j in range(self.n_joints)])
-            states.append(q)
+    def _create_solver(self):
+        """
+        Create the CasADi solver for the current planner type.
 
-        return np.array(states).flatten(order="C")
+        Must be implemented by subclasses.
 
-    def _is_state_valid(self, state):
-        q = np.array([state[i] for i in range(self.n_joints)])
-
-        for i, (low, high) in enumerate(self.joint_limits):
-            if q[i] < low or q[i] > high:
-                return False
-
-        return True
-
-    def _create_sovler(self):
+        Raises
+        ------
+        NotImplementedError
+        """
         raise NotImplementedError
 
 
 class Planner(BasePlanner):
+    """
+    Standard planner using one collision evaluation point per active link.
+
+    The obstacle term is built from link midpoints sampled along the trajectory.
+    """
+
     def _create_solver(self):
+        """
+        Create the midpoint-based optimization solver.
+
+        Returns
+        -------
+        tuple
+            `(solver, lbg, ubg, convolution_functor)`.
+        """
         return create_solver(
             robot=self.robot,
             num_control_points=self.num_control_points,
@@ -135,7 +228,25 @@ class Planner(BasePlanner):
 
 
 class MultipleGaussiansPlanner(BasePlanner):
+    """
+    Planner using multiple Gaussian evaluation points along selected links.
+
+    Gaussian samples are defined by `(link_idx, t)` pairs, where `t in [0, 1]`
+    indicates the interpolation factor along a link segment.
+    """
+
     def __init__(self, config: ProblemConfig):
+        """
+        Parameters
+        ----------
+        config : ProblemConfig
+            Planning problem configuration. Must include `gaussians_per_link`.
+
+        Raises
+        ------
+        ValueError
+            If the configuration does not define Gaussian samples.
+        """
         if not config.use_multiple_gaussians:
             raise ValueError(
                 "MultipleGaussiansPlanner requires config.gaussians_per_link."
@@ -147,14 +258,40 @@ class MultipleGaussiansPlanner(BasePlanner):
 
         super().__init__(config)
 
-    def _build_gaussian_specs(self, gaussians_per_link):
+    def _build_gaussian_specs(
+        self,
+        gaussians_per_link: List[Tuple[int, List[float]]],
+    ) -> List[Tuple[int, float]]:
+        """
+        Flatten grouped Gaussian definitions into a list of point specifications.
+
+        Parameters
+        ----------
+        gaussians_per_link : list[tuple[int, list[float]]]
+            Per-link Gaussian definitions. Each entry contains a link index and
+            a list of interpolation parameters along that link.
+
+        Returns
+        -------
+        list[tuple[int, float]]
+            Flat list of `(link_idx, t)` pairs.
+        """
         gaussian_specs = []
         for link_idx, t_values in gaussians_per_link:
             for t in t_values:
                 gaussian_specs.append((link_idx, t))
+
         return gaussian_specs
 
     def _create_solver(self):
+        """
+        Create the multi-Gaussian optimization solver.
+
+        Returns
+        -------
+        tuple
+            `(solver, lbg, ubg, convolution_functor)`.
+        """
         return create_multiple_gaussians_solver(
             robot=self.robot,
             num_control_points=self.num_control_points,
