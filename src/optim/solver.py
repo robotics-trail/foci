@@ -226,7 +226,7 @@ def _create_solver_common(
         n_joints,
         vel_hulls,
         acc_hulls,
-        start_limit=0.01,
+        start_limit=0.0,
         vel_limit=wmax**2,
         acc_limit=amax**2,
     )
