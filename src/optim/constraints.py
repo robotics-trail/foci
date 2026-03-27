@@ -113,18 +113,20 @@ def add_hulls_constraints(
     """
     for hull in hulls:
         for row_idx in range(hull.shape[0]):
-            hull_constraint = sum(
-                hull[row_idx, joint_idx] ** 2 for joint_idx in range(n_joints)
-            )
+            # hull_constraint = sum(
+            #     hull[row_idx, joint_idx] ** 2 for joint_idx in range(n_joints)
+            # )
+            for joint_idx in range(hull.shape[1]):
+                hull_constraint = hull[row_idx, joint_idx]
 
-            constraints, lower_bounds, upper_bounds = _append_scalar_constraint(
-                constraints,
-                lower_bounds,
-                upper_bounds,
-                hull_constraint,
-                lower_bound,
-                upper_bound,
-            )
+                constraints, lower_bounds, upper_bounds = _append_scalar_constraint(
+                    constraints,
+                    lower_bounds,
+                    upper_bounds,
+                    hull_constraint,
+                    lower_bound,
+                    upper_bound,
+                )
 
     return constraints, lower_bounds, upper_bounds
 
