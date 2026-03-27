@@ -64,6 +64,7 @@ class RRTStarInitializer(PathInitializer):
         start: np.ndarray,
         goal: np.ndarray,
         num_control_points: int,
+        threshold: float = 0.05,
     ) -> np.ndarray:
         """
         Generate an initial path for the optimizer.
@@ -84,7 +85,7 @@ class RRTStarInitializer(PathInitializer):
         """
         space, space_info = self._setup_space()
         start_state = self._create_state(space, start)
-        goal_region = EEGoal(space_info, self.robot, goal)
+        goal_region = EEGoal(space_info, self.robot, goal, threshold)
 
         return self._plan_rrt_star(
             space_info,
