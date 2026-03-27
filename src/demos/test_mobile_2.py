@@ -23,6 +23,9 @@ def mobile_robot_demo():
         ]
     )
 
+    colors = np.array([[100, 255, 100], [100, 255, 100], [100, 255, 100]])
+    opacities = np.array([[0.5], [0.5], [0.5]])
+
     # robot_cov = np.eye(3) * 0.2**2
     robot_cov = np.array(
         [
@@ -54,7 +57,7 @@ def mobile_robot_demo():
     ee_goal = np.array([3.0, 3.0, 4.5])
 
     planner_weights = PlannerWeights(jerk=0.00001, goal=100.0, obstacle=0.01)
-    planner_limits = PlannerLimits(wmax=5.0, vmax=5.0, amax=5.0)
+    planner_limits = PlannerLimits(wmax=2.0, vmax=5.0, amax=2.0)
 
     problem_config = ProblemConfig(
         urdf_file="urdfs/ur5_extended_move.urdf",
@@ -74,7 +77,12 @@ def mobile_robot_demo():
     )
 
     planner = MultipleGaussiansPlanner(config=problem_config)
-    curve = planner.plan()
+    curve, timings = planner.plan()
+
+    print("\n--- Planning timings ---")
+    print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
+    print(f"Solver:          {timings['solver_time']:.6f} s")
+    print(f"Total:           {timings['total_time']:.6f} s")
 
     vis = MultipleGaussiansVisualizer(
         planner.robot,
@@ -86,6 +94,9 @@ def mobile_robot_demo():
     vis.visualize_goal(ee_goal, radius=0.05)
     # vis.visualize_obstacles(table_means, table_covs, name="Table")
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(100, 255, 100))
+    # vis.visualize_gaussian_splat(
+    #     "Test", obstacle_means, obstacle_covs, colors, opacities
+    # )
     vis.visualize_robot_gaussians()
     vis.visualize_trajectory()
 

@@ -295,6 +295,16 @@ class BaseVisualizer:
             )
             self._robot_gauss_handles.append(handle)
 
+    def visualize_gaussian_splat(
+        self,
+        name: str,
+        means: np.ndarray,
+        covariances: np.ndarray,
+        colors: np.ndarray,
+        opacities: np.ndarray,
+    ):
+        self.server.add_gaussian_splats(name, means, covariances, colors, opacities)
+
     def _visualize_trajectory_live(self, dt: float, loop: bool):
         """
         Play the trajectory live in the Viser scene.

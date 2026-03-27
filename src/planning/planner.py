@@ -9,6 +9,7 @@ This module provides:
 
 from typing import List, Tuple
 
+import time
 import numpy as np
 
 from src.core.robot_loader import ManipulatorRobotURDF
@@ -139,6 +140,7 @@ class BasePlanner:
         self,
         theta_start: np.ndarray = None,
         ee_goal: np.ndarray = None,
+        return_timings: bool = True,
     ) -> np.ndarray:
         """
         Solve the trajectory optimization problem.
@@ -161,26 +163,43 @@ class BasePlanner:
         ee_goal = self.config.ee_goal if ee_goal is None else ee_goal
 
         initializer = self._build_initializer()
+
+        t0 = time.perf_counter()
         initial_guess = initializer.generate_initial_path(
             theta_start,
             ee_goal,
             self.num_control_points,
         )
+        t1 = time.perf_counter()
 
         params_val = np.concatenate((theta_start, ee_goal))
+
+        t2 = time.perf_counter()
         result = self.solver(
             x0=initial_guess,
             lbg=self.lbg,
             ubg=self.ubg,
             p=params_val,
         )
+        t3 = time.perf_counter()
 
         optimal_control_points = (
             np.array(result["x"]).reshape(self.n_joints, self.num_control_points).T
         )
 
         bspline = BSpline(optimal_control_points)
-        return bspline.spline_eval(self.num_samples)
+        trajectory = bspline.spline_eval(self.num_samples)
+
+        timings = {
+            "initializer_rrt_time": t1 - t0,
+            "solver_time": t3 - t2,
+            "total_time": (t1 - t0) + (t3 - t2),
+        }
+
+        if return_timings:
+            return trajectory, timings
+
+        return trajectory
 
     def _create_solver(self):
         """
