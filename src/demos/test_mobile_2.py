@@ -1,8 +1,9 @@
 import numpy as np
 import casadi as cas
 
+from src.planning.initializer import RRTStarConfig
 from src.planning.config import ProblemConfig, PlannerWeights, PlannerLimits
-from src.planning.planner import Planner, MultipleGaussiansPlanner
+from src.planning.planner import Planner, MultipleGaussiansPlanner, RRTStarPlanner
 from src.visualization.visualizer import MultipleGaussiansVisualizer
 
 
@@ -59,6 +60,7 @@ def mobile_robot_demo():
     planner_weights = PlannerWeights(jerk=0.00001, goal=100.0, obstacle=0.01)
     planner_limits = PlannerLimits(wmax=2.0, vmax=5.0, amax=2.0)
 
+    initializer_config = RRTStarConfig(solve_time=3.0, random_seed=42)
     problem_config = ProblemConfig(
         urdf_file="urdfs/ur5_extended_move.urdf",
         root_link="world",
@@ -76,13 +78,23 @@ def mobile_robot_demo():
         gaussians_per_link=gaussians_per_link,
     )
 
-    planner = MultipleGaussiansPlanner(config=problem_config)
+    planner = MultipleGaussiansPlanner(
+        config=problem_config, initializer_config=initializer_config
+    )
+    # planner = RRTStarPlanner(
+    #     config=problem_config, initializer_config=initializer_config
+    # )
+
     curve, timings = planner.plan()
 
     print("\n--- Planning timings ---")
     print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
     print(f"Solver:          {timings['solver_time']:.6f} s")
     print(f"Total:           {timings['total_time']:.6f} s")
+
+    # print("\n--- Planning timings ---")
+    # print(f"Solver:          {timings['rrt_time']:.6f} s")
+    # print(f"Total:           {timings['total_time']:.6f} s")
 
     vis = MultipleGaussiansVisualizer(
         planner.robot,

@@ -15,8 +15,61 @@ import numpy as np
 from src.core.robot_loader import ManipulatorRobotURDF
 from src.optim.solver import create_multiple_gaussians_solver, create_solver
 from src.planning.config import ProblemConfig
-from src.planning.initializer import RRTStarInitializer
+from src.planning.initializer import RRTStarInitializer, RRTStarConfig
 from src.splines.bspline import BSpline
+
+
+class RRTStarPlanner:
+    """
+    Baseline planner using only OMPL RRT*.
+    """
+
+    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
+        self.config = config
+        self.initializer_config = initializer_config
+        self.robot = ManipulatorRobotURDF(
+            config.urdf_file,
+            config.root_link,
+            config.tip_link,
+        )
+        self.n_joints = self.robot.get_n_joints()
+        self.num_control_points = config.num_control_points
+        self.num_samples = config.num_samples
+
+    def plan(
+        self,
+        theta_start: np.ndarray = None,
+        ee_goal: np.ndarray = None,
+        return_timings: bool = True,
+    ):
+        theta_start = self.config.theta_start if theta_start is None else theta_start
+        ee_goal = self.config.ee_goal if ee_goal is None else ee_goal
+
+        initializer = RRTStarInitializer(self.robot, config=self.initializer_config)
+
+        t0 = time.perf_counter()
+        control_points_flat = initializer.generate_initial_path(
+            theta_start, ee_goal, self.num_control_points, threshold=0.01
+        )
+        t1 = time.perf_counter()
+
+        control_points = control_points_flat.reshape(
+            self.num_control_points, self.n_joints
+        )
+
+        # Para comparar con tu método final, lo convertimos también en trayectoria muestreada
+        bspline = BSpline(control_points)
+        trajectory = bspline.spline_eval(self.num_samples)
+
+        timings = {
+            "rrt_time": t1 - t0,
+            "total_time": t1 - t0,
+        }
+
+        if return_timings:
+            return trajectory, timings
+
+        return trajectory
 
 
 class BasePlanner:
@@ -32,14 +85,17 @@ class BasePlanner:
     Subclasses only need to implement `_create_solver()`.
     """
 
-    def __init__(self, config: ProblemConfig):
+    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
         """
         Parameters
         ----------
         config : ProblemConfig
             Full planning problem definition.
+        initializer_config : RRTStarConfig
+            Initializer definition.
         """
         self.config = config
+        self.initializer_config = initializer_config
 
         # --- Robot ---
         self.robot = ManipulatorRobotURDF(
@@ -134,7 +190,7 @@ class BasePlanner:
         RRTStarInitializer
             Joint-space RRT* initializer.
         """
-        return RRTStarInitializer(self.robot)
+        return RRTStarInitializer(self.robot, self.initializer_config)
 
     def plan(
         self,
@@ -254,7 +310,7 @@ class MultipleGaussiansPlanner(BasePlanner):
     indicates the interpolation factor along a link segment.
     """
 
-    def __init__(self, config: ProblemConfig):
+    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
         """
         Parameters
         ----------
@@ -275,7 +331,7 @@ class MultipleGaussiansPlanner(BasePlanner):
         self.gaussian_specs = self._build_gaussian_specs(self.gaussians_per_link)
         self.n_total_gaussians = len(self.gaussian_specs)
 
-        super().__init__(config)
+        super().__init__(config, initializer_config)
 
     def _build_gaussian_specs(
         self,

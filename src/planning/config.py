@@ -76,6 +76,10 @@ class ProblemConfig:
         Initial joint configuration with shape (n_joints,).
     ee_goal : np.ndarray
         Desired end-effector goal position with shape (3,).
+    initializer_solve_time: float
+        Desired solve time for initializer.
+    random_seed: int
+        Desired random seed for initializer.
     """
 
     urdf_file: str
@@ -97,6 +101,9 @@ class ProblemConfig:
 
     ignore_link_indices: List[int] = field(default_factory=list)
     gaussians_per_link: Optional[List[Tuple[int, List[float]]]] = None
+
+    initializer_solve_time: float = field(default=3.0)
+    random_seed: int = field(default=42)
 
     @property
     def use_multiple_gaussians(self) -> bool:
