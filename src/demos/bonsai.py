@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from src.utils.ply import extract_splat_data_2
+from src.planning.initializer import RRTStarConfig
 from src.planning.config import ProblemConfig, PlannerWeights, PlannerLimits
 from src.planning.planner import Planner, MultipleGaussiansPlanner
 from src.visualization.visualizer import MultipleGaussiansVisualizer, Visualizer
@@ -42,11 +43,15 @@ def bonsai_demo(ply_file: str, urdf_path: str, ee_goal: np.ndarray, scale_factor
 
     #ignore_link_indices = [0, 1, 2]
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    #theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
     
 
-    planner_weights = PlannerWeights(jerk=0.00001, goal=500.0, obstacle=0.05)
-    planner_limits = PlannerLimits(wmax=5.0, vmax=5.0, amax=5.0)
+    planner_weights = PlannerWeights(jerk=0.00005, goal=800.0, obstacle=0.001)
+    planner_limits = PlannerLimits(wmax=5.0, vmax=7.5, amax=4.5)
+
+    
+    initializer_config = RRTStarConfig(solve_time=5.0, random_seed=42)
 
     problem_config = ProblemConfig(
         urdf_file=urdf_path,
@@ -64,9 +69,17 @@ def bonsai_demo(ply_file: str, urdf_path: str, ee_goal: np.ndarray, scale_factor
         gaussians_per_link=gaussians_per_link,
     )
 
-    planner = MultipleGaussiansPlanner(config=problem_config)
+    planner = MultipleGaussiansPlanner(config=problem_config, initializer_config=initializer_config)    
     #planner = Planner(config=problem_config)
-    curve = planner.plan()
+    curve, timings = planner.plan()
+    
+    print("\n--- Planning timings ---")
+    print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
+    print(f"Solver:          {timings['solver_time']:.6f} s")
+    print(f"Total:           {timings['total_time']:.6f} s")
+
+
+    print("Last configuration:", curve[-1])
 
     vis = MultipleGaussiansVisualizer(
         planner.robot,
@@ -96,4 +109,4 @@ if __name__ == "__main__":
     urdf_path = "urdfs/ur5.urdf"
     urdf_path = "urdfs/ur5_extended.urdf"
 
-    bonsai_demo(ply_file, urdf_path, ee_goal = np.array([0.2, 1.3, 2.0]), scale_factor=3.0, subsample_rate=1.0, translation=np.array([0.0, 1.5, 1.0]))
+    bonsai_demo(ply_file, urdf_path, ee_goal = np.array([-2.0, 2.2, 0.5]), scale_factor=3.0, subsample_rate=1.0, translation=np.array([0.0, 1.5, 1.0]))

@@ -227,8 +227,8 @@ def _create_solver_common(
         vel_hulls,
         acc_hulls,
         start_limit=0.0,
-        vel_limit=wmax,
-        acc_limit=amax,
+        vel_limit=wmax**2,
+        acc_limit=amax**2,
     )
 
     # --- Costs ---
