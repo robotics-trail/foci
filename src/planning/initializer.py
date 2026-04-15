@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
+
+import open3d as o3d
 from ompl import base as ob
 from ompl import geometric as og
 from ompl import util as ou
@@ -18,6 +20,7 @@ class RRTStarConfig:
     """
 
     solve_time: float = 3.0
+    voxel_size: float = 0.10
     random_seed: Optional[int] = 42
 
 
@@ -49,12 +52,22 @@ class RRTStarInitializer(PathInitializer):
     def __init__(
         self,
         robot: ManipulatorRobotURDF,
+        obstacle_means: np.ndarray,
+        gaussians_per_link,
         config: Optional[RRTStarConfig] = None,
     ):
         self.robot = robot
         self.n_joints = robot.get_n_joints()
         self.joint_limits = robot.get_joint_limits()
+
+        self.obstacle_means = obstacle_means
+        self.gaussians_per_link = gaussians_per_link
+
         self.config = RRTStarConfig() if config is None else config
+
+        self.occupancy_map = self._build_occupancy_map(
+            self.obstacle_means, self.config.voxel_size
+        )
 
         if self.config.random_seed is not None:
             ou.RNG.setSeed(self.config.random_seed)
@@ -64,7 +77,7 @@ class RRTStarInitializer(PathInitializer):
         start: np.ndarray,
         goal: np.ndarray,
         num_control_points: int,
-        threshold: float = 0.05,
+        threshold: float = 0.01,
     ) -> np.ndarray:
         """
         Generate an initial path for the optimizer.
@@ -92,6 +105,14 @@ class RRTStarInitializer(PathInitializer):
             start_state,
             goal_region,
             num_control_points,
+        )
+
+    def _build_occupancy_map(self, obstacle_means, voxel_size):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(obstacle_means)
+
+        return o3d.geometry.VoxelGrid.create_from_point_cloud(
+            pcd, voxel_size=voxel_size
         )
 
     def _plan_rrt_star(
@@ -161,10 +182,47 @@ class RRTStarInitializer(PathInitializer):
         Check whether a state is inside joint limits.
         """
         q = np.array([state[joint_idx] for joint_idx in range(self.n_joints)])
+
+        if not self._within_joint_limits(q):
+            return False
+
+        if self._robot_in_collision(q):
+            return False
+
+        return True
+
+    def _within_joint_limits(self, q: np.ndarray) -> bool:
         for joint_idx, (lower, upper) in enumerate(self.joint_limits):
             if q[joint_idx] < lower or q[joint_idx] > upper:
                 return False
+
         return True
+
+    def _robot_in_collision(self, q: np.ndarray):
+        fk = self.robot.forward_kinematics(q)
+        fk = np.array(fk.full()).reshape(-1)
+        points = fk.reshape(-1, 3)
+
+        sampled_points = []
+
+        for link_idx, gaussian_t_list in self.gaussians_per_link:
+            p0 = points[link_idx]
+            p1 = points[link_idx + 1]
+
+            for t in gaussian_t_list:
+                point = (1.0 - t) * p0 + t * p1
+                sampled_points.append(point)
+
+        if len(sampled_points) == 0:
+            return False
+
+        sampled_points = np.asarray(sampled_points, dtype=float)
+
+        included = self.occupancy_map.check_if_included(
+            o3d.utility.Vector3dVector(sampled_points)
+        )
+
+        return np.any(np.asarray(included, dtype=bool))
 
     def _path_to_numpy(self, path: og.PathGeometric) -> np.ndarray:
         """

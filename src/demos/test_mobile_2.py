@@ -60,7 +60,7 @@ def mobile_robot_demo():
     planner_weights = PlannerWeights(jerk=0.00001, goal=100.0, obstacle=0.01)
     planner_limits = PlannerLimits(wmax=2.0, vmax=5.0, amax=2.0)
 
-    initializer_config = RRTStarConfig(solve_time=3.0, random_seed=42)
+    initializer_config = RRTStarConfig(solve_time=3.0, voxel_size=0.1, random_seed=42)
     problem_config = ProblemConfig(
         urdf_file="urdfs/ur5_extended_move.urdf",
         root_link="world",

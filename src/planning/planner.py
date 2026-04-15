@@ -130,6 +130,8 @@ class BasePlanner:
         ]
         self.n_active_links = len(self.active_link_indices)
 
+        self.gaussians_per_link = config.gaussians_per_link
+
         # --- Precomputed obstacle/robot covariance terms ---
         (
             self.multiple_gaussians,
@@ -190,7 +192,12 @@ class BasePlanner:
         RRTStarInitializer
             Joint-space RRT* initializer.
         """
-        return RRTStarInitializer(self.robot, self.initializer_config)
+        return RRTStarInitializer(
+            self.robot,
+            self.obstacle_positions,
+            self.gaussians_per_link,
+            self.initializer_config,
+        )
 
     def plan(
         self,
