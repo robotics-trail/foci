@@ -303,7 +303,7 @@ class BaseVisualizer:
         colors: np.ndarray,
         opacities: np.ndarray,
     ):
-        self.server.add_gaussian_splats(name, means, covariances, colors, opacities)
+        self.server.add_gaussian_splats(name=name, centers=means, covariances=covariances, rgbs=colors, opacities=opacities)
 
     def _visualize_trajectory_live(self, dt: float, loop: bool):
         """

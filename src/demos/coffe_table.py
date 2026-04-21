@@ -60,7 +60,12 @@ def coffe_table_demo(
         config=problem_config, initializer_config=initializer_config
     )
 
-    curve = planner.plan(theta_start, ee_goal)
+    curve, timings = planner.plan(theta_start, ee_goal)
+    
+    obstacle_means = np.ascontiguousarray(obstacle_means, dtype=np.float32)
+    obstacle_covs = np.ascontiguousarray(obstacle_covs, dtype=np.float32)
+    colors = np.ascontiguousarray(colors, dtype=np.float32)
+    opacities = np.ascontiguousarray(opacities, dtype=np.float32)
 
     vis = MultipleGaussiansVisualizer(
         planner.robot,
