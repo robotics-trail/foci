@@ -79,13 +79,13 @@ def _get_ipopt_options() -> Dict[str, object]:
     """
     return {
         "ipopt.print_level": 5,
-        "ipopt.max_iter": 500,
-        "ipopt.tol": 1e-1,
+        "ipopt.max_iter": 1_000,
+        "ipopt.tol": 1e-6,
         "print_time": 0,
-        "ipopt.acceptable_tol": 1e-1,
-        "ipopt.acceptable_obj_change_tol": 1e-1,
-        "ipopt.constr_viol_tol": 1e-1,
-        "ipopt.acceptable_iter": 1,
+        "ipopt.acceptable_tol": 1e-6,
+        "ipopt.acceptable_obj_change_tol": 1e-6,
+        "ipopt.constr_viol_tol": 1e-6,
+        "ipopt.acceptable_iter": 3,
         "ipopt.linear_solver": "mumps",
         "ipopt.hessian_approximation": "limited-memory",
     }
@@ -635,3 +635,119 @@ def create_multiple_gaussians_solver(
         solver_name="solver_multi_gauss",
         fk_name="fk_multi_gauss",
     )
+
+
+def create_drone_solver(
+    robot,
+    num_control_points: int,
+    obstacle_means,
+    covs_det,
+    covs_inv,
+    num_samples: int = 30,
+    weights: Optional[Dict[str, float]] = None,
+    wmax: float = 1.0,
+    vmax: float = 1.0,
+    amax: float = 1.0,
+):
+
+    symbolic_type = cas.MX
+    n_joints = robot.get_n_joints()
+
+    # --- Decision variables ---
+    control_points = symbolic_type.sym("control_points", num_control_points, n_joints)
+    decision_variables = cas.vertcat(cas.vec(control_points))
+
+    # --- Parameters ---
+    start_conf = symbolic_type.sym("start_conf", n_joints, 1)
+    goal_position = symbolic_type.sym("goal_position", 3, 1)
+    params = cas.vertcat(cas.vec(start_conf), cas.vec(goal_position))
+
+    # --- Spline evaluation ---
+    bspline = BSpline(control_points)
+    curve = bspline.spline_eval(num_samples)
+
+    start_pos = robot.get_goal_point(curve[0, :])
+    estimated_duration = cas.norm_2(goal_position - start_pos) / vmax
+    num_segments = num_control_points - 4
+    time_to_spline_scale = num_segments / estimated_duration
+
+    dcurve = time_to_spline_scale * bspline.spline_eval(num_samples, derivative_order=1)
+    ddcurve = (time_to_spline_scale**2) * bspline.spline_eval(
+        num_samples, derivative_order=2
+    )
+    dddcurve = (time_to_spline_scale**3) * bspline.spline_eval(
+        num_samples, derivative_order=3
+    )
+
+    # --- Collision points ---
+    q_sym = symbolic_type.sym("q", n_joints)
+    collision_fun = cas.Function(
+        "drone_collision_points",
+        [q_sym],
+        [robot.get_collision_points(q_sym)],
+    )
+    collision_map = collision_fun.map(num_samples, "openmp")
+
+    collision_points = collision_map(curve.T)
+
+    # reshape to (num_samples * 3, 3)
+    collision_points = cas.reshape(collision_points.T, num_samples * 3, 3)
+
+    # --- Constraints ---
+    vel_hulls = [
+        time_to_spline_scale * h
+        for h in minvo_hulls(control_points, derivative_order=1)
+    ]
+    acc_hulls = [
+        (time_to_spline_scale**2) * h
+        for h in minvo_hulls(control_points, derivative_order=2)
+    ]
+
+    constraints, lbg, ubg = build_constraints(
+        symbolic_type,
+        curve,
+        start_conf,
+        n_joints,
+        vel_hulls,
+        acc_hulls,
+        start_limit=0.0,
+        vel_limit=wmax,
+        acc_limit=amax,
+    )
+
+    # --- Costs ---
+    final_pos = robot.get_goal_point(curve[-1, :])
+
+    cost_goal = get_cost_goal(
+        final_pos,
+        goal_position,
+        weight=weights["goal"],
+    )
+
+    cost_jerk = get_cost_jerk(
+        dddcurve,
+        weight=weights["jerk"],
+    )
+
+    convolution_functor = ConvolutionFunctorWarp(
+        "conv_drone",
+        3,
+        num_samples * 3,
+        obstacle_means,
+        covs_det,
+        covs_inv,
+    )
+
+    cost_obstacles = weights["obstacle"] * convolution_functor(collision_points)
+
+    total_cost = cost_goal + cost_obstacles + cost_jerk
+
+    nlp = {
+        "x": decision_variables,
+        "f": total_cost,
+        "p": params,
+        "g": constraints,
+    }
+
+    solver = cas.nlpsol("drone_solver", "ipopt", nlp, _get_ipopt_options())
+    return solver, lbg, ubg, convolution_functor

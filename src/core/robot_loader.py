@@ -4,6 +4,8 @@ import casadi as cas
 
 from urdf2casadi.urdfparser import URDFparser
 
+from typing import List
+
 
 class BaseRobot:
     """
@@ -315,3 +317,30 @@ class MobileManipulatorRobotURDF(ManipulatorRobotURDF):
         tip_link: str = "end_effector",
     ):
         super().__init__(robot_path, root_link, tip_link)
+
+
+class DroneRobot:
+    def __init__(
+        self,
+        arm_length: float = 0.15,
+    ):
+        self.n_joints = 4  # x, y, z, yaw
+        self.arm_length = arm_length
+
+    def get_collision_points(self, q):
+        x, y, z, yaw = q[0], q[1], q[2], q[3]
+        c, s = cas.cos(yaw), cas.sin(yaw)
+
+        center = cas.vertcat(x, y, z)  # (3, 1)
+        offset = cas.vertcat(c * self.arm_length, s * self.arm_length, 0)
+
+        left = center - offset  # (3, 1)
+        right = center + offset  # (3, 1)
+
+        return cas.vertcat(center.T, left.T, right.T)  # (3, 3)
+
+    def get_goal_point(self, q):
+        return cas.vertcat(q[0], q[1], q[2])
+
+    def get_n_joints(self) -> int:
+        return self.n_joints

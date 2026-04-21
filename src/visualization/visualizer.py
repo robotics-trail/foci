@@ -569,3 +569,211 @@ class MultipleGaussiansVisualizer(BaseVisualizer):
         """
         link_idx, _ = self.gaussian_specs[gaussian_idx]
         return link_idx
+
+
+class DroneVisualizer:
+    """
+    Simple visualizer for a drone trajectory in (x, y, z, yaw).
+
+    The drone is rendered as:
+    - one sphere at the center
+    - two orthogonal arms forming a cross
+    - an optional polyline for the center trajectory
+    """
+
+    def __init__(
+        self,
+        curve: np.ndarray,
+        arm_length: float = 0.15,
+    ):
+        curve = np.asarray(curve, dtype=float)
+        if curve.ndim != 2 or curve.shape[1] < 4:
+            raise ValueError(
+                f"curve must have shape (num_samples, 4), got {curve.shape}"
+            )
+
+        self.curve = curve
+        self.arm_length = float(arm_length)
+        self.server = ViserServer()
+
+        self._ellipsoid_faces = self._create_ellipsoid_faces()
+
+        self.body_handle = None
+        self.arm_x_handle = None
+        self.arm_y_handle = None
+
+    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
+        u = np.linspace(0, 2 * np.pi, resolution)
+        v = np.linspace(0, np.pi, resolution)
+
+        u_grid, v_grid = np.meshgrid(u, v)
+
+        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
+        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
+        z = radii[2] * np.cos(v_grid)
+
+        return np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+
+    def _create_ellipsoid_faces(self, resolution: int = 20):
+        faces = []
+
+        for i in range(resolution - 1):
+            for j in range(resolution - 1):
+                idx = i * resolution + j
+                faces.append([idx, idx + resolution, idx + 1])
+                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
+
+        return np.array(faces, dtype=np.uint32)
+
+    def _rotation_matrix_z(self, yaw: float) -> np.ndarray:
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+        return np.array(
+            [
+                [c, -s, 0.0],
+                [s, c, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+    def _drone_points(self, q: np.ndarray):
+        x, y, z, yaw = q[:4]
+        center = np.array([x, y, z], dtype=float)
+
+        R = self._rotation_matrix_z(float(yaw))
+
+        arm_x_local_pos = np.array([self.arm_length, 0.0, 0.0])
+        arm_x_local_neg = np.array([-self.arm_length, 0.0, 0.0])
+
+        arm_y_local_pos = np.array([0.0, self.arm_length, 0.0])
+        arm_y_local_neg = np.array([0.0, -self.arm_length, 0.0])
+
+        p1 = center + R @ arm_x_local_neg
+        p2 = center + R @ arm_x_local_pos
+        p3 = center + R @ arm_y_local_neg
+        p4 = center + R @ arm_y_local_pos
+
+        return center, p1, p2, p3, p4
+
+    def visualize_goal(
+        self,
+        goal: np.ndarray,
+        radius: float = 0.05,
+        color: tuple = (0, 0, 255),
+    ):
+        self.server.scene.add_icosphere(
+            name="Goal",
+            position=np.asarray(goal, dtype=float),
+            radius=radius,
+            color=color,
+        )
+
+    def visualize_obstacles(
+        self,
+        means: np.ndarray,
+        covariances: np.ndarray,
+        n_std: float = 2.0,
+        color: tuple = (255, 100, 100),
+        opacity: float = 0.6,
+        name: str = "Obstacle",
+    ):
+        factory = EllipsoidFactory(n_std=float(n_std))
+
+        for obstacle_idx, (mean, cov) in enumerate(zip(means, covariances)):
+            radii, quat_wxyz = factory.cov_to_ellipsoid(cov)
+
+            self.server.scene.add_mesh_simple(
+                name=f"{name}_{obstacle_idx}",
+                vertices=self._create_ellipsoid_mesh(radii),
+                faces=self._ellipsoid_faces,
+                position=mean,
+                wxyz=quat_wxyz,
+                color=color,
+                opacity=opacity,
+            )
+
+    def visualize_path(
+        self,
+        color: tuple = (50, 200, 50),
+    ):
+        centers = self.curve[:, :3]
+        n_segments = len(centers) - 1
+
+        self.server.scene.add_line_segments(
+            name="DronePath",
+            points=np.stack([centers[:-1], centers[1:]], axis=1),
+            colors=np.tile(
+                np.array(color, dtype=np.uint8)[None, None, :],
+                (n_segments, 2, 1),
+            ),
+            line_width=3.0,
+        )
+
+    def visualize_drone(
+        self,
+        q: np.ndarray = None,
+        body_radius: float = 0.05,
+        color: tuple = (80, 160, 255),
+    ):
+        if q is None:
+            q = self.curve[0]
+
+        center, p1, p2, p3, p4 = self._drone_points(np.asarray(q, dtype=float))
+
+        self.body_handle = self.server.scene.add_icosphere(
+            name="DroneBody",
+            position=center,
+            radius=body_radius,
+            color=color,
+        )
+
+        self.arm_x_handle = self.server.scene.add_line_segments(
+            name="DroneArmX",
+            points=np.array([[[p1[0], p1[1], p1[2]], [p2[0], p2[1], p2[2]]]]),
+            colors=np.array([[color, color]], dtype=np.uint8),
+            line_width=4.0,
+        )
+
+        self.arm_y_handle = self.server.scene.add_line_segments(
+            name="DroneArmY",
+            points=np.array([[[p3[0], p3[1], p3[2]], [p4[0], p4[1], p4[2]]]]),
+            colors=np.array([[color, color]], dtype=np.uint8),
+            line_width=4.0,
+        )
+
+    def _update_drone(self, q: np.ndarray):
+        if self.body_handle is None:
+            return
+
+        center, p1, p2, p3, p4 = self._drone_points(np.asarray(q, dtype=float))
+
+        self.body_handle.position = center
+        self.arm_x_handle.points = np.array(
+            [[[p1[0], p1[1], p1[2]], [p2[0], p2[1], p2[2]]]]
+        )
+        self.arm_y_handle.points = np.array(
+            [[[p3[0], p3[1], p3[2]], [p4[0], p4[1], p4[2]]]]
+        )
+
+    def visualize_trajectory(
+        self,
+        dt: float = 0.1,
+        loop: bool = True,
+    ):
+        if self.body_handle is None:
+            self.visualize_drone(self.curve[0])
+
+        num_samples = self.curve.shape[0]
+        sample_idx = 0
+
+        while True:
+            q = self.curve[sample_idx]
+            self._update_drone(q)
+            time.sleep(dt)
+
+            sample_idx += 1
+            if sample_idx >= num_samples:
+                if loop:
+                    sample_idx = 0
+                else:
+                    break

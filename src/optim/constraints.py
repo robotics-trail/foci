@@ -197,7 +197,7 @@ def build_constraints(
         constraints,
         lower_bounds,
         upper_bounds,
-        lower_bound=0.0,
+        lower_bound=-vel_limit,
         upper_bound=vel_limit,
     )
 
@@ -207,7 +207,7 @@ def build_constraints(
         constraints,
         lower_bounds,
         upper_bounds,
-        lower_bound=0.0,
+        lower_bound=-acc_limit,
         upper_bound=acc_limit,
     )
 
