@@ -12,8 +12,12 @@ from typing import List, Tuple
 import time
 import numpy as np
 
-from src.core.robot_loader import ManipulatorRobotURDF
-from src.optim.solver import create_multiple_gaussians_solver, create_solver
+from src.core.robot_loader import ManipulatorRobotURDF, DroneRobot
+from src.optim.solver import (
+    create_multiple_gaussians_solver,
+    create_solver,
+    create_drone_solver,
+)
 from src.planning.config import ProblemConfig
 from src.planning.initializer import RRTStarInitializer, RRTStarConfig
 from src.splines.bspline import BSpline
@@ -389,3 +393,61 @@ class MultipleGaussiansPlanner(BasePlanner):
             vmax=self.vmax,
             amax=self.amax,
         )
+
+
+class DronePlanner:
+    def __init__(self, config):
+        self.config = config
+
+        self.robot = DroneRobot()
+
+        self.n_joints = self.robot.get_n_joints()
+        self.num_control_points = config.num_control_points
+        self.num_samples = config.num_samples
+        self.weights = config.weights.as_dict()
+
+        self.wmax = config.limits.wmax
+        self.vmax = config.limits.vmax
+        self.amax = config.limits.amax
+
+        self.obstacle_positions = config.obstacle_positions
+        self.obstacle_covs = config.obstacle_covs
+        self.robot_cov = config.robot_cov
+
+        self.covs_det, self.covs_inv = self._precompute_covariances()
+
+        self.solver, self.lbg, self.ubg, self.convolution_functor = create_drone_solver(
+            robot=self.robot,
+            num_control_points=self.num_control_points,
+            obstacle_means=self.obstacle_positions,
+            covs_det=self.covs_det,
+            covs_inv=self.covs_inv,
+            num_samples=self.num_samples,
+            weights=self.weights,
+            wmax=self.wmax,
+            vmax=self.vmax,
+            amax=self.amax,
+        )
+
+    def _precompute_covariances(self):
+        combined_covs = self.obstacle_covs + self.robot_cov
+        return np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
+
+    def plan(self, theta_start: np.ndarray = None, ee_goal: np.ndarray = None):
+
+        params_val = np.concatenate((theta_start, ee_goal))
+
+        initial_guess = np.tile(theta_start, (self.num_control_points, 1)).flatten(
+            order="C"
+        )
+
+        result = self.solver(x0=initial_guess, lbg=self.lbg, ubg=self.ubg, p=params_val)
+
+        optimal_control_points = (
+            np.array(result["x"]).reshape(self.n_joints, self.num_control_points).T
+        )
+
+        bspline = BSpline(optimal_control_points)
+        trajectory = bspline.spline_eval(self.num_samples)
+
+        return trajectory
