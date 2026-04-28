@@ -80,11 +80,11 @@ def _get_ipopt_options() -> Dict[str, object]:
     return {
         "ipopt.print_level": 5,
         "ipopt.max_iter": 1_000,
-        "ipopt.tol": 1e-6,
+        "ipopt.tol": 1e-3,
         "print_time": 0,
-        "ipopt.acceptable_tol": 1e-6,
-        "ipopt.acceptable_obj_change_tol": 1e-6,
-        "ipopt.constr_viol_tol": 1e-6,
+        "ipopt.acceptable_tol": 1e-3,
+        "ipopt.acceptable_obj_change_tol": 1e-3,
+        "ipopt.constr_viol_tol": 1e-3,
         "ipopt.acceptable_iter": 3,
         "ipopt.linear_solver": "mumps",
         "ipopt.hessian_approximation": "limited-memory",
@@ -186,6 +186,8 @@ def _create_solver_common(
     dddcurve = (time_to_spline_scale**3) * bspline.spline_eval(
         num_samples, derivative_order=3
     )
+
+    print(dddcurve)
 
     # --- Kinematics ---
     q_sym = symbolic_type.sym("q", n_joints)

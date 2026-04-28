@@ -266,7 +266,9 @@ class BasePlanner:
         if return_timings:
             return trajectory, timings
 
-        return trajectory
+        initial_guess = initial_guess.reshape(self.num_control_points, self.n_joints)
+
+        return trajectory, initial_guess
 
     def _create_solver(self):
         """
