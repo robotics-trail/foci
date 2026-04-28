@@ -39,7 +39,7 @@ def drone_demo():
 
     # -- Planning parameters --
     theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    ee_goal = np.array([3.0, 3.0, 4.0])
+    ee_goal = np.array([3.0, 4.0, 4.0])
 
     planner_weights = PlannerWeights(jerk=0.00001, goal=300.0, obstacle=0.01)
     planner_limits = PlannerLimits(wmax=2.0, vmax=5.0, amax=2.0)
@@ -63,11 +63,10 @@ def drone_demo():
     planner = DronePlanner(problem_config)
     curve = planner.plan(theta_start, ee_goal)
 
-    vis = DroneVisualizer(curve, arm_length=0.15)
+    vis = DroneVisualizer(curve, "urdfs/drone_example.urdf")
     vis.visualize_goal(ee_goal, radius=0.08)
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(255, 100, 100))
     vis.visualize_path(color=np.array([50, 200, 50]).reshape((3,)))
-    vis.visualize_drone()
     vis.visualize_trajectory(dt=0.1, loop=True)
 
 

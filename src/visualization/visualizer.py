@@ -303,7 +303,27 @@ class BaseVisualizer:
         colors: np.ndarray,
         opacities: np.ndarray,
     ):
-        self.server.add_gaussian_splats(name=name, centers=means, covariances=covariances, rgbs=colors, opacities=opacities)
+        self.server.add_gaussian_splats(
+            name=name,
+            centers=means,
+            covariances=covariances,
+            rgbs=colors,
+            opacities=opacities,
+        )
+
+    def visualize_initalizer_path(
+        self,
+        initalizer_solution,
+        joint_indices,
+        color=(255, 0, 0),
+        name="Initalizer curve",
+    ):
+
+        xy = initalizer_solution[:, joint_indices]
+        z = np.full((xy.shape[0], 1), float(0.0))
+        points = np.hstack([xy, z])
+
+        self.server.scene.add_spline_catmull_rom(name=name, points=points, color=color)
 
     def _visualize_trajectory_live(self, dt: float, loop: bool):
         """
@@ -584,7 +604,7 @@ class DroneVisualizer:
     def __init__(
         self,
         curve: np.ndarray,
-        arm_length: float = 0.15,
+        urdf_path: str,
     ):
         curve = np.asarray(curve, dtype=float)
         if curve.ndim != 2 or curve.shape[1] < 4:
@@ -593,14 +613,14 @@ class DroneVisualizer:
             )
 
         self.curve = curve
-        self.arm_length = float(arm_length)
         self.server = ViserServer()
 
         self._ellipsoid_faces = self._create_ellipsoid_faces()
 
-        self.body_handle = None
-        self.arm_x_handle = None
-        self.arm_y_handle = None
+        self.base = self.server.scene.add_frame("/drone", show_axes=False)
+
+        urdf = URDF.load(urdf_path)
+        self.drone = ViserUrdf(self.server, urdf, root_node_name="/drone")
 
     def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
         u = np.linspace(0, 2 * np.pi, resolution)
@@ -625,35 +645,8 @@ class DroneVisualizer:
 
         return np.array(faces, dtype=np.uint32)
 
-    def _rotation_matrix_z(self, yaw: float) -> np.ndarray:
-        c = np.cos(yaw)
-        s = np.sin(yaw)
-        return np.array(
-            [
-                [c, -s, 0.0],
-                [s, c, 0.0],
-                [0.0, 0.0, 1.0],
-            ]
-        )
-
-    def _drone_points(self, q: np.ndarray):
-        x, y, z, yaw = q[:4]
-        center = np.array([x, y, z], dtype=float)
-
-        R = self._rotation_matrix_z(float(yaw))
-
-        arm_x_local_pos = np.array([self.arm_length, 0.0, 0.0])
-        arm_x_local_neg = np.array([-self.arm_length, 0.0, 0.0])
-
-        arm_y_local_pos = np.array([0.0, self.arm_length, 0.0])
-        arm_y_local_neg = np.array([0.0, -self.arm_length, 0.0])
-
-        p1 = center + R @ arm_x_local_neg
-        p2 = center + R @ arm_x_local_pos
-        p3 = center + R @ arm_y_local_neg
-        p4 = center + R @ arm_y_local_pos
-
-        return center, p1, p2, p3, p4
+    def _yaw_to_quat(self, yaw):
+        return np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
 
     def visualize_goal(
         self,
@@ -709,66 +702,24 @@ class DroneVisualizer:
             line_width=3.0,
         )
 
-    def visualize_drone(
-        self,
-        q: np.ndarray = None,
-        body_radius: float = 0.05,
-        color: tuple = (80, 160, 255),
-    ):
-        if q is None:
-            q = self.curve[0]
+    def update_drone(self, q: np.ndarray):
+        x, y, z, yaw = q
 
-        center, p1, p2, p3, p4 = self._drone_points(np.asarray(q, dtype=float))
-
-        self.body_handle = self.server.scene.add_icosphere(
-            name="DroneBody",
-            position=center,
-            radius=body_radius,
-            color=color,
-        )
-
-        self.arm_x_handle = self.server.scene.add_line_segments(
-            name="DroneArmX",
-            points=np.array([[[p1[0], p1[1], p1[2]], [p2[0], p2[1], p2[2]]]]),
-            colors=np.array([[color, color]], dtype=np.uint8),
-            line_width=4.0,
-        )
-
-        self.arm_y_handle = self.server.scene.add_line_segments(
-            name="DroneArmY",
-            points=np.array([[[p3[0], p3[1], p3[2]], [p4[0], p4[1], p4[2]]]]),
-            colors=np.array([[color, color]], dtype=np.uint8),
-            line_width=4.0,
-        )
-
-    def _update_drone(self, q: np.ndarray):
-        if self.body_handle is None:
-            return
-
-        center, p1, p2, p3, p4 = self._drone_points(np.asarray(q, dtype=float))
-
-        self.body_handle.position = center
-        self.arm_x_handle.points = np.array(
-            [[[p1[0], p1[1], p1[2]], [p2[0], p2[1], p2[2]]]]
-        )
-        self.arm_y_handle.points = np.array(
-            [[[p3[0], p3[1], p3[2]], [p4[0], p4[1], p4[2]]]]
-        )
+        self.base.position = (x, y, z)
+        self.base.wxyz = self._yaw_to_quat(yaw)
 
     def visualize_trajectory(
         self,
         dt: float = 0.1,
         loop: bool = True,
     ):
-        if self.body_handle is None:
-            self.visualize_drone(self.curve[0])
 
         num_samples = self.curve.shape[0]
         sample_idx = 0
 
         while True:
             q = self.curve[sample_idx]
-            self._update_drone(q)
+            self.update_drone(q)
             time.sleep(dt)
 
             sample_idx += 1

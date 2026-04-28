@@ -85,15 +85,11 @@ def mobile_robot_demo():
     #     config=problem_config, initializer_config=initializer_config
     # )
 
-    curve, timings = planner.plan()
-
-    print("\n--- Planning timings ---")
-    print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
-    print(f"Solver:          {timings['solver_time']:.6f} s")
-    print(f"Total:           {timings['total_time']:.6f} s")
+    curve, initalizer_path = planner.plan(return_timings=False)
 
     # print("\n--- Planning timings ---")
-    # print(f"Solver:          {timings['rrt_time']:.6f} s")
+    # print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
+    # print(f"Solver:          {timings['solver_time']:.6f} s")
     # print(f"Total:           {timings['total_time']:.6f} s")
 
     vis = MultipleGaussiansVisualizer(
@@ -104,11 +100,8 @@ def mobile_robot_demo():
         ignore_link_indices=ignore_link_indices,
     )
     vis.visualize_goal(ee_goal, radius=0.05)
-    # vis.visualize_obstacles(table_means, table_covs, name="Table")
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(100, 255, 100))
-    # vis.visualize_gaussian_splat(
-    #     "Test", obstacle_means, obstacle_covs, colors, opacities
-    # )
+    vis.visualize_initalizer_path(initalizer_path, joint_indices=[0, 1])
     vis.visualize_robot_gaussians()
     vis.visualize_trajectory()
 
