@@ -4,6 +4,7 @@ import casadi as cas
 from src.planning.initializer import RRTStarConfig
 from src.planning.config import ProblemConfig, PlannerWeights, PlannerLimits
 from src.planning.planner import Planner, MultipleGaussiansPlanner, RRTStarPlanner
+from src.planning.chomp_planner import CHOMPPlanner
 from src.visualization.visualizer import MultipleGaussiansVisualizer
 
 
@@ -78,22 +79,30 @@ def mobile_robot_demo():
         gaussians_per_link=gaussians_per_link,
     )
 
-    planner = MultipleGaussiansPlanner(
-        config=problem_config, initializer_config=initializer_config
-    )
-    # planner = RRTStarPlanner(
+    # planner = MultipleGaussiansPlanner(
     #     config=problem_config, initializer_config=initializer_config
     # )
+    # # planner = RRTStarPlanner(
+    # #     config=problem_config, initializer_config=initializer_config
+    # # )
 
-    curve, initalizer_path = planner.plan(return_timings=False)
+    # curve , timings = planner.plan(return_timings=True)
 
     # print("\n--- Planning timings ---")
     # print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
     # print(f"Solver:          {timings['solver_time']:.6f} s")
     # print(f"Total:           {timings['total_time']:.6f} s")
 
+    chomp_planner = CHOMPPlanner(config=problem_config, initializer_config=initializer_config)
+    curve, timings = chomp_planner.plan(return_timings=True)
+
+    print("\n--- CHOMP Planning timings ---")
+    print(f"RRT initializer: {timings['initializer_rrt_time']:.6f} s")
+    print(f"Solver (CHOMP):  {timings['solver_time']:.6f} s")
+    print(f"Total:           {timings['total_time']:.6f} s")
+
     vis = MultipleGaussiansVisualizer(
-        planner.robot,
+        chomp_planner.robot,
         robot_cov,
         curve,
         gaussians_per_link,
@@ -101,10 +110,8 @@ def mobile_robot_demo():
     )
     vis.visualize_goal(ee_goal, radius=0.05)
     vis.visualize_obstacles(obstacle_means, obstacle_covs, color=(100, 255, 100))
-    vis.visualize_initalizer_path(initalizer_path, joint_indices=[0, 1])
     vis.visualize_robot_gaussians()
     vis.visualize_trajectory()
-
 
 if __name__ == "__main__":
     mobile_robot_demo()
