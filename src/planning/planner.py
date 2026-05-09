@@ -1,455 +1,187 @@
-"""
-Trajectory planner interfaces built on top of the optimization layer.
-
-This module provides:
-- a shared base planner with common robot/problem setup
-- a standard midpoint-based planner
-- a planner using multiple Gaussian samples along selected links
-"""
-
-from typing import List, Tuple
-
-import time
+from time import perf_counter
 import numpy as np
 
-from src.core.robot_loader import ManipulatorRobotURDF, DroneRobot
-from src.optim.solver import (
-    create_multiple_gaussians_solver,
-    create_solver,
-    create_drone_solver,
-)
-from src.planning.config import ProblemConfig
-from src.planning.initializer import RRTStarInitializer, RRTStarConfig
+from src.optimization.problem import build_problem
+from src.optimization.solver import create_solver
+from src.planning.result import PlanningResult
+from src.planning.joints import JointGroups
+from src.initialize.straight_line_initializer import StraightLineInitializer
 from src.splines.bspline import BSpline
 
 
-class RRTStarPlanner:
+class Planner:
     """
-    Baseline planner using only OMPL RRT*.
+    Unified trajectory optimization planner.
+
+    This planner works with any robot implementing the BaseRobot API.
+
+    Supported robots:
+    - ManipulatorRobot
+    - DroneRobot
+    - future mobile robots
+
+    Supported methods:
+    - FOCI
+    - future CHOMP/STOMP integration
     """
 
-    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
-        self.config = config
-        self.initializer_config = initializer_config
-        self.robot = ManipulatorRobotURDF(
-            config.urdf_file,
-            config.root_link,
-            config.tip_link,
-        )
-        self.n_joints = self.robot.get_n_joints()
-        self.num_control_points = config.num_control_points
-        self.num_samples = config.num_samples
-
-    def plan(
+    def __init__(
         self,
-        theta_start: np.ndarray = None,
-        ee_goal: np.ndarray = None,
-        return_timings: bool = True,
+        robot,
+        environment,
+        joint_groups: JointGroups,
+        initializer=None,
+        num_control_points: int = 8,
+        num_samples: int = 30,
+        weights: dict[str, float] | None = None,
+        vmax: float = 1.0,
     ):
-        theta_start = self.config.theta_start if theta_start is None else theta_start
-        ee_goal = self.config.ee_goal if ee_goal is None else ee_goal
+        self.robot = robot
+        self.environment = environment
 
-        initializer = RRTStarInitializer(self.robot, config=self.initializer_config)
+        if initializer is None: 
+            self.initializer = StraightLineInitializer()
 
-        t0 = time.perf_counter()
-        control_points_flat = initializer.generate_initial_path(
-            theta_start, ee_goal, self.num_control_points, threshold=0.01
-        )
-        t1 = time.perf_counter()
+        else: 
+            self.initializer = initializer
 
-        control_points = control_points_flat.reshape(
-            self.num_control_points, self.n_joints
-        )
+        self.num_control_points = num_control_points
+        self.num_samples = num_samples
 
-        # Para comparar con tu método final, lo convertimos también en trayectoria muestreada
-        bspline = BSpline(control_points)
-        trajectory = bspline.spline_eval(self.num_samples)
+        self.joint_groups = joint_groups
 
-        timings = {
-            "rrt_time": t1 - t0,
-            "total_time": t1 - t0,
-        }
+        self.weights = weights
+        self.vmax = vmax
 
-        if return_timings:
-            return trajectory, timings
-
-        return trajectory
-
-
-class BasePlanner:
-    """
-    Base class for optimization-based trajectory planners.
-
-    This class owns:
-    - the robot model
-    - common planning parameters
-    - covariance preprocessing
-    - the optimization solve loop
-
-    Subclasses only need to implement `_create_solver()`.
-    """
-
-    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
-        """
-        Parameters
-        ----------
-        config : ProblemConfig
-            Full planning problem definition.
-        initializer_config : RRTStarConfig
-            Initializer definition.
-        """
-        self.config = config
-        self.initializer_config = initializer_config
-
-        # --- Robot ---
-        self.robot = ManipulatorRobotURDF(
-            config.urdf_file,
-            config.root_link,
-            config.tip_link,
-        )
-        self.n_joints = self.robot.get_n_joints()
-        self.n_links = self.robot.get_n_links()
-
-        self.joint_limits = self.robot.get_joint_limits()
-        self.chain_links = self.robot.get_links()
-
-        # --- Planning parameters ---
-        self.num_control_points = config.num_control_points
-        self.num_samples = config.num_samples
-        self.weights = config.weights.as_dict()
-
-        self.wmax = config.limits.wmax
-        self.vmax = config.limits.vmax
-        self.amax = config.limits.amax
-
-        self.obstacle_positions = config.obstacle_positions
-        self.obstacle_covs = config.obstacle_covs
-        self.robot_cov = config.robot_cov
-
-        self.ignore_link_indices = sorted(set(config.ignore_link_indices))
-        self.active_link_indices = [
-            link_idx
-            for link_idx in range(self.n_links)
-            if link_idx not in self.ignore_link_indices
-        ]
-        self.n_active_links = len(self.active_link_indices)
-
-        self.gaussians_per_link = config.gaussians_per_link
-
-        # --- Precomputed obstacle/robot covariance terms ---
-        (
-            self.multiple_gaussians,
-            self.covs_det,
-            self.covs_inv,
-        ) = self._precompute_covariances()
-
-        # --- Solver ---
-        self.solver, self.lbg, self.ubg, self.convolution_functor = (
-            self._create_solver()
-        )
-
-    def _precompute_covariances(self):
-        """
-        Precompute determinants and inverses of obstacle+robot covariance sums.
-
-        Returns
-        -------
-        tuple
-            `(multiple_gaussians, covs_det, covs_inv)` where:
-            - `multiple_gaussians` indicates whether the robot covariance is
-              link-dependent
-            - `covs_det` contains covariance determinants
-            - `covs_inv` contains covariance inverses
-
-        Raises
-        ------
-        ValueError
-            If `robot_cov` does not have shape `(3, 3)` or `(n_links, 3, 3)`.
-        """
-        robot_cov = self.robot_cov
-
-        if robot_cov.ndim == 2:
-            combined_covs = self.obstacle_covs + robot_cov
-            return False, np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
-
-        if robot_cov.ndim == 3 and robot_cov.shape[0] == self.n_links:
-            combined_covs = np.zeros(
-                (self.n_active_links, self.obstacle_covs.shape[0], 3, 3)
-            )
-
-            for local_idx, link_idx in enumerate(self.active_link_indices):
-                combined_covs[local_idx] = self.obstacle_covs + robot_cov[link_idx]
-
-            return True, np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
-
-        raise ValueError(
-            "robot_cov must have shape (3, 3) or (n_links, 3, 3). "
-            f"Got {robot_cov.shape}."
-        )
-
-    def _build_initializer(self) -> RRTStarInitializer:
-        """
-        Create the initializer used to generate the optimization warm start.
-
-        Returns
-        -------
-        RRTStarInitializer
-            Joint-space RRT* initializer.
-        """
-        return RRTStarInitializer(
-            self.robot,
-            self.obstacle_positions,
-            self.gaussians_per_link,
-            self.initializer_config,
-        )
 
     def plan(
         self,
-        theta_start: np.ndarray = None,
-        ee_goal: np.ndarray = None,
-        return_timings: bool = True,
-    ) -> np.ndarray:
+        start: np.ndarray,
+        goal: np.ndarray,
+    ) -> PlanningResult:
         """
-        Solve the trajectory optimization problem.
+        Run trajectory optimization.
 
         Parameters
         ----------
-        theta_start : np.ndarray, optional
-            Initial joint configuration of shape `(n_joints,)`.
-            If omitted, `config.theta_start` is used.
-        ee_goal : np.ndarray, optional
-            Target end-effector position of shape `(3,)`.
-            If omitted, `config.ee_goal` is used.
+        start :
+            Initial robot configuration.
+
+        goal :
+            Goal task-space position.
 
         Returns
         -------
-        np.ndarray
-            Optimized spline samples with shape `(num_samples, n_joints)`.
+        PlanningResult
         """
-        theta_start = self.config.theta_start if theta_start is None else theta_start
-        ee_goal = self.config.ee_goal if ee_goal is None else ee_goal
+        total_start = perf_counter()
 
-        initializer = self._build_initializer()
+        # ==========================================================
+        # Initializer
+        # ==========================================================
 
-        t0 = time.perf_counter()
-        initial_guess = initializer.generate_initial_path(
-            theta_start,
-            ee_goal,
-            self.num_control_points,
-        )
-        t1 = time.perf_counter()
+        init_start = perf_counter()
 
-        params_val = np.concatenate((theta_start, ee_goal))
-
-        t2 = time.perf_counter()
-        result = self.solver(
-            x0=initial_guess,
-            lbg=self.lbg,
-            ubg=self.ubg,
-            p=params_val,
-        )
-        t3 = time.perf_counter()
-
-        optimal_control_points = (
-            np.array(result["x"]).reshape(self.n_joints, self.num_control_points).T
-        )
-
-        bspline = BSpline(optimal_control_points)
-        trajectory = bspline.spline_eval(self.num_samples)
-
-        timings = {
-            "initializer_rrt_time": t1 - t0,
-            "solver_time": t3 - t2,
-            "total_time": (t1 - t0) + (t3 - t2),
-        }
-
-        if return_timings:
-            return trajectory, timings
-
-        initial_guess = initial_guess.reshape(self.num_control_points, self.n_joints)
-
-        return trajectory, initial_guess
-
-    def _create_solver(self):
-        """
-        Create the CasADi solver for the current planner type.
-
-        Must be implemented by subclasses.
-
-        Raises
-        ------
-        NotImplementedError
-        """
-        raise NotImplementedError
-
-
-class Planner(BasePlanner):
-    """
-    Standard planner using one collision evaluation point per active link.
-
-    The obstacle term is built from link midpoints sampled along the trajectory.
-    """
-
-    def _create_solver(self):
-        """
-        Create the midpoint-based optimization solver.
-
-        Returns
-        -------
-        tuple
-            `(solver, lbg, ubg, convolution_functor)`.
-        """
-        return create_solver(
+        init_result = self.initializer.initialize(
             robot=self.robot,
+            environment=self.environment,
+            start=start,
+            goal=goal,
             num_control_points=self.num_control_points,
-            obstacle_means=self.obstacle_positions,
-            covs_det=self.covs_det,
-            covs_inv=self.covs_inv,
-            multiple_gaussians=self.multiple_gaussians,
-            active_link_indices=self.active_link_indices,
-            num_samples=self.num_samples,
-            weights=self.weights,
-            wmax=self.wmax,
-            vmax=self.vmax,
-            amax=self.amax,
         )
 
+        initial_control_points = init_result.control_points
+        initial_trajectory = init_result.trajectory
 
-class MultipleGaussiansPlanner(BasePlanner):
-    """
-    Planner using multiple Gaussian evaluation points along selected links.
+        init_time = perf_counter() - init_start
 
-    Gaussian samples are defined by `(link_idx, t)` pairs, where `t in [0, 1]`
-    indicates the interpolation factor along a link segment.
-    """
+        # ==========================================================
+        # Build optimization problem
+        # ==========================================================
 
-    def __init__(self, config: ProblemConfig, initializer_config: RRTStarConfig):
-        """
-        Parameters
-        ----------
-        config : ProblemConfig
-            Planning problem configuration. Must include `gaussians_per_link`.
+        build_start = perf_counter()
 
-        Raises
-        ------
-        ValueError
-            If the configuration does not define Gaussian samples.
-        """
-        if not config.use_multiple_gaussians:
-            raise ValueError(
-                "MultipleGaussiansPlanner requires config.gaussians_per_link."
-            )
-
-        self.gaussians_per_link = config.gaussians_per_link
-        self.gaussian_specs = self._build_gaussian_specs(self.gaussians_per_link)
-        self.n_total_gaussians = len(self.gaussian_specs)
-
-        super().__init__(config, initializer_config)
-
-    def _build_gaussian_specs(
-        self,
-        gaussians_per_link: List[Tuple[int, List[float]]],
-    ) -> List[Tuple[int, float]]:
-        """
-        Flatten grouped Gaussian definitions into a list of point specifications.
-
-        Parameters
-        ----------
-        gaussians_per_link : list[tuple[int, list[float]]]
-            Per-link Gaussian definitions. Each entry contains a link index and
-            a list of interpolation parameters along that link.
-
-        Returns
-        -------
-        list[tuple[int, float]]
-            Flat list of `(link_idx, t)` pairs.
-        """
-        gaussian_specs = []
-        for link_idx, t_values in gaussians_per_link:
-            for t in t_values:
-                gaussian_specs.append((link_idx, t))
-
-        return gaussian_specs
-
-    def _create_solver(self):
-        """
-        Create the multi-Gaussian optimization solver.
-
-        Returns
-        -------
-        tuple
-            `(solver, lbg, ubg, convolution_functor)`.
-        """
-        return create_multiple_gaussians_solver(
+        nlp, lbg, ubg, callbacks = build_problem(
             robot=self.robot,
+            environment=self.environment,
             num_control_points=self.num_control_points,
-            obstacle_means=self.obstacle_positions,
-            covs_det=self.covs_det,
-            covs_inv=self.covs_inv,
-            multiple_gaussians=self.multiple_gaussians,
-            active_link_indices=self.active_link_indices,
-            gaussian_specs=self.gaussian_specs,
             num_samples=self.num_samples,
+            joint_groups=self.joint_groups,
             weights=self.weights,
-            wmax=self.wmax,
             vmax=self.vmax,
-            amax=self.amax,
         )
 
+        self._casadi_callbacks = callbacks
 
-class DronePlanner:
-    def __init__(self, config):
-        self.config = config
+        solver = create_solver(nlp)
 
-        self.robot = DroneRobot()
+        build_time = perf_counter() - build_start
 
-        self.n_joints = self.robot.get_n_joints()
-        self.num_control_points = config.num_control_points
-        self.num_samples = config.num_samples
-        self.weights = config.weights.as_dict()
+        # ==========================================================
+        # Initial guess
+        # ==========================================================
 
-        self.wmax = config.limits.wmax
-        self.vmax = config.limits.vmax
-        self.amax = config.limits.amax
+        if initial_control_points is None:
+            x0 = np.tile(start, (self.num_control_points, 1))
+        else:
+            x0 = initial_control_points
 
-        self.obstacle_positions = config.obstacle_positions
-        self.obstacle_covs = config.obstacle_covs
-        self.robot_cov = config.robot_cov
+        x0 = np.asarray(x0).reshape(-1, order="F")
 
-        self.covs_det, self.covs_inv = self._precompute_covariances()
+        # ==========================================================
+        # Solve NLP
+        # ==========================================================
 
-        self.solver, self.lbg, self.ubg, self.convolution_functor = create_drone_solver(
-            robot=self.robot,
-            num_control_points=self.num_control_points,
-            obstacle_means=self.obstacle_positions,
-            covs_det=self.covs_det,
-            covs_inv=self.covs_inv,
-            num_samples=self.num_samples,
-            weights=self.weights,
-            wmax=self.wmax,
-            vmax=self.vmax,
-            amax=self.amax,
+        solve_start = perf_counter()
+
+        params = np.concatenate([
+            np.asarray(start).reshape(-1),
+            np.asarray(goal).reshape(-1),
+        ])
+
+        solution = solver(
+            x0=x0,
+            p=params,
+            lbg=lbg,
+            ubg=ubg,
         )
 
-    def _precompute_covariances(self):
-        combined_covs = self.obstacle_covs + self.robot_cov
-        return np.linalg.det(combined_covs), np.linalg.inv(combined_covs)
+        solve_time = perf_counter() - solve_start
 
-    def plan(self, theta_start: np.ndarray = None, ee_goal: np.ndarray = None):
+        # ==========================================================
+        # Extract solution
+        # ==========================================================
 
-        params_val = np.concatenate((theta_start, ee_goal))
+        control_points = np.array(
+            solution["x"]
+        ).reshape(self.num_control_points, self.robot.n_dof, order="F")
 
-        initial_guess = np.tile(theta_start, (self.num_control_points, 1)).flatten(
-            order="C"
+        spline = BSpline(control_points)
+
+        trajectory = np.array(
+            spline.spline_eval(self.num_samples)
         )
 
-        result = self.solver(x0=initial_guess, lbg=self.lbg, ubg=self.ubg, p=params_val)
+        total_time = perf_counter() - total_start
 
-        optimal_control_points = (
-            np.array(result["x"]).reshape(self.n_joints, self.num_control_points).T
+        # ==========================================================
+        # Solver stats
+        # ==========================================================
+
+        stats = solver.stats()
+
+        success = stats.get("success", False)
+
+        return PlanningResult(
+            trajectory=trajectory,
+            control_points=control_points,
+            initial_trajectory=initial_trajectory,
+            success=success,
+            timings={
+                "initializer": init_time,
+                "build": build_time,
+                "solve": solve_time,
+                "total": total_time,
+            },
+            solver_stats=stats,
         )
-
-        bspline = BSpline(optimal_control_points)
-        trajectory = bspline.spline_eval(self.num_samples)
-
-        return trajectory

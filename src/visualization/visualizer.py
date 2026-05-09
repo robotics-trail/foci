@@ -1,208 +1,111 @@
 """
-Visualization utilities for optimized robot trajectories and Gaussian obstacle models.
+Generic visualization utilities for robot trajectories and Gaussian models.
 
-This module provides:
-- a base visualizer with shared scene setup and animation logic
-- a midpoint-based visualizer
-- a multi-Gaussian visualizer with arbitrary sampling points along links
+This visualizer works with any robot implementing:
+
+    robot.n_dof
+    robot.f_task(q)
+    robot.collision_points(q)
+    robot.collision_covariances()
+
+For manipulators, if the robot has a URDF path, the URDF is shown.
+For drones, the trajectory and Gaussian collision model are shown directly.
 """
 
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 from viser import ViserServer
 from viser.extras import ViserUrdf
 from yourdfpy import URDF
 
-from src.core.robot_loader import ManipulatorRobotURDF
-from src.visualization.utils import (
-    CasadiFKGaussians,
-    CasadiFKMidpoints,
-    EllipsoidFactory,
-    PerLinkCovariances,
-    SharedCovariance,
-)
+from src.visualization.utils import EllipsoidFactory
 
 
-class BaseVisualizer:
-    """
-    Base class for trajectory and Gaussian-model visualization.
-
-    This class manages:
-    - the Viser server and robot scene
-    - obstacle ellipsoid rendering
-    - robot Gaussian rendering
-    - live animation and recording export
-
-    Subclasses only need to implement:
-    - `_compute_gaussian_points`
-    - `_gaussian_link_index`
-    """
-
+class RobotVisualizer:
     def __init__(
         self,
-        robot: ManipulatorRobotURDF,
-        robot_cov: np.ndarray,
-        curve: np.ndarray,
-        ignore_link_indices: Optional[List[int]] = None,
+        robot,
+        trajectory: np.ndarray,
     ):
-        """
-        Parameters
-        ----------
-        robot : ManipulatorRobotURDF
-            Robot model used for visualization.
-        robot_cov : np.ndarray
-            Robot covariance model. Must have shape `(3, 3)` for shared covariance
-            or `(n_links, 3, 3)` for per-link covariance.
-        curve : np.ndarray
-            Joint trajectory of shape `(num_samples, n_joints)`.
-        ignore_link_indices : list[int], optional
-            Link indices excluded from the Gaussian visualization.
-        """
-        curve = np.asarray(curve, dtype=float)
-        if curve.ndim != 2:
+        trajectory = np.asarray(trajectory, dtype=float)
+
+        if trajectory.ndim != 2:
             raise ValueError(
-                f"curve must have shape (num_samples, n_joints), got {curve.shape}"
+                f"trajectory must have shape (num_samples, n_dof), "
+                f"got {trajectory.shape}."
+            )
+
+        if trajectory.shape[1] != robot.n_dof:
+            raise ValueError(
+                f"trajectory has {trajectory.shape[1]} columns, "
+                f"but robot.n_dof is {robot.n_dof}."
             )
 
         self.robot = robot
-        self.n_links = self.robot.get_n_links()
-        self.n_joints = self.robot.get_n_joints()
-        self.curve = curve
-
-        ignore_link_indices = ignore_link_indices or []
-        self.ignore_link_indices = sorted(set(ignore_link_indices))
-        self.active_link_indices = [
-            link_idx
-            for link_idx in range(self.n_links)
-            if link_idx not in self.ignore_link_indices
-        ]
-        self.n_active_links = len(self.active_link_indices)
-
-        self.gaussian_model = self._build_gaussian_model(robot_cov)
+        self.trajectory = trajectory
 
         self.server = ViserServer()
-        urdf = URDF.load(self.robot.get_robot_path())
-        self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
+
+        self.robot_urdf = robot.urdf_path
 
         self._ellipsoid_faces = self._create_ellipsoid_faces()
-        self._robot_gauss_handles = []
+        self._robot_gaussian_handles = []
         self._ellipsoid_factory = None
 
-        self.gaussian_points = self._compute_gaussian_points(curve)
-        self.n_total_gaussians = self.gaussian_points.shape[1]
-
-    def _build_gaussian_model(self, robot_cov: np.ndarray):
-        """
-        Build the covariance accessor used by robot Gaussian rendering.
-
-        Parameters
-        ----------
-        robot_cov : np.ndarray
-            Covariance specification, either shared `(3, 3)` or per-link
-            `(n_links, 3, 3)`.
-
-        Returns
-        -------
-        SharedCovariance or PerLinkCovariances
-            Covariance model wrapper.
-
-        Raises
-        ------
-        ValueError
-            If `robot_cov` has an invalid shape.
-        """
-        if robot_cov.shape == (3, 3):
-            return SharedCovariance(robot_cov)
-
-        if robot_cov.ndim == 3 and robot_cov.shape == (self.n_links, 3, 3):
-            return PerLinkCovariances(robot_cov)
-
-        raise ValueError(
-            f"robot_cov must be (3,3) or ({self.n_links},3,3), got {robot_cov.shape}"
+        self.gaussian_points = self._compute_robot_gaussian_points()
+        self.gaussian_covariances = np.asarray(
+            robot.collision_covariances(),
+            dtype=float,
         )
 
-    def _compute_gaussian_points(self, curve: np.ndarray) -> np.ndarray:
-        """
-        Compute Gaussian center positions for every trajectory sample.
+        if self.gaussian_covariances.shape[0] != self.gaussian_points.shape[1]:
+            raise ValueError(
+                "Number of collision covariances must match number of "
+                "collision points. "
+                f"Got {self.gaussian_covariances.shape[0]} covariances and "
+                f"{self.gaussian_points.shape[1]} points."
+            )
 
-        Parameters
-        ----------
-        curve : np.ndarray
-            Joint trajectory of shape `(num_samples, n_joints)`.
+        if self.robot_urdf is not None: 
+            if not Path(self.robot_urdf).is_file():
+                raise FileNotFoundError(f"URDF file not found: {self.robot_urdf}")
+
+            urdf = URDF.load(self.robot_urdf)
+            self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
+
+    def _compute_robot_gaussian_points(self) -> np.ndarray:
+        """
+        Evaluate robot.collision_points(q) for all trajectory samples.
 
         Returns
         -------
         np.ndarray
-            Gaussian points with shape `(num_samples, n_total_gaussians, 3)`.
+            Shape (num_samples, n_gaussians, 3).
         """
-        raise NotImplementedError
+        all_points = []
 
-    def _gaussian_link_index(self, gaussian_idx: int) -> int:
-        """
-        Map one Gaussian index to its associated robot link index.
+        for q in self.trajectory:
+            points = self.robot.collision_points(q)
 
-        Parameters
-        ----------
-        gaussian_idx : int
-            Gaussian index in `[0, n_total_gaussians)`.
+            if hasattr(points, "full"):
+                points = points.full()
 
-        Returns
-        -------
-        int
-            Link index associated with that Gaussian.
-        """
-        raise NotImplementedError
+            points = np.asarray(points, dtype=float).reshape(-1, 3)
+            all_points.append(points)
 
-    def visualize_trajectory(
-        self,
-        dt: float = 0.1,
-        loop: bool = True,
-        save_recording: bool = False,
-        recording_path: str = "trajectory.viser",
-    ):
-        """
-        Animate the robot trajectory live or save it as a Viser recording.
-
-        Parameters
-        ----------
-        dt : float, default=0.1
-            Time step between consecutive samples.
-        loop : bool, default=True
-            Whether to loop the live animation indefinitely.
-        save_recording : bool, default=False
-            If True, export a serialized recording instead of showing a live loop.
-        recording_path : str, default="trajectory.viser"
-            Output path for the saved recording.
-        """
-        if save_recording:
-            self._save_trajectory_recording(recording_path, dt)
-        else:
-            self._visualize_trajectory_live(dt, loop)
+        return np.stack(all_points, axis=0)
 
     def visualize_goal(
         self,
         goal: np.ndarray,
         radius: float = 0.05,
-        color: tuple = (0, 0, 255),
+        color: tuple[int, int, int] = (0, 0, 255),
     ):
-        """
-        Add a spherical goal marker to the scene.
-
-        Parameters
-        ----------
-        goal : np.ndarray
-            Goal position of shape `(3,)`.
-        radius : float, default=0.05
-            Sphere radius.
-        color : tuple, default=(0, 0, 255)
-            RGB color.
-        """
         self.server.scene.add_icosphere(
             name="Goal",
-            position=goal,
+            position=np.asarray(goal, dtype=float),
             radius=radius,
             color=color,
         )
@@ -212,28 +115,13 @@ class BaseVisualizer:
         means: np.ndarray,
         covariances: np.ndarray,
         n_std: float = 2.0,
-        color: tuple = (255, 100, 100),
+        color: tuple[int, int, int] = (255, 100, 100),
         opacity: float = 0.6,
         name: str = "Obstacle",
     ):
-        """
-        Render Gaussian obstacles as ellipsoids.
+        means = np.asarray(means, dtype=float)
+        covariances = np.asarray(covariances, dtype=float)
 
-        Parameters
-        ----------
-        means : np.ndarray
-            Obstacle centers with shape `(n_obstacles, 3)`.
-        covariances : np.ndarray
-            Obstacle covariance matrices with shape `(n_obstacles, 3, 3)`.
-        n_std : float, default=2.0
-            Number of standard deviations used to size each ellipsoid.
-        color : tuple, default=(255, 100, 100)
-            RGB color.
-        opacity : float, default=0.6
-            Mesh opacity.
-        name : str, default="Obstacle"
-            Prefix used to name the rendered meshes.
-        """
         factory = EllipsoidFactory(n_std=float(n_std))
 
         for obstacle_idx, (mean, cov) in enumerate(zip(means, covariances)):
@@ -251,37 +139,22 @@ class BaseVisualizer:
 
     def visualize_robot_gaussians(
         self,
-        name: str = "RobotGaussian",
         n_std: float = 2.0,
-        color: tuple = (80, 160, 255),
+        color: tuple[int, int, int] = (80, 160, 255),
         opacity: float = 0.35,
+        name: str = "RobotGaussian",
     ):
         """
-        Render Gaussian ellipsoids attached to the robot.
-
-        The ellipsoids are initialized at the first trajectory sample and later
-        updated during animation.
-
-        Parameters
-        ----------
-        name : str, default="RobotGaussian"
-            Prefix used to name the rendered meshes.
-        n_std : float, default=2.0
-            Number of standard deviations used to size each ellipsoid.
-        color : tuple, default=(80, 160, 255)
-            RGB color.
-        opacity : float, default=0.35
-            Mesh opacity.
+        Render robot collision Gaussians at the first trajectory sample.
+        They are updated during animation.
         """
-        self._robot_gauss_handles = []
+        self._robot_gaussian_handles = []
         self._ellipsoid_factory = EllipsoidFactory(n_std=float(n_std))
 
-        first_sample_idx = 0
-        for gaussian_idx in range(self.n_total_gaussians):
-            mean = self.gaussian_points[first_sample_idx, gaussian_idx, :]
-            link_idx = self._gaussian_link_index(gaussian_idx)
+        for gaussian_idx in range(self.gaussian_points.shape[1]):
+            mean = self.gaussian_points[0, gaussian_idx]
+            cov = self.gaussian_covariances[gaussian_idx]
 
-            cov = self.gaussian_model.cov(link_idx)
             radii, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
 
             handle = self.server.scene.add_mesh_simple(
@@ -293,7 +166,87 @@ class BaseVisualizer:
                 color=color,
                 opacity=opacity,
             )
-            self._robot_gauss_handles.append(handle)
+
+            self._robot_gaussian_handles.append(handle)
+
+    def visualize_path(
+        self,
+        color: tuple[int, int, int] = (50, 200, 50),
+        line_width: float = 3.0,
+        name: str = "Trajectory",
+    ):
+        """
+        Visualize the task-space trajectory.
+
+        For manipulators this is the end-effector path.
+        For drones this is the center path.
+        """
+        task_points = []
+
+        for q in self.trajectory:
+            point = self.robot.f_task(q)
+
+            if hasattr(point, "full"):
+                point = point.full()
+
+            task_points.append(np.asarray(point, dtype=float).reshape(3))
+
+        task_points = np.asarray(task_points)
+
+        if len(task_points) < 2:
+            return
+
+        segments = np.stack([task_points[:-1], task_points[1:]], axis=1)
+
+        colors = np.tile(
+            np.asarray(color, dtype=np.uint8)[None, None, :],
+            (segments.shape[0], 2, 1),
+        )
+
+        self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
+
+    def visualize_initializer_path(
+        self,
+        initial_trajectory: np.ndarray,
+        color: tuple[int, int, int] = (255, 0, 0),
+        line_width: float = 2.0,
+        name: str = "Initializer",
+    ):
+        initial_trajectory = np.asarray(initial_trajectory, dtype=float)
+
+        task_points = []
+
+        for q in initial_trajectory:
+            point = self.robot.f_task(q)
+
+            if hasattr(point, "full"):
+                point = point.full()
+
+            task_points.append(np.asarray(point, dtype=float).reshape(3))
+
+        task_points = np.asarray(task_points)
+
+        if len(task_points) < 2:
+            return
+
+        segments = np.stack([task_points[:-1], task_points[1:]], axis=1)
+
+        colors = np.tile(
+            np.asarray(color, dtype=np.uint8)[None, None, :],
+            (segments.shape[0], 2, 1),
+        )
+
+        self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
 
     def visualize_gaussian_splat(
         self,
@@ -311,420 +264,84 @@ class BaseVisualizer:
             opacities=opacities,
         )
 
-    def visualize_initalizer_path(
-        self,
-        initalizer_solution,
-        joint_indices,
-        color=(255, 0, 0),
-        name="Initalizer curve",
-    ):
-
-        xy = initalizer_solution[:, joint_indices]
-        z = np.full((xy.shape[0], 1), float(0.0))
-        points = np.hstack([xy, z])
-
-        self.server.scene.add_spline_catmull_rom(name=name, points=points, color=color)
-
-    def _visualize_trajectory_live(self, dt: float, loop: bool):
-        """
-        Play the trajectory live in the Viser scene.
-        """
-        self.viser_urdf.update_cfg(np.zeros(self.n_joints))
-
-        num_samples = self.curve.shape[0]
-        sample_idx = 0
-
-        while True:
-            q = self.curve[sample_idx]
-            self.viser_urdf.update_cfg(q)
-            self._update_robot_gaussians(sample_idx)
-
-            time.sleep(dt)
-
-            sample_idx += 1
-            if sample_idx >= num_samples:
-                if loop:
-                    sample_idx = 0
-                else:
-                    break
-
-    def _save_trajectory_recording(self, recording_path: str, dt: float):
-        """
-        Save the trajectory animation to a serialized Viser recording.
-
-        Parameters
-        ----------
-        recording_path : str
-            Output file path.
-        dt : float
-            Time step between consecutive samples.
-        """
-        serializer = self.server.get_scene_serializer()
-
-        num_samples = self.curve.shape[0]
-        self.viser_urdf.update_cfg(np.zeros(self.n_joints))
-
-        for sample_idx in range(num_samples):
-            q = self.curve[sample_idx]
-            self.viser_urdf.update_cfg(q)
-            self._update_robot_gaussians(sample_idx)
-            serializer.insert_sleep(dt)
-
-        data = serializer.serialize()
-        Path(recording_path).write_bytes(data)
-
-    def _update_robot_gaussians(self, sample_idx: int):
-        """
-        Update robot Gaussian positions and orientations for one trajectory sample.
-        """
-        if not self._robot_gauss_handles or self._ellipsoid_factory is None:
-            return
-
-        for gaussian_idx, handle in enumerate(self._robot_gauss_handles):
-            mean = self.gaussian_points[sample_idx, gaussian_idx, :]
-            link_idx = self._gaussian_link_index(gaussian_idx)
-            cov = self.gaussian_model.cov(link_idx)
-            _, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
-
-            handle.position = mean
-            handle.wxyz = quat_wxyz
-
-    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
-        """
-        Create a triangulated ellipsoid surface centered at the origin.
-
-        Parameters
-        ----------
-        radii : np.ndarray
-            Ellipsoid radii along the principal axes, shape `(3,)`.
-        resolution : int, default=20
-            Angular sampling resolution.
-
-        Returns
-        -------
-        np.ndarray
-            Vertex array of shape `(n_vertices, 3)`.
-        """
-        u = np.linspace(0, 2 * np.pi, resolution)
-        v = np.linspace(0, np.pi, resolution)
-
-        u_grid, v_grid = np.meshgrid(u, v)
-
-        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
-        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
-        z = radii[2] * np.cos(v_grid)
-
-        return np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
-
-    def _create_ellipsoid_faces(self, resolution: int = 20):
-        """
-        Create triangular faces for the ellipsoid mesh grid.
-
-        Parameters
-        ----------
-        resolution : int, default=20
-            Angular sampling resolution used to build the mesh.
-
-        Returns
-        -------
-        np.ndarray
-            Face array of shape `(n_faces, 3)` with dtype `np.uint32`.
-        """
-        faces = []
-
-        for i in range(resolution - 1):
-            for j in range(resolution - 1):
-                idx = i * resolution + j
-                faces.append([idx, idx + resolution, idx + 1])
-                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
-
-        return np.array(faces, dtype=np.uint32)
-
-
-class Visualizer(BaseVisualizer):
-    """
-    Visualizer based on one Gaussian per active link midpoint.
-    """
-
-    def __init__(
-        self,
-        robot: ManipulatorRobotURDF,
-        robot_cov: np.ndarray,
-        curve: np.ndarray,
-        ignore_link_indices: Optional[List[int]] = None,
-    ):
-        """
-        Parameters
-        ----------
-        robot : ManipulatorRobotURDF
-            Robot model.
-        robot_cov : np.ndarray
-            Robot covariance model.
-        curve : np.ndarray
-            Joint trajectory of shape `(num_samples, n_joints)`.
-        ignore_link_indices : list[int], optional
-            Link indices excluded from Gaussian rendering.
-        """
-        self.kinematics = CasadiFKMidpoints(robot, robot.get_n_links())
-        super().__init__(robot, robot_cov, curve, ignore_link_indices)
-
-    def _compute_gaussian_points(self, curve: np.ndarray) -> np.ndarray:
-        """
-        Compute midpoint Gaussian centers for all active links.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape `(num_samples, n_active_links, 3)`.
-        """
-        return self.kinematics.midpoints(curve)[:, self.active_link_indices, :]
-
-    def _gaussian_link_index(self, gaussian_idx: int) -> int:
-        """
-        Map one midpoint Gaussian to its active link index.
-        """
-        return self.active_link_indices[gaussian_idx]
-
-
-class MultipleGaussiansVisualizer(BaseVisualizer):
-    """
-    Visualizer using multiple Gaussian samples along selected links.
-    """
-
-    def __init__(
-        self,
-        robot: ManipulatorRobotURDF,
-        robot_cov: np.ndarray,
-        curve: np.ndarray,
-        gaussians_per_link: List[Tuple[int, List[float]]],
-        ignore_link_indices: Optional[List[int]] = None,
-    ):
-        """
-        Parameters
-        ----------
-        robot : ManipulatorRobotURDF
-            Robot model.
-        robot_cov : np.ndarray
-            Robot covariance model.
-        curve : np.ndarray
-            Joint trajectory of shape `(num_samples, n_joints)`.
-        gaussians_per_link : list[tuple[int, list[float]]]
-            Per-link Gaussian sampling specification. Each tuple contains a link
-            index and a list of interpolation parameters `t in [0, 1]`.
-        ignore_link_indices : list[int], optional
-            Link indices excluded from Gaussian rendering.
-
-        Raises
-        ------
-        ValueError
-            If no active Gaussian samples remain after filtering ignored links.
-        """
-        self.gaussians_per_link = gaussians_per_link
-        self.gaussian_specs = self._build_gaussian_specs(
-            gaussians_per_link,
-            robot.get_n_links(),
-            ignore_link_indices,
-        )
-
-        if len(self.gaussian_specs) == 0:
-            raise ValueError("No active gaussian specs were generated.")
-
-        self.kinematics = CasadiFKGaussians(robot, robot.get_n_links())
-        super().__init__(robot, robot_cov, curve, ignore_link_indices)
-
-    @staticmethod
-    def _build_gaussian_specs(
-        gaussians_per_link: List[Tuple[int, List[float]]],
-        n_links: int,
-        ignore_link_indices: Optional[List[int]],
-    ) -> List[Tuple[int, float]]:
-        """
-        Flatten grouped Gaussian definitions and discard ignored links.
-
-        Parameters
-        ----------
-        gaussians_per_link : list[tuple[int, list[float]]]
-            Per-link Gaussian sampling specification.
-        n_links : int
-            Total number of links in the robot chain.
-        ignore_link_indices : list[int], optional
-            Link indices excluded from Gaussian rendering.
-
-        Returns
-        -------
-        list[tuple[int, float]]
-            Flat list of `(link_idx, t)` pairs.
-        """
-        ignore_link_indices = sorted(set(ignore_link_indices or []))
-        active_link_indices = [
-            link_idx
-            for link_idx in range(n_links)
-            if link_idx not in ignore_link_indices
-        ]
-
-        specs = []
-        for link_idx, t_values in gaussians_per_link:
-            if link_idx not in active_link_indices:
-                continue
-
-            for t in t_values:
-                specs.append((link_idx, float(t)))
-
-        return specs
-
-    def _compute_gaussian_points(self, curve: np.ndarray) -> np.ndarray:
-        """
-        Compute all configured Gaussian centers along links.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape `(num_samples, n_total_gaussians, 3)`.
-        """
-        return self.kinematics.gaussian_points(curve, self.gaussian_specs)
-
-    def _gaussian_link_index(self, gaussian_idx: int) -> int:
-        """
-        Map one Gaussian sample to its underlying link index.
-        """
-        link_idx, _ = self.gaussian_specs[gaussian_idx]
-        return link_idx
-
-
-class DroneVisualizer:
-    """
-    Simple visualizer for a drone trajectory in (x, y, z, yaw).
-
-    The drone is rendered as:
-    - one sphere at the center
-    - two orthogonal arms forming a cross
-    - an optional polyline for the center trajectory
-    """
-
-    def __init__(
-        self,
-        curve: np.ndarray,
-        urdf_path: str,
-    ):
-        curve = np.asarray(curve, dtype=float)
-        if curve.ndim != 2 or curve.shape[1] < 4:
-            raise ValueError(
-                f"curve must have shape (num_samples, 4), got {curve.shape}"
-            )
-
-        self.curve = curve
-        self.server = ViserServer()
-
-        self._ellipsoid_faces = self._create_ellipsoid_faces()
-
-        self.base = self.server.scene.add_frame("/drone", show_axes=False)
-
-        urdf = URDF.load(urdf_path)
-        self.drone = ViserUrdf(self.server, urdf, root_node_name="/drone")
-
-    def _create_ellipsoid_mesh(self, radii: np.ndarray, resolution: int = 20):
-        u = np.linspace(0, 2 * np.pi, resolution)
-        v = np.linspace(0, np.pi, resolution)
-
-        u_grid, v_grid = np.meshgrid(u, v)
-
-        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
-        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
-        z = radii[2] * np.cos(v_grid)
-
-        return np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
-
-    def _create_ellipsoid_faces(self, resolution: int = 20):
-        faces = []
-
-        for i in range(resolution - 1):
-            for j in range(resolution - 1):
-                idx = i * resolution + j
-                faces.append([idx, idx + resolution, idx + 1])
-                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
-
-        return np.array(faces, dtype=np.uint32)
-
-    def _yaw_to_quat(self, yaw):
-        return np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
-
-    def visualize_goal(
-        self,
-        goal: np.ndarray,
-        radius: float = 0.05,
-        color: tuple = (0, 0, 255),
-    ):
-        self.server.scene.add_icosphere(
-            name="Goal",
-            position=np.asarray(goal, dtype=float),
-            radius=radius,
-            color=color,
-        )
-
-    def visualize_obstacles(
-        self,
-        means: np.ndarray,
-        covariances: np.ndarray,
-        n_std: float = 2.0,
-        color: tuple = (255, 100, 100),
-        opacity: float = 0.6,
-        name: str = "Obstacle",
-    ):
-        factory = EllipsoidFactory(n_std=float(n_std))
-
-        for obstacle_idx, (mean, cov) in enumerate(zip(means, covariances)):
-            radii, quat_wxyz = factory.cov_to_ellipsoid(cov)
-
-            self.server.scene.add_mesh_simple(
-                name=f"{name}_{obstacle_idx}",
-                vertices=self._create_ellipsoid_mesh(radii),
-                faces=self._ellipsoid_faces,
-                position=mean,
-                wxyz=quat_wxyz,
-                color=color,
-                opacity=opacity,
-            )
-
-    def visualize_path(
-        self,
-        color: tuple = (50, 200, 50),
-    ):
-        centers = self.curve[:, :3]
-        n_segments = len(centers) - 1
-
-        self.server.scene.add_line_segments(
-            name="DronePath",
-            points=np.stack([centers[:-1], centers[1:]], axis=1),
-            colors=np.tile(
-                np.array(color, dtype=np.uint8)[None, None, :],
-                (n_segments, 2, 1),
-            ),
-            line_width=3.0,
-        )
-
-    def update_drone(self, q: np.ndarray):
-        x, y, z, yaw = q
-
-        self.base.position = (x, y, z)
-        self.base.wxyz = self._yaw_to_quat(yaw)
-
     def visualize_trajectory(
         self,
         dt: float = 0.1,
         loop: bool = True,
     ):
-
-        num_samples = self.curve.shape[0]
+        """
+        Animate robot and robot Gaussians.
+        """
         sample_idx = 0
-
+        num_samples = self.trajectory.shape[0]
+        
         while True:
-            q = self.curve[sample_idx]
-            self.update_drone(q)
+            q = self.trajectory[sample_idx]
+
+            self._update_robot(q)
+            self._update_robot_gaussians(sample_idx)
+
             time.sleep(dt)
 
             sample_idx += 1
+
             if sample_idx >= num_samples:
                 if loop:
                     sample_idx = 0
                 else:
                     break
+
+    def _update_robot(self, q: np.ndarray):
+        """
+        Update URDF if available.
+
+        For drones without URDF, the Gaussian visualization already shows the
+        robot collision model.
+        """
+        if self.robot_urdf is None:
+            return
+
+        self.viser_urdf.update_cfg(q)
+
+    def _update_robot_gaussians(self, sample_idx: int):
+        if not self._robot_gaussian_handles or self._ellipsoid_factory is None:
+            return
+
+        for gaussian_idx, handle in enumerate(self._robot_gaussian_handles):
+            mean = self.gaussian_points[sample_idx, gaussian_idx]
+            cov = self.gaussian_covariances[gaussian_idx]
+
+            _, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
+
+            handle.position = mean
+            handle.wxyz = quat_wxyz
+
+    def _create_ellipsoid_mesh(
+        self,
+        radii: np.ndarray,
+        resolution: int = 20,
+    ) -> np.ndarray:
+        u = np.linspace(0, 2 * np.pi, resolution)
+        v = np.linspace(0, np.pi, resolution)
+
+        u_grid, v_grid = np.meshgrid(u, v)
+
+        x = radii[0] * np.cos(u_grid) * np.sin(v_grid)
+        y = radii[1] * np.sin(u_grid) * np.sin(v_grid)
+        z = radii[2] * np.cos(v_grid)
+
+        return np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+
+    def _create_ellipsoid_faces(
+        self,
+        resolution: int = 20,
+    ) -> np.ndarray:
+        faces = []
+
+        for i in range(resolution - 1):
+            for j in range(resolution - 1):
+                idx = i * resolution + j
+                faces.append([idx, idx + resolution, idx + 1])
+                faces.append([idx + 1, idx + resolution, idx + resolution + 1])
+
+        return np.asarray(faces, dtype=np.uint32)

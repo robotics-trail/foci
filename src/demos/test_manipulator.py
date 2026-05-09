@@ -1,14 +1,13 @@
 import numpy as np
 
-from src.robots.drone import DroneRobot, DroneGaussian
+from src.robots.manipulator import ManipulatorRobot, LinkGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
 
-
-def drone_demo():
+def mobile_robot_demo():
     obstacle_means = np.array(
         [
             [2.0, 0.0, 1.0],
@@ -25,24 +24,37 @@ def drone_demo():
         ]
     )
 
+    gaussian_specs = [
+        LinkGaussian(4, 0.3, np.eye(3) * 0.2**2), 
+        LinkGaussian(4, 0.5, np.eye(3) * 0.2**2), 
+        LinkGaussian(4, 0.7, np.eye(3) * 0.2**2), 
+        LinkGaussian(5, 0.2, np.eye(3) * 0.2**2), 
+        LinkGaussian(5, 0.5, np.eye(3) * 0.2**2), 
+        LinkGaussian(5, 0.8, np.eye(3) * 0.2**2), 
+        LinkGaussian(6, 0.5, np.eye(3) * 0.1**2), 
+        LinkGaussian(7, 0.5, np.eye(3) * 0.1**2), 
+        LinkGaussian(8, 0.5, np.eye(3) * 0.1**2), 
+    ]
 
-    gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.eye(3) * 0.1 ** 2)]
+    theta_start = np.array(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    )
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0])
     goal = np.array([3.0, 3.0, 4.5])
 
-    robot = DroneRobot(
-        urdf_path="urdfs/drone_example.urdf",
-        arm_length=0.15,
+    robot = ManipulatorRobot(
+        urdf_path="urdfs/ur5_extended_move.urdf",
+        root_link="world",
+        tip_link="ee_link",
         gaussian_specs=gaussian_specs,
     )
 
     joint_groups = JointGroups(
-        virtual_indices=[0,1,2,3], 
-        virtual_wmax=5.0, 
-        virtual_amax=3.0, 
-        real_wmax=5.0, 
-        real_amax=3.0,
+        virtual_indices=[0,1,2], 
+        virtual_wmax=2.0, 
+        virtual_amax=2.0, 
+        real_wmax=2.0, 
+        real_amax=2.0,
     )
 
     environment = GaussianEnvironment(
@@ -50,26 +62,27 @@ def drone_demo():
         obstacle_covariances=obstacle_covs,
     )
 
+
     initializer = RRTStarInitializer(
         voxel_size=0.1,
         goal_threshold=0.01,
         random_seed=42,
         max_time=None,   
 )
-    
     planner = Planner(
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
+        initializer=initializer,
         num_control_points=12,
         num_samples=25,
         weights={
-            "goal": 1000.0,
-            "obstacle": 0.01,
-            "jerk": 0.0000001,
-            "virtual_jerk": 0.0000001,
+            "goal": 1.0,
+            "obstacle": 1.0,
+            "jerk": 1.0,
+            "virtual_jerk": 1.0,
         },
-        vmax=2.0,
+        vmax=5.0,
     )
 
     result = planner.plan(
@@ -93,10 +106,12 @@ def drone_demo():
     vis.visualize_obstacles(obstacle_means, obstacle_covs)
     vis.visualize_robot_gaussians()
     vis.visualize_path()
-    vis.visualize_initializer_path(result.initial_trajectory)
+    if result.initial_trajectory is not None:
+        vis.visualize_initializer_path(result.initial_trajectory)
+
     vis.visualize_trajectory(loop=True)
 
     
 
 if __name__ == "__main__":
-    drone_demo()
+    mobile_robot_demo()
