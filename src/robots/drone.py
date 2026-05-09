@@ -63,6 +63,8 @@ class DroneRobot(BaseRobot):
         urdf_path: str,
         arm_length: float = 0.15,
         gaussian_specs: list[DroneGaussian | dict | tuple] | None = None,
+        xyz_limits: list[tuple[float, float]] =  [(-np.inf, np.inf), (-np.inf, np.inf), (-np.inf, np.inf)],
+        yaw_limits: tuple[float, float] = (-np.pi, np.pi),
     ):
         if arm_length <= 0:
             raise ValueError("arm_length must be positive.")
@@ -70,6 +72,9 @@ class DroneRobot(BaseRobot):
         self._urdf_path = urdf_path
         self.arm_length = float(arm_length)
         self.gaussian_specs = self._parse_gaussian_specs(gaussian_specs)
+
+        self.xyz_limits = xyz_limits
+        self.yaw_limits = yaw_limits
 
     @property
     def n_dof(self) -> int:
@@ -119,7 +124,7 @@ class DroneRobot(BaseRobot):
             )
 
             point = center + world_offset
-            points.append(point)
+            points.append(point.T)
 
         return cas.vertcat(*points)
 
@@ -137,10 +142,8 @@ class DroneRobot(BaseRobot):
 
     def joint_limits(self) -> list[tuple[float, float]]:
         return [
-            (-np.inf, np.inf),  # x
-            (-np.inf, np.inf),  # y
-            (-np.inf, np.inf),  # z
-            (-np.pi, np.pi),    # yaw
+            *self.xyz_limits,
+            self.yaw_limits,
         ]
 
     def _parse_gaussian_specs(

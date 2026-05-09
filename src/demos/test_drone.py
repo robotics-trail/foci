@@ -29,12 +29,13 @@ def drone_demo():
     gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.eye(3) * 0.1 ** 2)]
 
     theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    goal = np.array([3.0, 3.0, 4.5])
+    goal = np.array([4.0, 3.0, 2.5])
 
     robot = DroneRobot(
         urdf_path="urdfs/drone_example.urdf",
         arm_length=0.15,
         gaussian_specs=gaussian_specs,
+        xyz_limits=[(-0.5, 4.5), (-0.5, 3.5),(0.0, 3.0)]
     )
 
     joint_groups = JointGroups(
@@ -61,15 +62,16 @@ def drone_demo():
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
+        initializer=initializer,
         num_control_points=12,
         num_samples=25,
         weights={
             "goal": 1000.0,
-            "obstacle": 0.01,
+            "obstacle": 0.001,
             "jerk": 0.0000001,
-            "virtual_jerk": 0.0000001,
+            "virtual_jerk": 0.000001,
         },
-        vmax=2.0,
+        vmax=5.0,
     )
 
     result = planner.plan(

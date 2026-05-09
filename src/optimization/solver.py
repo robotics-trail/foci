@@ -14,7 +14,7 @@ def default_ipopt_options() -> dict[str, Any]:
         "ipopt.acceptable_tol": 1e-3,
         "ipopt.acceptable_obj_change_tol": 1e-3,
         "ipopt.constr_viol_tol": 1e-3,
-        "ipopt.acceptable_iter": 3,
+        "ipopt.acceptable_iter": 1,
         "ipopt.linear_solver": "mumps",
         "ipopt.hessian_approximation": "limited-memory",
         "print_time": 0,

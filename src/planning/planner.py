@@ -92,7 +92,6 @@ class Planner:
 
         initial_control_points = init_result.control_points
         initial_trajectory = init_result.trajectory
-
         init_time = perf_counter() - init_start
 
         # ==========================================================

@@ -83,7 +83,9 @@ class RRTStarInitializer(PathInitializer):
             control_points = np.tile(start, (num_control_points, 1))
             success = False
 
-        trajectory = BSpline(control_points).spline_eval(num_control_points)
+        bspline = BSpline(control_points)
+        trajectory = np.array(bspline.spline_eval(num_control_points))
+
 
         return InitializerResult(
             control_points=control_points,
@@ -196,6 +198,11 @@ class RRTStarInitializer(PathInitializer):
 
     def _robot_in_collision(self, q: np.ndarray) -> bool:
         points = self.robot.collision_points(q)
+
+        if hasattr(points, "full"):
+            points = points.full()
+
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
 
         included = self.occupancy_map.check_if_included(
             o3d.utility.Vector3dVector(points)

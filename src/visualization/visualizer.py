@@ -73,7 +73,11 @@ class RobotVisualizer:
                 raise FileNotFoundError(f"URDF file not found: {self.robot_urdf}")
 
             urdf = URDF.load(self.robot_urdf)
-            self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf)
+            self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf, root_node_name="/robot")
+
+            self.robot_frame = self.server.scene.add_frame("/robot",show_axes=False)
+
+        
 
     def _compute_robot_gaussian_points(self) -> np.ndarray:
         """
@@ -299,6 +303,21 @@ class RobotVisualizer:
         robot collision model.
         """
         if self.robot_urdf is None:
+            return
+        
+        if self.robot.__class__.__name__ == "DroneRobot":
+            x, y, z, yaw = q
+
+            self.robot_frame.position = np.array([x, y, z])
+            self.robot_frame.wxyz = np.array([
+                np.cos(yaw / 2.0),
+                0.0,
+                0.0,
+                np.sin(yaw / 2.0),
+            ])
+
+            # Usually drone URDF has no actuated joints.
+            self.viser_urdf.update_cfg(np.zeros(0))
             return
 
         self.viser_urdf.update_cfg(q)

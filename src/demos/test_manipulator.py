@@ -24,14 +24,12 @@ def mobile_robot_demo():
         ]
     )
 
-    gaussian_specs = [
-        LinkGaussian(4, 0.3, np.eye(3) * 0.2**2), 
-        LinkGaussian(4, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(4, 0.7, np.eye(3) * 0.2**2), 
-        LinkGaussian(5, 0.2, np.eye(3) * 0.2**2), 
-        LinkGaussian(5, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(5, 0.8, np.eye(3) * 0.2**2), 
-        LinkGaussian(6, 0.5, np.eye(3) * 0.1**2), 
+    gaussian_specs = [ 
+        LinkGaussian(4, 0.7, np.eye(3) * 0.1**2), 
+        LinkGaussian(5, 0.2, np.eye(3) * 0.1**2), 
+        LinkGaussian(5, 0.5, np.eye(3) * 0.1**2), 
+        LinkGaussian(5, 0.8, np.eye(3) * 0.1**2), 
+        LinkGaussian(6, 0.5, np.eye(3) * 0.2**2), 
         LinkGaussian(7, 0.5, np.eye(3) * 0.1**2), 
         LinkGaussian(8, 0.5, np.eye(3) * 0.1**2), 
     ]
@@ -51,10 +49,10 @@ def mobile_robot_demo():
 
     joint_groups = JointGroups(
         virtual_indices=[0,1,2], 
-        virtual_wmax=2.0, 
-        virtual_amax=2.0, 
-        real_wmax=2.0, 
-        real_amax=2.0,
+        virtual_wmax=4.0, 
+        virtual_amax=3.5, 
+        real_wmax=4.0, 
+        real_amax=3.5,
     )
 
     environment = GaussianEnvironment(
@@ -66,9 +64,10 @@ def mobile_robot_demo():
     initializer = RRTStarInitializer(
         voxel_size=0.1,
         goal_threshold=0.01,
-        random_seed=42,
+        random_seed=10,
         max_time=None,   
 )
+    
     planner = Planner(
         robot=robot,
         environment=environment,
@@ -77,10 +76,10 @@ def mobile_robot_demo():
         num_control_points=12,
         num_samples=25,
         weights={
-            "goal": 1.0,
-            "obstacle": 1.0,
-            "jerk": 1.0,
-            "virtual_jerk": 1.0,
+            "goal": 450.0,
+            "obstacle": 0.05,
+            "jerk": 0.01,
+            "virtual_jerk": 0.01,
         },
         vmax=5.0,
     )
@@ -106,8 +105,7 @@ def mobile_robot_demo():
     vis.visualize_obstacles(obstacle_means, obstacle_covs)
     vis.visualize_robot_gaussians()
     vis.visualize_path()
-    if result.initial_trajectory is not None:
-        vis.visualize_initializer_path(result.initial_trajectory)
+    vis.visualize_initializer_path(result.initial_trajectory)
 
     vis.visualize_trajectory(loop=True)
 

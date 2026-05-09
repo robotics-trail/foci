@@ -33,6 +33,7 @@ def _goal_cost(
 
 def _jerk_cost(
     dddcurve,
+    duration, 
     real_indices: List[int], 
     virtual_indices: List[int], 
     real_weight: float,
@@ -40,14 +41,15 @@ def _jerk_cost(
 ):
     
     cost: float = 0.0
+    duration_factor = duration ** 6
 
     if real_indices: 
         real_jerk = dddcurve[:, real_indices]
-        cost += real_weight * cas.sum1(cas.sum2(real_jerk**2))
+        cost += real_weight * duration_factor * cas.sum1(cas.sum2(real_jerk**2)) / len(real_indices)
 
     if virtual_indices: 
         virtual_jerk = dddcurve[:, virtual_indices]
-        cost += virtual_weight * cas.sum1(cas.sum2(virtual_jerk**2))
+        cost += virtual_weight * duration_factor * cas.sum1(cas.sum2(virtual_jerk**2)) / len(virtual_indices)
     
     return cost
 
@@ -128,6 +130,7 @@ def _build_constraints(
     vel_hulls,
     acc_hulls,
     real_indices: List[int], 
+    virtual_indices: List[int],
     real_wmax: float,
     real_amax: float,
     virtual_wmax: float,
@@ -138,25 +141,26 @@ def _build_constraints(
     ubg = np.array([], dtype=float)
 
     # Start equality constraint.
-    start_error = sum(
-        (curve[0, i] - start[i]) ** 2
-        for i in range(n_dof)
-    )
-
-    constraints, lbg, ubg = _append_scalar_constraint(
-        constraints,
-        lbg,
-        ubg,
-        start_error,
-        0.0,
-        0.0,
-    )
+    for i in range(n_dof):
+        start_error = curve[0, i] - start[i]
+        constraints, lbg, ubg = _append_scalar_constraint(
+            constraints, 
+            lbg, 
+            ubg, 
+            start_error, 
+            0.0, 
+            0.0
+        )
 
     # Velocity hull component-wise bounds.
-    for hull in vel_hulls:
+    for hull in vel_hulls: 
         for row in range(hull.shape[0]):
+            virtual_joints_velocity_cost = 0.0
             for joint_idx in range(hull.shape[1]):
-                if joint_idx in real_indices:
+                if joint_idx in virtual_indices:
+                    virtual_joints_velocity_cost += hull[row, joint_idx]**2
+
+                else: 
                     constraints, lbg, ubg = _append_scalar_constraint(
                         constraints,
                         lbg,
@@ -165,22 +169,27 @@ def _build_constraints(
                         -real_wmax,
                         real_wmax,
                     )
+            
+            if virtual_indices:
+                constraints, lbg, ubg = _append_scalar_constraint(
+                    constraints,
+                    lbg,
+                    ubg,
+                    virtual_joints_velocity_cost,
+                    0.0,
+                    virtual_wmax**2,
+                )
+
+    
+    # Acceleration hull component-wise bounds.
+    for hull in acc_hulls: 
+        for row in range(hull.shape[0]):
+            virtual_joints_acceleration_cost = 0.0
+            for joint_idx in range(hull.shape[1]):
+                if joint_idx in virtual_indices:
+                    virtual_joints_acceleration_cost += hull[row, joint_idx]**2
 
                 else: 
-                    constraints, lbg, ubg = _append_scalar_constraint(
-                        constraints,
-                        lbg,
-                        ubg,
-                        hull[row, joint_idx],
-                        -virtual_wmax,
-                        virtual_wmax,
-                    )
-
-    # Acceleration hull component-wise bounds.
-    for hull in acc_hulls:
-        for row in range(hull.shape[0]):
-            for joint_idx in range(hull.shape[1]):
-                if joint_idx in real_indices:
                     constraints, lbg, ubg = _append_scalar_constraint(
                         constraints,
                         lbg,
@@ -190,15 +199,15 @@ def _build_constraints(
                         real_amax,
                     )
 
-                else: 
-                    constraints, lbg, ubg = _append_scalar_constraint(
-                        constraints,
-                        lbg,
-                        ubg,
-                        hull[row, joint_idx],
-                        -virtual_amax,
-                        virtual_amax,
-                    )
+            if virtual_indices:
+                constraints, lbg, ubg = _append_scalar_constraint(
+                    constraints,
+                    lbg,
+                    ubg,
+                    virtual_joints_acceleration_cost,
+                    0.0,
+                    virtual_amax**2,
+                )
 
     return constraints, lbg, ubg
 
@@ -290,8 +299,6 @@ def build_problem(
     start_task = robot.f_task(curve[0, :])
 
     estimated_duration = cas.norm_2(goal - start_task) / vmax
-
-    # Avoid division by zero in very small motions.
     estimated_duration = cas.fmax(estimated_duration, 1e-3)
 
     num_segments = num_control_points - 4
@@ -323,8 +330,7 @@ def build_problem(
         [q_sym],
         [robot.collision_points(q_sym)],
     )
-    print(curve.shape)
-
+   
     collision_map = collision_fun.map(num_samples, "openmp")
 
     # mapped_collision_points: (3*n_gaussians, num_samples)
@@ -366,6 +372,7 @@ def build_problem(
         vel_hulls=vel_hulls,
         acc_hulls=acc_hulls,
         real_indices=real_indices,
+        virtual_indices=virtual_indices,
         real_wmax=joint_groups.real_wmax,
         real_amax=joint_groups.real_amax,
         virtual_wmax=joint_groups.virtual_wmax, 
@@ -386,6 +393,7 @@ def build_problem(
 
     cost_jerk = _jerk_cost(
         dddcurve,
+        estimated_duration,
         real_indices=real_indices, 
         virtual_indices=virtual_indices, 
         real_weight=weights["jerk"], 
