@@ -104,9 +104,9 @@ def bonsai_demo():
     print(f"Minimum robot-environment distance: {min_dist:.3f} m")
 
     vis = RobotVisualizer(
-    robot=robot,
-    trajectory=result.trajectory,
-)
+        robot=robot,
+        trajectory=result.trajectory
+    )
 
     vis.visualize_goal(goal)
     vis.visualize_gaussian_splat("Bonsai", obstacle_means, obstacle_covs, colors, opacities)
