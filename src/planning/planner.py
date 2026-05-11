@@ -8,7 +8,6 @@ from src.planning.joints import JointGroups
 from src.initialize.straight_line_initializer import StraightLineInitializer
 from src.splines.bspline import BSpline
 
-
 class Planner:
     """
     Unified trajectory optimization planner.

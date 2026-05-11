@@ -6,6 +6,7 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
+from src.benchmark.utils import minimum_robot_environment_distance
 
 
 def drone_demo():
@@ -53,8 +54,8 @@ def drone_demo():
 
     initializer = RRTStarInitializer(
         voxel_size=0.1,
-        goal_threshold=0.01,
-        random_seed=42,
+        goal_threshold=0.005,
+        random_seed=10,
         max_time=None,   
 )
     
@@ -79,12 +80,19 @@ def drone_demo():
         goal=goal,
     )
 
+    min_dist, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
+
     print("\n--- Planning timings ---")
     print(f"Initializer: {result.timings['initializer']:.6f} s")
     print(f"Build:       {result.timings['build']:.6f} s")
     print(f"Solver:      {result.timings['solve']:.6f} s")
     print(f"Total:       {result.timings['total']:.6f} s")
     print(f"Success:     {result.success}")
+
+    print("\n--- Benchmark metrics ---")
+    print(f"Number of environment gaussians: {len(obstacle_means)}")
+    print(f"Number of robot gaussians: {len(gaussian_specs)}")
+    print(f"Minimum robot-environment distance: {min_dist:.3f} m")
 
     vis = RobotVisualizer(
     robot=robot,
