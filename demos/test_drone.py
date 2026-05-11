@@ -73,6 +73,7 @@ def drone_demo():
             "virtual_jerk": 0.000001,
         },
         vmax=5.0,
+        linear_solver="ma27"
     )
 
     result = planner.plan(

@@ -83,6 +83,7 @@ def mobile_robot_demo():
             "virtual_jerk": 0.01,
         },
         vmax=5.0,
+        solver="ma27",
     )
 
     result = planner.plan(

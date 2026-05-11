@@ -34,9 +34,11 @@ class Planner:
         num_samples: int = 30,
         weights: dict[str, float] | None = None,
         vmax: float = 1.0,
+        linear_solver: str = "mumps",
     ):
         self.robot = robot
         self.environment = environment
+        self.linear_solver = linear_solver
 
         if initializer is None: 
             self.initializer = StraightLineInitializer()
@@ -111,7 +113,7 @@ class Planner:
 
         self._casadi_callbacks = callbacks
 
-        solver = create_solver(nlp)
+        solver = create_solver(nlp, options={"ipopt.linear_solver": self.linear_solver})
 
         build_time = perf_counter() - build_start
 
