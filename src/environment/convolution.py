@@ -1,10 +1,11 @@
 import warp as wp
 from casadi import *
 import numpy as np
+import math
 
 wp.init()
-# wp.set_device("cuda:0")
-wp.set_device("cpu")
+wp.set_device("cuda:0")
+# wp.set_device("cpu")
 
 # Integral over Gaussians https://arxiv.org/pdf/1811.04751v1
 # https://web.ist.utl.pt/susanavinga/renyi/convolution_normal.pdf
@@ -57,7 +58,8 @@ class ConvolutionFunctorWarp(Callback):
 
             diff = points[m] - obstacle_means[n]
             normal = (
-                wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff)) * 1000.0 / covs_det[n]
+                wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
+                / (wp.pow(2.0 * wp.pi, float(1.5)) * wp.sqrt(covs_det[n]))
             )
             wp.atomic_add(intermediate, n, normal)
 
@@ -143,8 +145,7 @@ class ConvolutionFunctorWarp(Callback):
                     diff = points[m] - obstacle_means[n]
                     normal = (
                         wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
-                        * 1000.0
-                        / covs_det[n]
+                        / (wp.pow(2.0 * wp.pi, float(1.5)) * wp.sqrt(covs_det[n]))
                     )
 
                     sub_gradient = -normal * covs_inv[n] @ diff

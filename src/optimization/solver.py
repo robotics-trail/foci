@@ -8,7 +8,7 @@ def default_ipopt_options() -> dict[str, Any]:
     Default IPOPT options for trajectory optimization.
     """
     return {
-        "ipopt.print_level": 0,
+        "ipopt.print_level": 3,
         "ipopt.max_iter": 1000,
         "ipopt.tol": 1e-3,
         "ipopt.acceptable_tol": 1e-3,
@@ -17,7 +17,7 @@ def default_ipopt_options() -> dict[str, Any]:
         "ipopt.acceptable_iter": 1,
         "ipopt.linear_solver": "mumps",
         "ipopt.hessian_approximation": "limited-memory",
-        "print_time": 0,
+        "print_time": 1,
     }
 
 

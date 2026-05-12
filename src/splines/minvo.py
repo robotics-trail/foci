@@ -60,8 +60,6 @@ def minvo_hulls(control_points, derivative_order=0):
         raise ValueError(
             f"derivative_order must be one of {{0, 1, 2, 3}}, got {derivative_order}"
         )
-    V = control_points
-
     first_diff = _forward_differences(control_points)
     second_diff = _forward_differences(first_diff) if derivative_order >= 2 else None
     third_diff = _forward_differences(second_diff) if derivative_order >= 3 else None
@@ -74,17 +72,17 @@ def minvo_hulls(control_points, derivative_order=0):
             hulls.append(hull)
 
     elif derivative_order == 1:
-        for i in range(control_points.shape[0] - 4):
+        for i in range(control_points.shape[0] - 3):
             hull = INV_MINVO_2 @ BSPLINE_2 @ first_diff[i : i + 3, :]
             hulls.append(hull)
 
     elif derivative_order == 2:
-        for i in range(control_points.shape[0] - 5):
+        for i in range(control_points.shape[0] - 3):
             hull = INV_MINVO_1 @ BSPLINE_1 @ second_diff[i : i + 2, :]
             hulls.append(hull)
 
     else:
-        for i in range(control_points.shape[0] - 6):
+        for i in range(control_points.shape[0] - 3):
             hull = INV_MINVO_0 @ BSPLINE_0 @ third_diff[i : i + 1, :]
             hulls.append(hull)
 

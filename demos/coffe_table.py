@@ -13,31 +13,54 @@ from src.benchmark.utils import minimum_robot_environment_distance
 
 def coffe_table_demo():
     
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ply_file = os.path.join(PROJECT_ROOT, "data", "Coffee_Table.ply")
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
 
-    translation = np.array([0.0, 1.5, 1.0])
-    scale_factor = 1.5
+    translation = np.array([0.71, 0.0, 0.6])
+    scale_factor = 0.005
+    mesh_scale = 1.3
     
-    obstacle_means = (obstacle_means * scale_factor)+ translation
-    obstacle_covs = obstacle_covs * scale_factor**2
+    floor_height_threshold = np.min(obstacle_means[:, 2]) + 0.1
+    mask = obstacle_means[:, 2] > floor_height_threshold
+
+    obstacle_means = obstacle_means[mask]
+    obstacle_covs = obstacle_covs[mask]
+    colors = colors[mask]
+    opacities = opacities[mask]
+    
+    centroid = obstacle_means.mean(axis=0)
+    obstacle_means = (obstacle_means - centroid) * mesh_scale + centroid + translation
+    obstacle_covs = obstacle_covs * (scale_factor * mesh_scale)**2
+      
+    random_seed = 42  
+    n = obstacle_means.shape[0]
+    max_gaussians = 80_000
+    
+    rng = np.random.default_rng(random_seed)
+    indices = rng.choice(n, size=max_gaussians, replace=False)
+    
+    obstacle_means = np.ascontiguousarray(obstacle_means[indices], dtype=np.float32)
+    obstacle_covs = np.ascontiguousarray(obstacle_covs[indices], dtype=np.float32)
+    colors = np.ascontiguousarray(colors[indices], dtype=np.float32)
+    opacities = np.ascontiguousarray(opacities[indices], dtype=np.float32)
 
     gaussian_specs = [ 
-        LinkGaussian(0, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(1, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(2, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(3, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(4, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(5, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(6, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(7, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(8, 0.5, np.eye(3) * 0.1**2), 
+        LinkGaussian(0, 0.5, np.eye(3) * 0.01**2), 
+        LinkGaussian(1, 0.5, np.eye(3) * 0.01**2), 
+        LinkGaussian(2, 0.3, np.eye(3) * 0.04**2), 
+        LinkGaussian(2, 0.7, np.eye(3) * 0.04**2), 
+        LinkGaussian(3, 0.3, np.eye(3) * 0.03**2), 
+        LinkGaussian(3, 0.7, np.eye(3) * 0.03**2), 
+        LinkGaussian(4, 0.5, np.eye(3) * 0.03**2), 
+        LinkGaussian(5, 0.5, np.eye(3) * 0.01**2), 
+        LinkGaussian(6, 0.5, np.eye(3) * 0.01**2), 
+        LinkGaussian(7, 0.5, np.eye(3) * 0.01**2), 
     ]
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    goal = np.array([-2.0, 2.2, 0.5])
+    theta_start = np.array([-0.3, -1.2, 1.8, -2.1, -1.57, 0.0])
+    goal = np.array([0.38, 0.0, 0.75])
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5.urdf",
@@ -50,8 +73,8 @@ def coffe_table_demo():
         virtual_indices=[], 
         virtual_wmax=4.0, 
         virtual_amax=3.5, 
-        real_wmax=5.0, 
-        real_amax=4.5,
+        real_wmax=7.5, 
+        real_amax=6.5,
     )
     
     environment = GaussianEnvironment(
@@ -60,9 +83,9 @@ def coffe_table_demo():
     )
 
     initializer = RRTStarInitializer(
-        voxel_size=0.1,
-        goal_threshold=0.01,
-        random_seed=10,
+        voxel_size=0.01,
+        goal_threshold=0.02,
+        random_seed=42,
         max_time=None,   
     )
 
@@ -71,22 +94,23 @@ def coffe_table_demo():
         environment=environment,
         joint_groups=joint_groups,
         initializer=initializer,
-        num_control_points=12,
-        num_samples=25,
+        num_control_points=15,
+        num_samples=30,
         weights={
-            "goal": 450.0,
-            "obstacle": 0.05,
-            "jerk": 0.01,
+            "goal": 150.0,
+            "obstacle": 550.0,
+            "jerk": 0.004,
             "virtual_jerk": 0.01,
         },
-        vmax=7.5,
-        linear_solver="mumps"
+        vmax=1.0,
+        linear_solver="ma27"
     )
 
     result = planner.plan(
         start=theta_start,
         goal=goal,
     )
+    
 
     min_dist, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
 
@@ -106,9 +130,9 @@ def coffe_table_demo():
         robot=robot,
         trajectory=result.trajectory
     )
-
+    
     vis.visualize_goal(goal)
-    vis.visualize_gaussian_splat("Bonsai", obstacle_means, obstacle_covs, colors, opacities)
+    vis.visualize_gaussian_splat("Coffe table", obstacle_means, obstacle_covs, colors, opacities)
     vis.visualize_robot_gaussians()
     vis.visualize_path()
     vis.visualize_initializer_path(result.initial_trajectory)
