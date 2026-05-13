@@ -73,7 +73,7 @@ def drone_demo():
             "virtual_jerk": 0.000001,
         },
         vmax=5.0,
-        linear_solver="ma27"
+        linear_solver="mumps"
     )
 
     result = planner.plan(
@@ -98,6 +98,8 @@ def drone_demo():
     vis = RobotVisualizer(
     robot=robot,
     trajectory=result.trajectory,
+    follow_camera=True,
+    camera_offset=np.array([0.0, 0.0, 0.1]),
 )
 
     vis.visualize_goal(goal)

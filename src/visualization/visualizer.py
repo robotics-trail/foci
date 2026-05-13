@@ -28,6 +28,9 @@ class RobotVisualizer:
         self,
         robot,
         trajectory: np.ndarray,
+        follow_camera: bool = False,
+        camera_offset: np.ndarray | None = None,
+        camera_lookahead: float = 0.5,
     ):
         trajectory = np.asarray(trajectory, dtype=float)
 
@@ -46,8 +49,16 @@ class RobotVisualizer:
         self.robot = robot
         self.trajectory = trajectory
 
-        self.server = ViserServer()
+        self.follow_camera = follow_camera
+        self.camera_offset = (
+            np.asarray(camera_offset, dtype=float)
+            if camera_offset is not None
+            else np.array([0.0, 0.0, 1.5])
+        )
+        self.camera_lookahead = float(camera_lookahead)
 
+
+        self.server = ViserServer()
         self.robot_urdf = robot.urdf_path
 
         self._ellipsoid_faces = self._create_ellipsoid_faces()
@@ -77,6 +88,17 @@ class RobotVisualizer:
 
             self.robot_frame = self.server.scene.add_frame("/robot",show_axes=False)
 
+        # if self.follow_camera:
+        #     q0 = self.trajectory[0]
+        #     target0 = self.robot.f_task(q0)
+
+        #     if hasattr(target0, "full"):
+        #         target0 = target0.full()
+
+        #     target0 = np.asarray(target0, dtype=float).reshape(3)
+
+        #     self.server.initial_camera.position = target0 + self.camera_offset
+        #     self.server.initial_camera.look_at = target0
         
 
     def _compute_robot_gaussian_points(self) -> np.ndarray:
@@ -284,6 +306,7 @@ class RobotVisualizer:
 
             self._update_robot(q)
             self._update_robot_gaussians(sample_idx)
+            self._update_camera(sample_idx)
 
             time.sleep(dt)
 
@@ -334,6 +357,48 @@ class RobotVisualizer:
 
             handle.position = mean
             handle.wxyz = quat_wxyz
+
+    def _update_camera(self, sample_idx: int):
+        """
+        Optionally keep the viewer camera above the robot/task point.
+
+        Uses robot.f_task(q), so it is robot-agnostic:
+        - for drones, this is usually the drone center;
+        - for manipulators, this is usually the end-effector.
+        """
+        if not self.follow_camera:
+            return
+
+        q = self.trajectory[sample_idx]
+        target = self.robot.f_task(q)
+
+        if hasattr(target, "full"):
+            target = target.full()
+
+        target = np.asarray(target, dtype=float).reshape(3)
+
+        camera_position = target + self.camera_offset
+
+        look_at = target #+ np.array([0.1, 0.0, 0.1])
+        next_idx = min(sample_idx + 1, self.trajectory.shape[0] - 1)
+
+        if next_idx != sample_idx:
+            next_target = self.robot.f_task(self.trajectory[next_idx])
+
+            if hasattr(next_target, "full"):
+                next_target = next_target.full()
+
+            next_target = np.asarray(next_target, dtype=float).reshape(3)
+            direction = next_target - target
+            norm = np.linalg.norm(direction)
+
+            if norm > 1e-9:
+                look_at = camera_position + self.camera_lookahead * direction / norm
+
+        for client in self.server.get_clients().values():
+            with client.atomic():
+                client.camera.position = camera_position
+                client.camera.look_at = look_at
 
     def _create_ellipsoid_mesh(
         self,

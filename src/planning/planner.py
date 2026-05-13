@@ -5,7 +5,7 @@ from src.optimization.problem import build_problem
 from src.optimization.solver import create_solver
 from src.planning.result import PlanningResult
 from src.planning.joints import JointGroups
-from src.initialize.straight_line_initializer import StraightLineInitializer
+from src.initialize.uniform_initializer import UniformControlPointsInitializer
 from src.splines.bspline import BSpline
 
 class Planner:
@@ -41,7 +41,7 @@ class Planner:
         self.linear_solver = linear_solver
 
         if initializer is None: 
-            self.initializer = StraightLineInitializer()
+            self.initializer = UniformControlPointsInitializer()
 
         else: 
             self.initializer = initializer
