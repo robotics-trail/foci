@@ -33,19 +33,7 @@ def coffe_table_demo():
     centroid = obstacle_means.mean(axis=0)
     obstacle_means = (obstacle_means - centroid) * mesh_scale + centroid + translation
     obstacle_covs = obstacle_covs * (scale_factor * mesh_scale)**2
-      
-    random_seed = 42  
-    n = obstacle_means.shape[0]
-    max_gaussians = 80_000
-    
-    rng = np.random.default_rng(random_seed)
-    indices = rng.choice(n, size=max_gaussians, replace=False)
-    
-    obstacle_means = np.ascontiguousarray(obstacle_means[indices], dtype=np.float32)
-    obstacle_covs = np.ascontiguousarray(obstacle_covs[indices], dtype=np.float32)
-    colors = np.ascontiguousarray(colors[indices], dtype=np.float32)
-    opacities = np.ascontiguousarray(opacities[indices], dtype=np.float32)
-
+     
     gaussian_specs = [ 
         LinkGaussian(0, 0.5, np.eye(3) * 0.01**2), 
         LinkGaussian(1, 0.5, np.eye(3) * 0.01**2), 
@@ -60,7 +48,7 @@ def coffe_table_demo():
     ]
 
     theta_start = np.array([-0.3, -1.2, 1.8, -2.1, -1.57, 0.0])
-    goal = np.array([0.38, 0.0, 0.75])
+    goal = np.array([0.55, 0.0, 0.75])
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5.urdf",
@@ -84,7 +72,7 @@ def coffe_table_demo():
 
     initializer = RRTStarInitializer(
         voxel_size=0.01,
-        goal_threshold=0.02,
+        goal_threshold=0.01,
         random_seed=42,
         max_time=None,   
     )
