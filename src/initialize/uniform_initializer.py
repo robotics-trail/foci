@@ -4,14 +4,9 @@ import numpy as np
 
 from src.initialize.initializer import InitializerResult, PathInitializer
 
-class StraightLineInitializer(PathInitializer):
+class UniformControlPointsInitializer(PathInitializer):
     """
-    Fallback initializer that holds the start configuration for all control points.
-
-    A true straight-line interpolation in configuration space would require IK
-    to resolve the task-space goal into a goal configuration, which is not
-    available here. This constant warm-start is sufficient for the NLP to
-    converge from.
+    Simple fallback initializer using linear interpolation in configuration space.
     """
 
     def initialize(
@@ -22,7 +17,7 @@ class StraightLineInitializer(PathInitializer):
         goal: np.ndarray,
         num_control_points: int,
     ) -> InitializerResult:
-        del robot, environment, goal
+        
 
         start = np.asarray(start, dtype=float)
         control_points = np.tile(start, (num_control_points, 1))
@@ -32,5 +27,5 @@ class StraightLineInitializer(PathInitializer):
             trajectory=control_points,
             success=True,
             timings={"initializer": 0.0},
-            metadata={"type": "constant"},
+            metadata={"type": "straight_line_constant"},
         )
