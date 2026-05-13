@@ -1,8 +1,9 @@
 import os
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
-from src.utils.ply import extract_splat_data
+from src.utils.ply import extract_splat_data_2
 from src.robots.drone import DroneRobot, DroneGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
@@ -14,16 +15,24 @@ from src.benchmark.utils import minimum_robot_environment_distance
 def forest_demo():
     
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ply_file = os.path.join(PROJECT_ROOT, "data", "Coffee_Table.ply")
+    ply_file = os.path.join(PROJECT_ROOT, "data/Forest.ply")
 
-    obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
+    obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 
-    translation = np.array([0.0, 0.0, 0.0])
+    rotation = R.from_euler("x", -90, degrees=True).as_matrix()
+    translation = np.array([8.0, 0.0, 0.0])
+    scale_factor = 10.0
+    
+    
+    obstacle_means = (obstacle_means * scale_factor) @ rotation.T + translation
+    obstacle_covs = np.einsum("ij,njk,lk->nil", rotation, obstacle_covs, rotation) * scale_factor**2
+
+    
 
     gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.eye(3) * 0.1 ** 2)]
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    goal = np.array([4.0, 3.0, 2.5])
+    theta_start = np.array([0.0, -3.0, 1.0, 0.0])
+    goal = np.array([14.0, 5.0, 3.5])
 
     robot = DroneRobot(
         urdf_path="urdfs/drone_example.urdf",
@@ -32,7 +41,7 @@ def forest_demo():
     )
 
     joint_groups = JointGroups(
-        virtual_indices=[0,1,2,3], 
+        virtual_indices=[0,1,2], 
         virtual_wmax=5.0, 
         virtual_amax=3.0, 
         real_wmax=5.0, 
@@ -55,16 +64,16 @@ def forest_demo():
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
-        initializer=initializer,
+        #initializer=initializer,
         num_control_points=12,
         num_samples=25,
         weights={
-            "goal": 1000.0,
-            "obstacle": 0.001,
+            "goal": 100.0,
+            "obstacle": 200.0,
             "jerk": 0.1,
             "virtual_jerk": 0.001,
         },
-        vmax=2.0,
+        vmax=1.0,
         linear_solver="ma27"
     )
 
@@ -90,7 +99,9 @@ def forest_demo():
 
     vis = RobotVisualizer(
         robot=robot,
-        trajectory=result.trajectory
+        trajectory=result.trajectory,
+        #follow_camera=True,
+        #camera_offset=np.array([0.0, 0.0, 0.1]),
     )
     
     vis.visualize_goal(goal)
