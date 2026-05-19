@@ -20,8 +20,8 @@ def bonsai_demo():
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 
     rotation = R.from_euler("x", -90, degrees=True).as_matrix()
-    translation = np.array([0.0, 1.5, 1.0])
-    scale_factor = 3.0
+    translation = np.array([0.0, 1.8, 1.0])
+    scale_factor = 3.5
     
     obstacle_means = (obstacle_means * scale_factor) @ rotation.T + translation
     obstacle_covs = np.einsum("ij,njk,lk->nil", rotation, obstacle_covs, rotation) * scale_factor**2
@@ -51,8 +51,8 @@ def bonsai_demo():
         virtual_indices=[], 
         virtual_wmax=4.0, 
         virtual_amax=3.5, 
-        real_wmax=6.5, 
-        real_amax=6.0,
+        real_wmax=3.5, 
+        real_amax=3.0,
     )
 
     environment = GaussianEnvironment(
@@ -75,9 +75,9 @@ def bonsai_demo():
         num_control_points=12,
         num_samples=25,
         weights={
-            "goal": 150.0,
-            "obstacle": 350.0,
-            "jerk": 0.005,
+            "goal": 10.0,
+            "obstacle": 1.0,
+            "jerk": 0.001,
             "virtual_jerk": 0.01,
         },
         vmax=2.0,
