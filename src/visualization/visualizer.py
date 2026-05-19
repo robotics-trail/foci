@@ -12,6 +12,8 @@ For manipulators, if the robot has a URDF path, the URDF is shown.
 For drones, the trajectory and Gaussian collision model are shown directly.
 """
 
+import sys
+import select
 import time
 from pathlib import Path
 
@@ -302,6 +304,13 @@ class RobotVisualizer:
         num_samples = self.trajectory.shape[0]
         
         while True:
+        
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                key = sys.stdin.readline().strip()
+                if key.lower() == "q":
+                    print("Stopping visualization.")
+                    break
+
             q = self.trajectory[sample_idx]
 
             self._update_robot(q)

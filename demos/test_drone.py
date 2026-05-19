@@ -7,6 +7,7 @@ from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
 from src.benchmark.utils import minimum_robot_environment_distance
+from src.benchmark.stomp_planner import STOMPPlanner
 
 
 def drone_demo():
@@ -58,6 +59,8 @@ def drone_demo():
         random_seed=10,
         max_time=None,   
 )
+    rrt_result = initializer.initialize(robot, environment, theta_start, goal, num_control_points=40)
+    
     
     planner = Planner(
         robot=robot,
@@ -67,46 +70,78 @@ def drone_demo():
         num_control_points=12,
         num_samples=25,
         weights={
-            "goal": 1000.0,
-            "obstacle": 0.001,
-            "jerk": 0.0000001,
-            "virtual_jerk": 0.000001,
+            "goal": 10.0,
+            "obstacle": 0.01,
+            "jerk": 0.001,
+            "virtual_jerk": 0.001,
         },
         vmax=5.0,
         linear_solver="mumps"
     )
+
+    stomp = STOMPPlanner(
+        robot=robot, 
+        environment=environment,
+        joint_groups=joint_groups, 
+        num_waypoints=40, 
+        n_samples=25,
+        max_iter=800,
+        temperature=10.0,
+        convergence_tol=1e-3,
+        noise_scale= 0.1,
+        seed=42,
+        total_time= 5.0,
+    )
+
 
     result = planner.plan(
         start=theta_start,
         goal=goal,
     )
 
-    min_dist, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
+    theta_final = result.trajectory[-1]
 
-    print("\n--- Planning timings ---")
+    stomp_result = stomp.plan(
+        start=theta_start,
+        goal=theta_final,
+        initial_trajectory=result.initial_trajectory,
+    )
+
+    min_dist_foci, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
+    min_dist_stomp, info = minimum_robot_environment_distance(robot,environment,stomp_result.trajectory)
+
+    print("\n--- Planning timings FOCI---")
     print(f"Initializer: {result.timings['initializer']:.6f} s")
     print(f"Build:       {result.timings['build']:.6f} s")
     print(f"Solver:      {result.timings['solve']:.6f} s")
     print(f"Total:       {result.timings['total']:.6f} s")
     print(f"Success:     {result.success}")
 
+    print("\n--- Planning timings STOMP---")
+    print(f"Initializer: {stomp_result.timings['initializer']:.6f} s")
+    print(f"Build:       {stomp_result.timings['build']:.6f} s")
+    print(f"Solver:      {stomp_result.timings['solve']:.6f} s")
+    print(f"Total:       {stomp_result.timings['total']:.6f} s")
+    print(f"Success:     {stomp_result.success}")
+
     print("\n--- Benchmark metrics ---")
     print(f"Number of environment gaussians: {len(obstacle_means)}")
     print(f"Number of robot gaussians: {len(gaussian_specs)}")
-    print(f"Minimum robot-environment distance: {min_dist:.3f} m")
+    print(f"Minimum robot-environment distance FOCI: {min_dist_foci:.3f} m")
+    print(f"Minimum robot-environment distance CHOMP: {min_dist_stomp:.3f} m")
 
     vis = RobotVisualizer(
     robot=robot,
-    trajectory=result.trajectory,
-    follow_camera=True,
-    camera_offset=np.array([0.0, 0.0, 0.1]),
+    trajectory=stomp_result.trajectory,
+
 )
 
     vis.visualize_goal(goal)
     vis.visualize_obstacles(obstacle_means, obstacle_covs)
     vis.visualize_robot_gaussians()
     vis.visualize_path()
-    vis.visualize_initializer_path(result.initial_trajectory)
+    vis.visualize_initializer_path(result.trajectory, name="FOCI")
+    vis.visualize_initializer_path(result.initial_trajectory, color=(0, 0, 255), name="RRT*")
     vis.visualize_trajectory(loop=True)
 
     

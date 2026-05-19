@@ -1,0 +1,917 @@
+"""
+STOMP Planner
+=============
+
+Stochastic Trajectory Optimization for Motion Planning.
+
+Follows the same interface as CHOMPPlanner and Planner so it can be used
+as a drop-in replacement anywhere a PlanningResult is expected.
+
+Algorithm summary
+-----------------
+STOMP does NOT use gradients. Instead, at each iteration it:
+  1. Samples K noisy trajectory perturbations  δξ_k ~ N(0, R^{-1})
+     where R is the smoothness precision matrix.
+  2. Evaluates the total cost Q_k for each noisy trajectory ξ + δξ_k.
+  3. Computes per-waypoint probability weights w_k ∝ exp(-h · Q_k).
+  4. Updates the mean trajectory:  Δξ = R^{-1} Σ_k w_k δξ_k
+     (the update is automatically smooth because R^{-1} filters it).
+  5. Re-pins the endpoints.
+
+Cost terms (all evaluated numerically, no CasADi graph at solve time):
+  - Obstacle cost   : Gaussian convolution, same as problem.py / CHOMPPlanner.
+  - Jerk cost       : penalises the 3rd finite difference of the trajectory,
+                      matching the _jerk_cost() logic in problem.py.
+  - Constraint cost : soft penalty for velocity, acceleration, and joint-limit
+                      violations (magnitude of the violation, not a hard bound).
+
+References
+----------
+Kalakrishnan et al., "STOMP: Stochastic Trajectory Optimization for
+Motion Planning", ICRA 2011.
+"""
+
+from __future__ import annotations
+
+from time import perf_counter
+from typing import Any
+
+import casadi as cas
+import numpy as np
+
+from src.environment.convolution import ConvolutionFunctorWarp
+from src.planning.joints import JointGroups
+from src.planning.result import PlanningResult
+
+
+_EPS = 1e-10
+
+
+# =============================================================================
+# Smoothness precision matrix  R  and its inverse
+# =============================================================================
+
+def _build_smoothness_matrix(num_waypoints: int, dt: float) -> np.ndarray:
+    """
+    Build the (T, T) finite-difference smoothness matrix R = K^T K.
+
+    K is the (T-1)×T first-difference operator, so R penalises squared
+    velocities.  Scaling by 1/dt gives units consistent with the dt used
+    in the jerk and constraint costs.
+
+    Why R and not A?
+    ----------------
+    In STOMP the same matrix serves two roles:
+      - Precision matrix of the noise distribution: noise ~ N(0, R^{-1}).
+        Drawing noise from R^{-1} guarantees that perturbations are smooth
+        by construction — most of the variance is in low-frequency modes.
+      - Smoothing filter for the update: Δξ = R^{-1} (weighted sum of δξ_k).
+        Multiplying by R^{-1} re-smooths the update, preventing the
+        trajectory from becoming jagged after many iterations.
+
+    A small ridge term is added to guarantee invertibility even for very
+    short trajectories.
+    """
+    T = num_waypoints
+    K = np.zeros((T - 1, T), dtype=float)
+    for i in range(T - 1):
+        K[i, i]     = -1.0
+        K[i, i + 1] =  1.0
+
+    R = (K.T @ K) / max(dt, _EPS)
+    R += 1e-6 * np.eye(T, dtype=float)   # ridge for invertibility
+    return R
+
+
+def _build_precision_inverse(R: np.ndarray) -> np.ndarray:
+    """
+    Return R^{-1}.
+
+    R^{-1} is the covariance of the noise distribution and the smoothing
+    kernel for trajectory updates.  Computed once and reused across all
+    iterations and DOFs.
+    """
+    return np.linalg.inv(R)
+
+
+# =============================================================================
+# Noise sampling
+# =============================================================================
+
+def _sample_noise(
+    R_inv: np.ndarray,
+    n_dof: int,
+    n_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Draw K smooth noise trajectories with unit std, ready to be scaled by
+    noise_scale in the caller.
+
+    Returns
+    -------
+    noise : (K, T, n_dof)
+        Each noise[k] is a smooth perturbation. std ≈ 1 per waypoint so
+        that noise_scale has direct physical meaning (metres, radians, etc).
+
+    Why normalize L?
+    ----------------
+    The raw Cholesky factor L = chol(R^{-1}) amplifies white noise z by
+    sqrt(diag(R^{-1})).  For typical STOMP parameters (T=40, dt=1/39),
+    diag(R^{-1}) ≈ 25,000, so L amplifies by ~158x.  Without normalization,
+    noise_scale=0.1 produces noise with std≈15.8 — catastrophically large
+    for a drone flying over a few metres.
+
+    Dividing L by L_scale = sqrt(max diag(R^{-1})) makes the resulting
+    noise have std≈1 regardless of T and dt, so noise_scale directly
+    controls the perturbation magnitude in the robot's configuration units.
+    The smoothness shape of the noise (low-frequency bias) is preserved
+    because we scale the whole matrix uniformly.
+    """
+    T = R_inv.shape[0]
+    L = np.linalg.cholesky(R_inv)                        # (T, T)
+    L_scale = np.sqrt(np.diag(R_inv).max())              # scalar ≈ 158 for T=40
+    L_norm  = L / max(float(L_scale), _EPS)              # unit-scale Cholesky
+
+    z     = rng.standard_normal(size=(n_samples, T, n_dof))  # (K, T, n_dof)
+    noise = np.einsum("ij,kjd->kid", L_norm, z)              # (K, T, n_dof)
+    return noise
+
+
+# =============================================================================
+# Finite-difference derivatives  (pure numpy, no CasADi)
+# =============================================================================
+
+def _fd_velocity(xi: np.ndarray, dt: float) -> np.ndarray:
+    """
+    First derivative via central differences.  Shape: (T, n_dof).
+    Endpoints use forward/backward differences.
+    """
+    vel = np.zeros_like(xi)
+    vel[1:-1] = (xi[2:] - xi[:-2]) / (2.0 * max(dt, _EPS))
+    vel[0]    = (xi[1]  - xi[0])   / max(dt, _EPS)
+    vel[-1]   = (xi[-1] - xi[-2])  / max(dt, _EPS)
+    return vel
+
+
+def _fd_acceleration(xi: np.ndarray, dt: float) -> np.ndarray:
+    """
+    Second derivative via central differences.  Shape: (T, n_dof).
+    """
+    acc = np.zeros_like(xi)
+    acc[1:-1] = (xi[2:] - 2.0 * xi[1:-1] + xi[:-2]) / max(dt ** 2, _EPS)
+    acc[0]    = acc[1]
+    acc[-1]   = acc[-2]
+    return acc
+
+
+def _fd_jerk(xi: np.ndarray, dt: float) -> np.ndarray:
+    """
+    Third derivative via central differences.  Shape: (T, n_dof).
+
+    Why jerk instead of torque?
+    ---------------------------
+    STOMP's original paper uses torque as the smoothness cost because it
+    has a physical meaning for manipulators.  Here we substitute jerk
+    (third derivative of position) as a proxy — it is model-free, applies
+    to any robot type, and matches the _jerk_cost() logic in problem.py.
+
+    Central difference for the third derivative:
+        d³q/dt³ ≈ (-q_{t-2} + 2q_{t-1} - 2q_{t+1} + q_{t+2}) / (2 dt³)
+    Endpoints are extrapolated from their nearest computed value.
+    """
+    T   = xi.shape[0]
+    jrk = np.zeros_like(xi)
+    dt3 = max(dt ** 3, _EPS)
+
+    for t in range(2, T - 2):
+        jrk[t] = (-xi[t - 2] + 2.0 * xi[t - 1]
+                  - 2.0 * xi[t + 1] + xi[t + 2]) / (2.0 * dt3)
+
+    # Fill boundary stencils with nearest valid value
+    if T > 4:
+        jrk[0]  = jrk[2]
+        jrk[1]  = jrk[2]
+        jrk[-1] = jrk[-3]
+        jrk[-2] = jrk[-3]
+
+    return jrk
+
+
+# =============================================================================
+# Individual cost terms
+# =============================================================================
+
+def _jerk_cost_numpy(
+    xi: np.ndarray,
+    dt: float,
+    duration: float,
+    real_indices: list[int],
+    virtual_indices: list[int],
+    real_weight: float,
+    virtual_weight: float,
+) -> float:
+    """
+    Jerk cost matching the _jerk_cost() formula in problem.py.
+
+    problem.py scales by duration^6 to make the cost dimensionless with
+    respect to the trajectory duration.  We replicate that here so that
+    the obstacle and jerk weights have the same order of magnitude across
+    different trajectory lengths.
+
+        cost = weight * duration^6 * mean( jerk² ) over real/virtual joints
+    """
+    jrk            = _fd_jerk(xi, dt)                # (T, n_dof)
+    duration_factor = max(duration, _EPS) ** 6
+    cost            = 0.0
+
+    if real_indices:
+        real_jerk = jrk[:, real_indices]
+        cost += real_weight * duration_factor * float(np.mean(real_jerk ** 2))
+
+    if virtual_indices:
+        virtual_jerk = jrk[:, virtual_indices]
+        cost += virtual_weight * duration_factor * float(np.mean(virtual_jerk ** 2))
+
+    return cost
+
+
+def _constraint_violation_cost(
+    xi: np.ndarray,
+    dt: float,
+    joint_groups: JointGroups,
+    joint_limits: list[tuple[float, float]] | None,
+    n_dof: int,
+) -> float:
+    """
+    Soft penalty for constraint violations.
+
+    Unlike FOCI/CHOMP (which enforce hard bounds via NLP constraints or
+    clipping), STOMP adds the *magnitude of the violation* to the cost.
+    Noisy samples that violate constraints are thus assigned high cost and
+    receive low weight in the update — they are naturally suppressed
+    without disrupting the sampling process.
+
+    Three violation types are penalised:
+
+    1. Velocity:
+         For real joints:    max(0, |dq/dt| − wmax)
+         For virtual joints: max(0, ||dq_virtual/dt||² − virt_wmax²)
+         (mirrors the quadratic virtual-joint constraint in problem.py)
+
+    2. Acceleration:
+         For real joints:    max(0, |d²q/dt²| − amax)
+         For virtual joints: max(0, ||d²q_virtual/dt²||² − virt_amax²)
+
+    3. Joint limits:
+         max(0, lower − q)  +  max(0, q − upper)  for each DOF and waypoint.
+    """
+    vel = _fd_velocity(xi, dt)       # (T, n_dof)
+    acc = _fd_acceleration(xi, dt)   # (T, n_dof)
+    cost = 0.0
+
+    virtual_set = set(joint_groups.virtual_indices)
+
+    # ---- velocity violations ----
+    for t in range(xi.shape[0]):
+        virtual_vel_sq = 0.0
+
+        for d in range(n_dof):
+            if d in virtual_set:
+                virtual_vel_sq += vel[t, d] ** 2
+            else:
+                viol = max(0.0, abs(vel[t, d]) - joint_groups.real_wmax)
+                cost += viol
+
+        if joint_groups.virtual_indices:
+            viol = max(0.0, virtual_vel_sq - joint_groups.virtual_wmax ** 2)
+            cost += viol
+
+    # ---- acceleration violations ----
+    for t in range(xi.shape[0]):
+        virtual_acc_sq = 0.0
+
+        for d in range(n_dof):
+            if d in virtual_set:
+                virtual_acc_sq += acc[t, d] ** 2
+            else:
+                viol = max(0.0, abs(acc[t, d]) - joint_groups.real_amax)
+                cost += viol
+
+        if joint_groups.virtual_indices:
+            viol = max(0.0, virtual_acc_sq - joint_groups.virtual_amax ** 2)
+            cost += viol
+
+    # ---- joint limit violations ----
+    if joint_limits:
+        for t in range(xi.shape[0]):
+            for d, (lower, upper) in enumerate(joint_limits[:n_dof]):
+                lo = -np.inf if lower is None else float(lower)
+                hi =  np.inf if upper is None else float(upper)
+
+                if not np.isinf(lo):
+                    cost += max(0.0, lo - xi[t, d])
+                if not np.isinf(hi):
+                    cost += max(0.0, xi[t, d] - hi)
+
+    return cost
+
+
+# =============================================================================
+# Collision cost (CasADi function compiled once)
+# =============================================================================
+
+def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
+    """
+    Compile one CasADi function per robot Gaussian:
+        collision_fn_g(x: R³) → (cost: R, grad: R³)
+
+    Why per-Gaussian instead of one joint function?
+    -----------------------------------------------
+    Each Gaussian has its own combined covariance
+    (env_cov + robot_cov_g), so the ConvolutionFunctorWarp is
+    parameterised differently per Gaussian.  Building one function per
+    Gaussian makes the cost evaluation trivially parallelisable and mirrors
+    the loop structure of _obstacle_cost() in problem.py exactly.
+
+    Returns
+    -------
+    fns       : list of K CasADi functions, one per Gaussian
+    callbacks : ConvolutionFunctorWarp objects (kept alive to avoid GC)
+    """
+    robot_covariances = np.asarray(robot.collision_covariances(), dtype=float)
+    n_gaussians       = robot_covariances.shape[0]
+    fns               = []
+    callbacks         = []
+
+    for g in range(n_gaussians):
+        x_sym = cas.MX.sym(f"x_stomp_g{g}", 3)
+        pt    = x_sym.T                             # (1, 3) — ConvolutionFunctorWarp expects (n_samples, 3)
+
+        combined_cov     = environment.obstacle_covariances + robot_covariances[g]
+        combined_cov_det = np.linalg.det(combined_cov)
+        combined_cov_inv = np.linalg.inv(combined_cov)
+
+        conv = ConvolutionFunctorWarp(
+            f"stomp_conv_g{g}",
+            3,
+            1,                                      # num_samples = 1 (one waypoint at a time)
+            environment.obstacle_means,
+            combined_cov_det,
+            combined_cov_inv,
+        )
+        callbacks.append(conv)
+
+        cost = conv(pt)
+        # No gradient needed for STOMP: cost is evaluated numerically
+        # on sampled trajectories, not differentiated.
+        fn   = cas.Function(
+            f"stomp_collision_g{g}",
+            [x_sym],
+            [cost],
+            [f"x_g{g}"],
+            [f"cost_g{g}"],
+        )
+        fns.append(fn)
+
+    return fns, callbacks
+
+
+def _obstacle_cost_trajectory(
+    xi: np.ndarray,
+    collision_geometry_fn: cas.Function,
+    collision_cost_fns: list[cas.Function],
+    n_collision_points: int,
+) -> float:
+    """
+    Evaluate the total obstacle cost for a full trajectory xi (T, n_dof).
+
+    For each waypoint t and each robot Gaussian g, we:
+      1. Compute the Gaussian's 3-D position via FK (collision_geometry_fn).
+      2. Evaluate the convolution cost at that position.
+      3. Sum over waypoints and Gaussians, normalise by n_gaussians
+         (matching the `/ n_gaussians` in _obstacle_cost() of problem.py).
+    """
+    T    = xi.shape[0]
+    cost = 0.0
+    n_g  = n_collision_points
+
+    for t in range(T):
+        pts, _ = collision_geometry_fn(xi[t])           # (n_g, 3), jacobians (unused)
+        pts_np  = np.asarray(pts, dtype=float).reshape(n_g, 3)
+
+        for g in range(n_g):
+            c = float(collision_cost_fns[g](pts_np[g]))
+            cost += c
+
+    return cost / max(float(n_g), _EPS)
+
+
+# =============================================================================
+# STOMP weight computation
+# =============================================================================
+
+def _compute_sample_weights(costs: np.ndarray, temperature: float) -> np.ndarray:
+    """
+    Convert per-sample costs to probability weights using the softmin.
+
+        w_k = exp(-h * (Q_k - min Q)) / Σ exp(-h * (Q_k - min Q))
+
+    Subtracting min Q before exponentiating prevents numerical underflow
+    when costs are large.  The temperature h controls how sharply the
+    distribution concentrates on the best samples:
+      - Large h  → winner-takes-all (only the best sample matters).
+      - Small h  → uniform averaging (all samples contribute equally).
+
+    Parameters
+    ----------
+    costs       : (K,)  per-sample total costs
+    temperature : h > 0
+
+    Returns
+    -------
+    weights : (K,)  normalised, sum to 1
+    """
+    shifted   = costs - costs.min()
+    log_w     = -temperature * shifted
+    log_w    -= log_w.max()             # numerical stability
+    weights   = np.exp(log_w)
+    total     = weights.sum()
+    if total < _EPS:
+        weights[:] = 1.0 / len(weights)
+    else:
+        weights   /= total
+    return weights
+
+
+# =============================================================================
+# STOMPPlanner
+# =============================================================================
+
+class STOMPPlanner:
+    """
+    STOMP trajectory optimisation planner.
+
+    Drop-in replacement for ``Planner`` and ``CHOMPPlanner``:
+
+        planner = STOMPPlanner(robot, env, joint_groups, ...)
+        result  = planner.plan(start, goal)   # → PlanningResult
+
+    Key difference from CHOMP
+    -------------------------
+    CHOMP is gradient-based: it differentiates the obstacle cost w.r.t. the
+    trajectory and follows the gradient.  STOMP is gradient-free: it samples
+    noisy trajectories, scores them, and updates the mean by a
+    *probability-weighted average of the noise*.  This makes STOMP suitable
+    for cost functions that are non-differentiable (e.g. binary collision
+    checks, discrete environment representations).
+
+    Parameters
+    ----------
+    robot :
+        ManipulatorRobot (or any BaseRobot with gaussian_specs,
+        collision_covariances(), joint_limits()).
+    environment :
+        GaussianEnvironment with obstacle_means and obstacle_covariances.
+    joint_groups : JointGroups
+        Real vs virtual joint definitions and limits.
+    num_waypoints : int
+        Number of trajectory waypoints T.
+    n_samples : int
+        K — number of noisy trajectories sampled per iteration.
+        More samples → more stable update but higher cost per iteration.
+    max_iter : int
+        Maximum number of update iterations.
+    temperature : float
+        h — controls sharpness of the softmin weight distribution.
+        Higher values make the update concentrate on the best sample.
+    weights : dict[str, float] | None
+        Per-term cost weights: 'obstacle', 'jerk', 'constraint'.
+    convergence_tol : float
+        Stop early if ||Δξ|| < tol.
+    noise_scale : float
+        Global scaling applied to all sampled noise perturbations.
+        Increase if the optimizer is stuck; decrease for fine-tuning.
+    seed : int | None
+        Random seed for reproducibility.
+    total_time : float
+        Normalised trajectory duration used for dt and cost scaling.
+        Increase for slower motions, decrease for faster ones.
+    """
+
+    def __init__(
+        self,
+        robot: Any,
+        environment: Any,
+        joint_groups: JointGroups,
+        num_waypoints:   int   = 40,
+        n_samples:       int   = 10,
+        max_iter:        int   = 200,
+        temperature:     float = 10.0,
+        weights:         dict[str, float] | None = None,
+        convergence_tol: float = 1e-4,
+        noise_scale:     float = 0.1,
+        seed:            int | None = None,
+        total_time:      float = 1.0,
+    ):
+        self.robot           = robot
+        self.environment     = environment
+        self.joint_groups    = joint_groups
+        self.num_waypoints   = int(num_waypoints)
+        self.n_samples       = int(n_samples)
+        self.max_iter        = int(max_iter)
+        self.temperature     = float(temperature)
+        self.convergence_tol = float(convergence_tol)
+        self.noise_scale     = float(noise_scale)
+        self.total_time      = float(total_time)
+
+        self.weights = {
+            "obstacle":   1.0,
+            "jerk":       1.0,
+            "constraint": 1.0,
+            **(weights or {}),
+        }
+
+        # dt is the time step between consecutive waypoints.
+        # It is used consistently in all derivative estimations (velocity,
+        # acceleration, jerk) and in the smoothness matrix, so every cost
+        # term has the same time units.
+        self.dt = self.total_time / max(self.num_waypoints - 1, 1)
+
+        self._rng = np.random.default_rng(seed)
+
+        # ------------------------------------------------------------------
+        # Joint information cached once from the robot
+        # ------------------------------------------------------------------
+        self._joint_limits: list[tuple[float, float]] | None = (
+            self.robot.joint_limits()
+            if hasattr(self.robot, "joint_limits")
+            else None
+        )
+
+        robot_covs = np.asarray(self.robot.collision_covariances(), dtype=float)
+        if robot_covs.ndim != 3 or robot_covs.shape[1:] != (3, 3):
+            raise ValueError(
+                "robot.collision_covariances() must have shape (n_gaussians, 3, 3)."
+            )
+        self._n_collision_points = robot_covs.shape[0]
+
+        # ------------------------------------------------------------------
+        # Build pre-compiled CasADi functions (done once in __init__,
+        # not inside plan(), to amortise compilation cost over repeated calls)
+        # ------------------------------------------------------------------
+
+        # FK + Jacobian for each collision point — needed to map
+        # q → 3-D position of each robot Gaussian.
+        self._collision_geometry_fn = self._build_collision_geometry_fn()
+
+        # Per-Gaussian convolution cost evaluated at a single 3-D point.
+        self._collision_cost_fns, self._callbacks = _build_collision_fn(
+            robot, environment
+        )
+
+        # Build the smoothness precision matrix R once.
+        # R^{-1} (its Cholesky factor L) is used only for noise sampling.
+        # It is NOT applied to the update step — see plan() block 3e.
+        R           = _build_smoothness_matrix(self.num_waypoints, self.dt)
+        self._R     = R
+        self._R_inv = _build_precision_inverse(R)   # kept for noise sampling via cholesky(R_inv)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _build_collision_geometry_fn(self) -> cas.Function:
+        """
+        CasADi function:  q (n_dof,) → points (n_g, 3), J_stack (3*n_g, n_dof)
+
+        Identical to CHOMPPlanner._build_collision_geometry_function().
+        Compiled once; evaluated numerically for every (sample, waypoint).
+        """
+        q   = cas.MX.sym("q_stomp_geom", self.robot.n_dof)
+        pts = self.robot.collision_points(q)             # (n_g, 3)
+
+        jacobians = []
+        for g in range(self._n_collision_points):
+            pt_g = pts[g, :].T
+            jacobians.append(cas.jacobian(pt_g, q))
+
+        J_stack = cas.vertcat(*jacobians)                # (3*n_g, n_dof)
+
+        return cas.Function(
+            "stomp_collision_geometry",
+            [q],
+            [pts, J_stack],
+        )
+
+    def _total_cost(self, xi: np.ndarray) -> float:
+        """
+        Evaluate the total scalar cost of a trajectory xi (T, n_dof).
+
+        Three additive terms — all weighted by self.weights:
+
+        1. Obstacle cost
+           Gaussian convolution summed over waypoints and body points,
+           normalised by n_gaussians (mirrors _obstacle_cost() in problem.py).
+
+        2. Jerk cost
+           Matches _jerk_cost() in problem.py: scales by duration^6 and
+           averages over real/virtual joints separately.
+
+        3. Constraint violation cost
+           Sum of magnitudes of velocity, acceleration, and joint-limit
+           violations.  This replaces the hard NLP constraints of problem.py
+           with soft penalties appropriate for a sampling-based method.
+        """
+        n_dof        = self.robot.n_dof
+        real_indices = self.joint_groups.real_indices(n_dof)
+        virtual_idx  = self.joint_groups.virtual_indices
+
+        obs_cost = _obstacle_cost_trajectory(
+            xi,
+            self._collision_geometry_fn,
+            self._collision_cost_fns,
+            self._n_collision_points,
+        )
+
+        jrk_cost = _jerk_cost_numpy(
+            xi,
+            dt              = self.dt,
+            duration        = self.total_time,
+            real_indices    = real_indices,
+            virtual_indices = virtual_idx,
+            real_weight     = 1.0,    # outer weight applied below
+            virtual_weight  = 1.0,
+        )
+
+        con_cost = _constraint_violation_cost(
+            xi,
+            dt            = self.dt,
+            joint_groups  = self.joint_groups,
+            joint_limits  = self._joint_limits,
+            n_dof         = n_dof,
+        )
+
+        return (
+            self.weights["obstacle"]   * obs_cost
+            + self.weights["jerk"]     * jrk_cost
+            + self.weights["constraint"] * con_cost
+        )
+
+    def _straight_line(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        s = np.linspace(0.0, 1.0, self.num_waypoints)[:, None]
+        return (1.0 - s) * start[None, :] + s * goal[None, :]
+
+    def _clip_to_joint_limits(self, xi: np.ndarray) -> np.ndarray:
+        """
+        Hard-clip a trajectory to the robot's joint limits.
+
+        In STOMP this is applied only to the *mean* trajectory after the
+        update step — not to the noisy samples.  Clipping the samples would
+        bias the noise distribution and corrupt the probability weights.
+        The joint-limit *cost* on the samples already discourages violations
+        without distorting the distribution.
+        """
+        if not self._joint_limits:
+            return xi
+
+        out = xi.copy()
+        for d, (lo, hi) in enumerate(self._joint_limits[: xi.shape[1]]):
+            lo_f = -np.inf if lo is None else float(lo)
+            hi_f =  np.inf if hi is None else float(hi)
+            out[:, d] = np.clip(out[:, d], lo_f, hi_f)
+        return out
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def plan(
+        self,
+        start: np.ndarray,
+        goal:  np.ndarray,
+        initial_trajectory: np.ndarray | None = None,
+    ) -> PlanningResult:
+        """
+        Run STOMP optimisation and return a PlanningResult.
+
+        Parameters
+        ----------
+        start : (n_dof,)
+            Initial joint configuration.
+        goal : (n_dof,)
+            Goal joint configuration.
+        initial_trajectory : (N, n_dof) | None
+            Optional warm-start trajectory (e.g. from FOCI).
+            If None, a straight-line initialisation is used.
+
+        Returns
+        -------
+        PlanningResult
+            Same structure as Planner.plan() and CHOMPPlanner.plan().
+        """
+        total_start = perf_counter()
+
+        start = np.asarray(start, dtype=float).reshape(-1)
+        goal  = np.asarray(goal,  dtype=float).reshape(-1)
+        n_dof = len(start)
+
+        self.joint_groups.validate(n_dof)
+
+        if goal.shape != start.shape:
+            raise ValueError(
+                f"goal must have shape {start.shape}, got {goal.shape}."
+            )
+
+        # ==============================================================
+        # Block 1 – Initialiser
+        # ==============================================================
+        init_start = perf_counter()
+
+        if initial_trajectory is None:
+            # Straight-line: minimum-smoothness boundary-satisfying trajectory.
+            xi = self._straight_line(start, goal)
+        else:
+            xi = np.asarray(initial_trajectory, dtype=float)
+            if xi.ndim != 2 or xi.shape[1] != n_dof:
+                raise ValueError(
+                    f"initial_trajectory must have shape (N, {n_dof}), got {xi.shape}."
+                )
+            # Resample to num_waypoints if needed
+            if xi.shape[0] != self.num_waypoints:
+                old_s = np.linspace(0.0, 1.0, xi.shape[0])
+                new_s = np.linspace(0.0, 1.0, self.num_waypoints)
+                xi    = np.vstack(
+                    [np.interp(new_s, old_s, xi[:, d]) for d in range(n_dof)]
+                ).T
+
+        xi[0]  = start
+        xi[-1] = goal
+        initial_xi = xi.copy()
+
+        init_time = perf_counter() - init_start
+
+        # ==============================================================
+        # Block 2 – Build  (matrices already prepared in __init__)
+        # ==============================================================
+        build_start = perf_counter()
+        # R and R_inv were built in __init__ to amortise compilation.
+        # We just record the timing for consistency with Planner.
+        build_time = perf_counter() - build_start
+
+        # ==============================================================
+        # Block 3 – STOMP optimisation loop
+        # ==============================================================
+        solve_start = perf_counter()
+
+        converged              = False
+        iterations_run         = 0
+        final_cost             = np.inf
+        final_obstacle_cost    = np.inf
+        final_jerk_cost        = np.inf
+        final_constraint_cost  = np.inf
+        final_update_norm      = np.inf
+
+        for iteration in range(self.max_iter):
+            iterations_run = iteration + 1
+
+            # ----------------------------------------------------------
+            # 3a. Sample K noisy trajectories
+            # ----------------------------------------------------------
+            # noise shape: (K, T, n_dof)
+            # Each noise[k] is drawn from N(0, R^{-1}) so it is smooth
+            # by construction and has zero mean across samples.
+            noise = (
+                self.noise_scale
+                * _sample_noise(self._R_inv, n_dof, self.n_samples, self._rng)
+            )
+
+            # ----------------------------------------------------------
+            # 3b. Evaluate cost of each noisy trajectory
+            # ----------------------------------------------------------
+            # xi_k = xi + noise[k], with endpoints re-pinned.
+            # Costs are evaluated on the noisy trajectory, not on xi.
+            costs = np.zeros(self.n_samples, dtype=float)
+
+            for k in range(self.n_samples):
+                xi_k          = xi + noise[k]
+                xi_k[0]       = start
+                xi_k[-1]      = goal
+                costs[k]      = self._total_cost(xi_k)
+
+            # ----------------------------------------------------------
+            # 3c. Compute sample weights  w_k ∝ exp(-h · Q_k)
+            # ----------------------------------------------------------
+            weights = _compute_sample_weights(costs, self.temperature)  # (K,)
+
+            # ----------------------------------------------------------
+            # 3d. Compute the probability-weighted noise sum
+            # ----------------------------------------------------------
+            # delta_xi[t, d] = Σ_k w_k * noise[k, t, d]
+            # Shape: (T, n_dof)
+            delta_xi = np.einsum("k,ktd->td", weights, noise)           # (T, n_dof)
+
+            # ----------------------------------------------------------
+            # 3e. Apply the update  Δξ = Σ_k w_k δξ_k
+            # ----------------------------------------------------------
+            # delta_xi is already smooth because every noise[k] was sampled
+            # from N(0, R^{-1}): low-frequency modes dominate, high-frequency
+            # modes are suppressed by construction.
+            #
+            # We do NOT multiply by R^{-1} here.  R^{-1} has diagonal
+            # values ~25,000 and row sums ~1,000,000 (for T=40, dt=1/39).
+            # Applying it to delta_xi (magnitude ~0.03-0.1 units) would
+            # produce updates of ~100,000 units — exactly the teleportation
+            # bug observed with DroneRobot (DOFs are metres, not radians).
+            #
+            # The noise sampling step (3a) already encodes the smoothness
+            # prior via cholesky(R^{-1}); applying R^{-1} again in the
+            # update would double-count it and explode the step size.
+            xi_new = xi + delta_xi
+
+            # ----------------------------------------------------------
+            # 3f. Re-pin endpoints and clip to joint limits
+            # ----------------------------------------------------------
+            # Clipping is applied only to the mean trajectory (not to
+            # the noisy samples) to preserve the noise distribution.
+            xi_new        = self._clip_to_joint_limits(xi_new)
+            xi_new[0]     = start
+            xi_new[-1]    = goal
+
+            # ----------------------------------------------------------
+            # 3g. Convergence check
+            # ----------------------------------------------------------
+            update_norm = float(np.linalg.norm(xi_new - xi))
+            xi          = xi_new
+
+            if update_norm < self.convergence_tol:
+                converged = True
+                break
+
+        # ----------------------------------------------------------
+        # Final cost breakdown on the converged mean trajectory
+        # ----------------------------------------------------------
+        n_dof_final   = self.robot.n_dof
+        real_indices  = self.joint_groups.real_indices(n_dof_final)
+        virtual_idx   = self.joint_groups.virtual_indices
+
+        final_obstacle_cost = self.weights["obstacle"] * _obstacle_cost_trajectory(
+            xi,
+            self._collision_geometry_fn,
+            self._collision_cost_fns,
+            self._n_collision_points,
+        )
+        final_jerk_cost = self.weights["jerk"] * _jerk_cost_numpy(
+            xi,
+            dt              = self.dt,
+            duration        = self.total_time,
+            real_indices    = real_indices,
+            virtual_indices = virtual_idx,
+            real_weight     = 1.0,
+            virtual_weight  = 1.0,
+        )
+        final_constraint_cost = self.weights["constraint"] * _constraint_violation_cost(
+            xi,
+            dt           = self.dt,
+            joint_groups = self.joint_groups,
+            joint_limits = self._joint_limits,
+            n_dof        = n_dof_final,
+        )
+        final_cost     = final_obstacle_cost + final_jerk_cost + final_constraint_cost
+        final_update_norm = update_norm
+
+        solve_time = perf_counter() - solve_start
+        total_time = perf_counter() - total_start
+
+        # ==============================================================
+        # Block 4 – Pack PlanningResult
+        # ==============================================================
+        return PlanningResult(
+            trajectory         = xi,
+            control_points     = None,
+            initial_trajectory = initial_xi,
+            success            = converged,
+            timings={
+                "initializer": init_time,
+                "build":       build_time,
+                "solve":       solve_time,
+                "total":       total_time,
+            },
+            solver_stats={},
+            metadata={
+                "iterations":            iterations_run,
+                "final_cost":            final_cost,
+                "final_obstacle_cost":   final_obstacle_cost,
+                "final_jerk_cost":       final_jerk_cost,
+                "final_constraint_cost": final_constraint_cost,
+                "final_update_norm":     final_update_norm,
+                "converged":             converged,
+                "num_waypoints":         self.num_waypoints,
+                "n_samples":             self.n_samples,
+                "temperature":           self.temperature,
+                "noise_scale":           self.noise_scale,
+                "weights":               self.weights,
+                "dt":                    self.dt,
+                "total_time":            self.total_time,
+            },
+        )
