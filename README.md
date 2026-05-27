@@ -12,7 +12,7 @@ This repository contains the implementation developed for the Final Degree Proje
 git clone <REPOSITORY_URL>
 cd FOCI_Generico
 
-git checkout <refactor/codebase_cleanup>
+git checkout refactor/codebase_cleanup
 ```
 
 ### 2. Create the virtual environment and install dependencies
