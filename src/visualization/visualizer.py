@@ -49,6 +49,7 @@ class RobotVisualizer:
             )
 
         self.robot = robot
+
         self.trajectory = trajectory
 
         self.follow_camera = follow_camera
@@ -85,8 +86,8 @@ class RobotVisualizer:
             if not Path(self.robot_urdf).is_file():
                 raise FileNotFoundError(f"URDF file not found: {self.robot_urdf}")
 
-            urdf = URDF.load(self.robot_urdf)
-            self.viser_urdf = ViserUrdf(self.server, urdf_or_path=urdf, root_node_name="/robot")
+            self.urdf = URDF.load(self.robot_urdf)
+            self.viser_urdf = ViserUrdf(self.server, urdf_or_path=self.urdf, root_node_name="/robot")
 
             self.robot_frame = self.server.scene.add_frame("/robot",show_axes=False)
 
@@ -336,8 +337,10 @@ class RobotVisualizer:
         """
         if self.robot_urdf is None:
             return
+
+        robot_type = self.robot.__class__.__name__
         
-        if self.robot.__class__.__name__ == "DroneRobot":
+        if robot_type == "DroneRobot":
             x, y, z, yaw = q
 
             self.robot_frame.position = np.array([x, y, z])
@@ -348,11 +351,28 @@ class RobotVisualizer:
                 np.sin(yaw / 2.0),
             ])
 
-            # Usually drone URDF has no actuated joints.
-            self.viser_urdf.update_cfg(np.zeros(0))
+            self.viser_urdf.update_cfg(self.urdf.zero_cfg)
+
+            return
+
+        elif robot_type == "MobileRobot":
+            x, y, yaw = q
+
+            self.robot_frame.position = np.array([x, y, self.robot.body_center_height])
+            self.robot_frame.wxyz = np.array([
+                np.cos(yaw / 2.0),
+                0.0,
+                0.0,
+                np.sin(yaw / 2.0),
+            ])
+
+            self.viser_urdf.update_cfg(self.urdf.zero_cfg)
+
             return
 
         self.viser_urdf.update_cfg(q)
+
+    
 
     def _update_robot_gaussians(self, sample_idx: int):
         if not self._robot_gaussian_handles or self._ellipsoid_factory is None:
