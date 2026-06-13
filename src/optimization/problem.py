@@ -66,7 +66,7 @@ def _obstacle_cost(
 
     collision_points has shape:
 
-        (num_samples * n_gaussians, 3)
+        (3 * n_gaussians, n_samples)
 
     robot_covariances has shape:
 
@@ -85,10 +85,10 @@ def _obstacle_cost(
     callbacks = []
 
     for gaussian_idx in range(n_gaussians):
-        gaussian_points = collision_points[
-            gaussian_idx::n_gaussians,
-            :
-        ]
+        row_start = gaussian_idx * 3
+        row_end = row_start + 3
+
+        gaussian_points = collision_points[row_start:row_end, :].T
 
         covs = environment.obstacle_covariances + robot_covariances[gaussian_idx]
         covs_det = np.linalg.det(covs)
@@ -224,22 +224,6 @@ def build_problem(
     """
     Build the trajectory optimization NLP.
 
-    Parameters
-    ----------
-    robot:
-        Any robot implementing:
-
-            robot.n_dof
-            robot.f_task(q)
-            robot.collision_points(q)
-
-    environment:
-        GaussianEnvironment.
-
-    robot_covariance:
-        3x3 covariance matrix for the robot collision model.
-        If omitted, a small isotropic covariance is used.
-
     Returns
     -------
     nlp, lbg, ubg
@@ -325,28 +309,20 @@ def build_problem(
 
     q_sym = symbolic_type.sym("q", n_dof)
 
+    collision_points_raw = robot.collision_points(q_sym) # (n_gaussias, 3)
+    n_gaussians = collision_points_raw.shape[0]
+
+    collision_points_vec = cas.reshape(collision_points_raw.T, 3 * n_gaussians, 1) # (3 * n_gaussians, 1)
+
     collision_fun = cas.Function(
         "collision_points",
         [q_sym],
-        [robot.collision_points(q_sym)],
+        [collision_points_vec],
     )
    
     collision_map = collision_fun.map(num_samples, "openmp")
+    mapped_collision_points = collision_map(curve.T) # (3*n_gaussians, num_samples)
 
-    # mapped_collision_points: (3*n_gaussians, num_samples)
-    mapped_collision_points = collision_map(curve.T)
-
-    n_gaussians = len(robot.gaussian_specs)
-
-    # Cada columna de mapped_collision_points es un sample con layout [x0,y0,z0,x1,y1,z1,...]
-    # Queremos (num_samples * n_gaussians, 3) con orden [s0_g0, s0_g1, ..., s1_g0, ...]
-    # reshape column-major de CasADi: primero varía la fila, luego la columna
-    # (3*n_gaussians, num_samples) -> leer columna a columna -> (3, n_gaussians*num_samples) -> .T
-    collision_points = cas.reshape(
-        mapped_collision_points,
-        3,
-        n_gaussians * num_samples,
-    ).T
 
     # ==========================================================
     # Constraints
@@ -363,7 +339,6 @@ def build_problem(
     ]
 
     
-
     constraints, lbg, ubg = _build_constraints(
         symbolic_type=symbolic_type,
         curve=curve,
@@ -401,7 +376,7 @@ def build_problem(
     )
 
     cost_obstacles, callbacks = _obstacle_cost(
-        collision_points,
+        mapped_collision_points,
         environment,
         robot_covariance,
         num_samples=num_samples,
