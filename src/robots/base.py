@@ -26,6 +26,7 @@ class BaseRobot(ABC):
         """
         raise NotImplementedError
 
+
     @abstractmethod
     def forward_kinematics(self, q: Any) -> Any:
         """
@@ -35,6 +36,10 @@ class BaseRobot(ABC):
     
     @abstractmethod
     def collision_covariances(self): 
+        raise NotImplementedError
+
+    @abstractmethod
+    def collision_covariances_online(self, q: Any) -> Any: 
         raise NotImplementedError
 
     def joint_limits(self) -> list[tuple[float, float]] | None:
