@@ -2,6 +2,7 @@ import numpy as np
 
 from src.robots.drone import DroneRobot, DroneGaussian
 from src.robots.mobile import MobileRobot, MobileGaussian
+from src.robots.manipulator import ManipulatorRobot, LinkGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner_online import OnlinePlanner
@@ -28,15 +29,25 @@ def mobile_robot_demo():
     )
 
     # gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02]))]
-    gaussian_specs = [
-        MobileGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02])), 
+    # gaussian_specs = [
+    #     MobileGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02])), 
+    #     ]
+    gaussian_specs = [ 
+            LinkGaussian(5, 0.5, np.diag([0.1, 0.02, 0.2])), 
+            LinkGaussian(6, 0.5, np.diag([0.1, 0.02, 0.2])), 
+            LinkGaussian(7, 0.5, np.diag([0.1, 0.02, 0.05])), 
+            LinkGaussian(8, 0.5, np.diag([0.1, 0.02, 0.05])), 
         ]
     
 
     # theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    theta_start = np.array([0.0, 0.0, 0.0])
+    # theta_start = np.array([0.0, 0.0, 0.0])
+    theta_start = np.array(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    )
     # goal = np.array([4.0, 3.0, 2.5])
-    goal = np.array([4.0, 3.0, 0.5])
+    # goal = np.array([4.0, 3.0, 0.5])
+    goal = np.array([3.0, 3.0, 4.0])
 
     # robot = DroneRobot(
     #     urdf_path="urdfs/drone_example.urdf",
@@ -45,11 +56,18 @@ def mobile_robot_demo():
     #     xyz_limits=[(-0.5, 4.5), (-0.5, 3.5),(0.0, 3.0)]
     # )
 
-    robot = MobileRobot(
-            urdf_path="urdfs/anymal.urdf",
-            body_center_height=1.0,
-            gaussian_specs=gaussian_specs,
-            xy_limits=[(-0.5, 4.5), (-0.5, 3.5)]
+    # robot = MobileRobot(
+    #         urdf_path="urdfs/anymal.urdf",
+    #         body_center_height=1.0,
+    #         gaussian_specs=gaussian_specs,
+    #         xy_limits=[(-0.5, 4.5), (-0.5, 3.5)]
+    # )
+
+    robot = ManipulatorRobot(
+        urdf_path="urdfs/ur5_extended_move.urdf",
+        root_link="world",
+        tip_link="ee_link",
+        gaussian_specs=gaussian_specs,
     )
 
     # joint_groups = JointGroups(
@@ -60,13 +78,22 @@ def mobile_robot_demo():
     #         real_amax=3.0,
     #     )
 
+    # joint_groups = JointGroups(
+    #         virtual_indices=[0,1], 
+    #         virtual_wmax=5.0, 
+    #         virtual_amax=2.5, 
+    #         real_wmax=2.0, 
+    #         real_amax=2.5,
+    # )
+
     joint_groups = JointGroups(
-            virtual_indices=[0,1], 
-            virtual_wmax=5.0, 
-            virtual_amax=2.5, 
-            real_wmax=2.0, 
-            real_amax=2.5,
-    )
+            virtual_indices=[0,1,2], 
+            virtual_wmax=4.5, 
+            virtual_amax=5.0, 
+            real_wmax=4.5, 
+            real_amax=5.5,
+        )
+    
     
     environment = GaussianEnvironment(
         obstacle_means=obstacle_means,

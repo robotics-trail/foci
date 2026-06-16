@@ -317,6 +317,23 @@ class ManipulatorRobot(BaseRobot):
             axis=0,
         )
 
+    def collision_covariances_online(self, q):
+
+        links = self.urdf_backend.links
+        covs = []
+
+        for spec in self.gaussian_specs: 
+            link_name = links[spec.link]
+            T = self.urdf_backend.link_transform(q, link_name)
+            R = cas.reshape(T[:3, :3], 3, 3)
+
+            body_cov = cas.DM(spec.covariance)
+            world_cov = R @ body_cov @ R.T
+
+            covs.append(world_cov)
+
+        return cas.vertcat(*covs)
+
     def joint_limits(self) -> list[tuple[float, float]]:
         return self.urdf_backend.joint_limits()
 
