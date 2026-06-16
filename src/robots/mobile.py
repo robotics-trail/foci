@@ -135,6 +135,26 @@ class MobileRobot(BaseRobot):
             axis=0,
         )
 
+    def collision_covariances_online(self, q):
+            yaw = q[2]
+            
+            c, s = cas.cos(yaw), cas.sin(yaw)
+            R = cas.vertcat(
+                cas.horzcat(c, -s, 0), 
+                cas.horzcat(s, c, 0), 
+                cas.horzcat(0, 0, 1), 
+            )
+    
+            covs = []
+    
+            for spec in self.gaussian_specs: 
+                body_cov = cas.DM(spec.covariance)
+                world_cov = R @ body_cov @ R.T
+    
+                covs.append(world_cov)
+    
+            return cas.vertcat(*covs)
+
     def joint_limits(self) -> list[tuple[float, float]]:
         return [
             *self.xy_limits,

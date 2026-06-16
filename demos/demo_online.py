@@ -1,6 +1,7 @@
 import numpy as np
 
 from src.robots.drone import DroneRobot, DroneGaussian
+from src.robots.mobile import MobileRobot, MobileGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner_online import OnlinePlanner
@@ -26,26 +27,46 @@ def mobile_robot_demo():
         ]
     )
 
-    gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02]))]
+    # gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02]))]
+    gaussian_specs = [
+        MobileGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02])), 
+        ]
     
 
-    theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    goal = np.array([4.0, 3.0, 2.5])
+    # theta_start = np.array([0.0, 0.0, 0.0, 0.0])
+    theta_start = np.array([0.0, 0.0, 0.0])
+    # goal = np.array([4.0, 3.0, 2.5])
+    goal = np.array([4.0, 3.0, 0.5])
 
-    robot = DroneRobot(
-        urdf_path="urdfs/drone_example.urdf",
-        arm_length=0.15,
-        gaussian_specs=gaussian_specs,
-        xyz_limits=[(-0.5, 4.5), (-0.5, 3.5),(0.0, 3.0)]
+    # robot = DroneRobot(
+    #     urdf_path="urdfs/drone_example.urdf",
+    #     arm_length=0.15,
+    #     gaussian_specs=gaussian_specs,
+    #     xyz_limits=[(-0.5, 4.5), (-0.5, 3.5),(0.0, 3.0)]
+    # )
+
+    robot = MobileRobot(
+            urdf_path="urdfs/anymal.urdf",
+            body_center_height=1.0,
+            gaussian_specs=gaussian_specs,
+            xy_limits=[(-0.5, 4.5), (-0.5, 3.5)]
     )
 
+    # joint_groups = JointGroups(
+    #         virtual_indices=[0,1,2,3], 
+    #         virtual_wmax=5.0, 
+    #         virtual_amax=3.0, 
+    #         real_wmax=5.0, 
+    #         real_amax=3.0,
+    #     )
+
     joint_groups = JointGroups(
-            virtual_indices=[0,1,2,3], 
+            virtual_indices=[0,1], 
             virtual_wmax=5.0, 
-            virtual_amax=3.0, 
-            real_wmax=5.0, 
-            real_amax=3.0,
-        )
+            virtual_amax=2.5, 
+            real_wmax=2.0, 
+            real_amax=2.5,
+    )
     
     environment = GaussianEnvironment(
         obstacle_means=obstacle_means,
@@ -58,8 +79,7 @@ def mobile_robot_demo():
         random_seed=10,
         max_time=None,   
 )
-    rrt_result = initializer.initialize(robot, environment, theta_start, goal, num_control_points=40)
-    
+    # rrt_result = initializer.initialize(robot, environment, theta_start, goal, num_control_points=40)
     
     planner = OnlinePlanner(
         robot=robot,
