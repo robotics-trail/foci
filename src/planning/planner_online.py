@@ -51,19 +51,11 @@ class OnlinePlanner:
         return covariances.reshape(covariances.shape[0], 9, order="C")
 
     def _build_parameter_vector(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        obstacle_means = np.asarray(self.environment.obstacle_means, dtype=float)
-        obstacle_covs = self._obstacle_covariances_to_row_major(
-            self.environment.obstacle_covariances
-        )
-
-        # Important: problem_online.py uses cas.vec(matrix), which is column-major.
-        # Therefore each matrix parameter must be flattened with order="F" here.
         return np.concatenate(
             [
                 np.asarray(start, dtype=float).reshape(-1),
                 np.asarray(goal, dtype=float).reshape(-1),
-                obstacle_means.reshape(-1, order="F"),
-                obstacle_covs.reshape(-1, order="F"),
+
             ]
         )
 

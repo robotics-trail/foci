@@ -100,7 +100,7 @@ def _obstacle_cost(
     num_samples: int,
     weight: float,
 ):
-    """Obstacle cost for dynamic robot covariance matrices.
+    """Obstacle cost supporting per-sample (dynamic) obstacle positions.
 
     collision_points shape:
         (3*n_gaussians, num_samples)
@@ -109,40 +109,44 @@ def _obstacle_cost(
         (9*n_gaussians, num_samples)
 
     obstacle_means_param shape:
-        (num_obstacles, 3)
+        (num_samples, n_obstacles * 3)
+        Row k contains the flattened means of all obstacles at sample k.
 
     obstacle_covs_param shape:
-        (num_obstacles, 9), row-major per obstacle covariance.
+        (num_samples, n_obstacles * 9)
+        Row k contains the flattened row-major covariances at sample k.
     """
     cost = 0
     callbacks = []
 
-    n_obstacles = int(obstacle_means_param.shape[0])
+    n_obstacles = int(obstacle_means_param.shape[1]) // 3
 
-    for gauss_idx in range(n_gaussians):
-        gaussian_points = collision_points[
-            3 * gauss_idx : 3 * gauss_idx + 3,
-            :,
-        ].T
+    for sample_idx in range(num_samples):
+        gaussian_points_flat = collision_points[:, sample_idx] 
+        gaussian_points = cas.reshape(gaussian_points_flat, 3, n_gaussians).T 
 
-        gaussian_covs = collision_covs[
-            9 * gauss_idx : 9 * gauss_idx + 9,
-            :,
-        ].T
+        gaussian_covs_flat = collision_covs[:, sample_idx] 
+        gaussian_covs = cas.reshape(gaussian_covs_flat, 9, n_gaussians).T 
+
+        obstacle_points_flat = obstacle_means_param[sample_idx, :]
+        obstacle_points = cas.reshape(obstacle_points_flat.T, 3, n_obstacles).T
+
+        obstacle_covs_flat = obstacle_covs_param[sample_idx, :]
+        obstacle_covs = cas.reshape(obstacle_covs_flat.T, 9, n_obstacles).T
+
 
         convolution = ConvolutionFunctorWarpOnline(
-            f"conv_robot_gaussian_{gauss_idx}",
-            num_points=num_samples,
-            num_obstacles=n_obstacles,
+            f"conv_{sample_idx}",
+            num_points=n_gaussians, 
+            num_obstacles=n_obstacles
         )
 
         callbacks.append(convolution)
-
         cost += convolution(
             gaussian_points,
             gaussian_covs,
-            obstacle_means_param,
-            obstacle_covs_param,
+            obstacle_points,
+            obstacle_covs,
         )
 
     return weight * cost / n_gaussians, callbacks
@@ -284,15 +288,17 @@ def build_problem(
     start = symbolic_type.sym("start", n_dof, 1)
     goal = symbolic_type.sym("goal", 3, 1)
 
-    n_obstacles = len(environment.obstacle_means)
-    obstacle_means_param = symbolic_type.sym("obstacle_means", n_obstacles, 3)
-    obstacle_covs_param = symbolic_type.sym("obstacle_covs", n_obstacles, 9)
+    # Obstacle data is evaluated numerically at build time — not symbolic parameters.
+    # Shape: (num_samples, n_obstacles * 3) and (num_samples, n_obstacles * 9)
+    obstacle_means_num = environment.build_per_sample_means(num_samples)
+    obstacle_covs_num = environment.build_per_sample_covariances(num_samples)
+
+    obstacle_means_param = cas.DM(obstacle_means_num)
+    obstacle_covs_param = cas.DM(obstacle_covs_num)
 
     params = cas.vertcat(
         cas.vec(start),
         cas.vec(goal),
-        cas.vec(obstacle_means_param),
-        cas.vec(obstacle_covs_param),
     )
 
     bspline = BSpline(control_points)

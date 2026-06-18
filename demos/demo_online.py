@@ -3,7 +3,9 @@ import numpy as np
 from src.robots.drone import DroneRobot, DroneGaussian
 from src.robots.mobile import MobileRobot, MobileGaussian
 from src.robots.manipulator import ManipulatorRobot, LinkGaussian
-from src.environment.environment import GaussianEnvironment
+# from src.environment.environment import GaussianEnvironment
+from src.environment.obstacle import StaticObstacle, MobileObstacle
+from src.environment.environment_online import GaussianEnvironmentOnline
 from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner_online import OnlinePlanner
 from src.planning.joints import JointGroups
@@ -12,26 +14,20 @@ from src.benchmark.utils import minimum_robot_environment_distance
 
 
 def mobile_robot_demo():
-    obstacle_means = np.array(
-        [
-            [2.0, 0.0, 1.0],
-            [0.0, 2.0, 1.0],
-            [2.0, 2.5, 1.0],
-        ]
-    )
 
-    obstacle_covs = np.array(
-        [
-            np.diag([0.12**2, 0.12**2, 0.6**2]),
-            np.diag([0.12**2, 0.12**2, 0.6**2]),
-            np.diag([0.12**2, 0.12**2, 0.6**2]),
-        ]
-    )
+    num_samples = 25
 
-    # gaussian_specs = [DroneGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02]))]
-    # gaussian_specs = [
-    #     MobileGaussian(np.array([0.0, 0.0, 0.0], dtype=float), np.diag([0.1, 0.02, 0.02])), 
-    #     ]
+    trajectory = np.array([(i * 0.1, 0.0, 0.0) for i in range(num_samples)])
+
+    obstacles = [
+        StaticObstacle(np.array([2.0, 0.0, 1.0]), np.diag([0.12**2, 0.12**2, 0.6**2])),
+        StaticObstacle(np.array([0.0, 2.0, 1.0]), np.diag([0.12**2, 0.12**2, 0.6**2])),
+        StaticObstacle(np.array([2.0, 2.5, 1.0]), np.diag([0.12**2, 0.12**2, 0.6**2])),
+        MobileObstacle(np.array([1.0, 1.0, 1.0]), np.diag([0.12**2, 0.12**2, 0.6**2]), trajectory),
+    ]
+
+    environment = GaussianEnvironmentOnline(obstacles)
+
     gaussian_specs = [ 
             LinkGaussian(5, 0.5, np.diag([0.1, 0.02, 0.2])), 
             LinkGaussian(6, 0.5, np.diag([0.1, 0.02, 0.2])), 
@@ -39,29 +35,11 @@ def mobile_robot_demo():
             LinkGaussian(8, 0.5, np.diag([0.1, 0.02, 0.05])), 
         ]
     
-
-    # theta_start = np.array([0.0, 0.0, 0.0, 0.0])
-    # theta_start = np.array([0.0, 0.0, 0.0])
     theta_start = np.array(
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     )
-    # goal = np.array([4.0, 3.0, 2.5])
-    # goal = np.array([4.0, 3.0, 0.5])
+
     goal = np.array([3.0, 3.0, 4.0])
-
-    # robot = DroneRobot(
-    #     urdf_path="urdfs/drone_example.urdf",
-    #     arm_length=0.15,
-    #     gaussian_specs=gaussian_specs,
-    #     xyz_limits=[(-0.5, 4.5), (-0.5, 3.5),(0.0, 3.0)]
-    # )
-
-    # robot = MobileRobot(
-    #         urdf_path="urdfs/anymal.urdf",
-    #         body_center_height=1.0,
-    #         gaussian_specs=gaussian_specs,
-    #         xy_limits=[(-0.5, 4.5), (-0.5, 3.5)]
-    # )
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5_extended_move.urdf",
@@ -69,22 +47,6 @@ def mobile_robot_demo():
         tip_link="ee_link",
         gaussian_specs=gaussian_specs,
     )
-
-    # joint_groups = JointGroups(
-    #         virtual_indices=[0,1,2,3], 
-    #         virtual_wmax=5.0, 
-    #         virtual_amax=3.0, 
-    #         real_wmax=5.0, 
-    #         real_amax=3.0,
-    #     )
-
-    # joint_groups = JointGroups(
-    #         virtual_indices=[0,1], 
-    #         virtual_wmax=5.0, 
-    #         virtual_amax=2.5, 
-    #         real_wmax=2.0, 
-    #         real_amax=2.5,
-    # )
 
     joint_groups = JointGroups(
             virtual_indices=[0,1,2], 
@@ -95,26 +57,20 @@ def mobile_robot_demo():
         )
     
     
-    environment = GaussianEnvironment(
-        obstacle_means=obstacle_means,
-        obstacle_covariances=obstacle_covs,
-    )
+#     initializer = RRTStarInitializer(
+#         voxel_size=0.1,
+#         goal_threshold=0.005,
+#         random_seed=10,
+#         max_time=None,   
+# )
 
-    initializer = RRTStarInitializer(
-        voxel_size=0.1,
-        goal_threshold=0.005,
-        random_seed=10,
-        max_time=None,   
-)
-    # rrt_result = initializer.initialize(robot, environment, theta_start, goal, num_control_points=40)
-    
     planner = OnlinePlanner(
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
-        initializer=initializer,
+        # initializer=initializer,
         num_control_points=12,
-        num_samples=25,
+        num_samples=num_samples,
         weights={
             "goal": 10.0,
             "obstacle": 0.01,
@@ -130,7 +86,7 @@ def mobile_robot_demo():
         goal=goal,
     )
 
-    min_dist_foci, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
+    # min_dist_foci, info = minimum_robot_environment_distance(robot,environment,result.trajectory)
 
     print("\n--- Planning timings FOCI---")
     print(f"Initializer: {result.timings['initializer']:.6f} s")
@@ -139,10 +95,10 @@ def mobile_robot_demo():
     print(f"Total:       {result.timings['total']:.6f} s")
     print(f"Success:     {result.success}")
 
-    print("\n--- Benchmark metrics ---")
-    print(f"Number of environment gaussians: {len(obstacle_means)}")
-    print(f"Number of robot gaussians: {len(gaussian_specs)}")
-    print(f"Minimum robot-environment distance FOCI: {min_dist_foci:.3f} m")
+    # print("\n--- Benchmark metrics ---")
+    # print(f"Number of environment gaussians: {len(obstacles)}")
+    # print(f"Number of robot gaussians: {len(gaussian_specs)}")
+    # print(f"Minimum robot-environment distance FOCI: {min_dist_foci:.3f} m")
 
     vis = RobotVisualizerOnline(
         robot=robot,
@@ -151,7 +107,7 @@ def mobile_robot_demo():
     )
     
     vis.visualize_goal(goal)
-    vis.visualize_obstacles(obstacle_means, obstacle_covs)
+    vis.visualize_obstacles_online(environment)
     vis.visualize_robot_gaussians()
     vis.visualize_path()
     vis.visualize_initializer_path(result.initial_trajectory, color=(0, 0, 255), name="RRT*")

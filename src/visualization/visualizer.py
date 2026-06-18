@@ -505,6 +505,11 @@ class RobotVisualizerOnline:
         self._robot_gaussian_handles = []
         self._ellipsoid_factory = None
 
+        self._obstacle_handles = []
+        self._obstacle_factory = None
+        self.obstacle_means = None
+        self.obstacle_covariances = None
+
         self.gaussian_points = self._compute_robot_gaussian_points()
         self.gaussian_covariances = self._compute_robot_gaussian_covariances()
 
@@ -617,6 +622,84 @@ class RobotVisualizerOnline:
                 color=color,
                 opacity=opacity,
             )
+
+    def visualize_obstacles_online(
+        self,
+        environment,
+        n_std: float = 2.0,
+        color: tuple[int, int, int] = (255, 100, 100),
+        opacity: float = 0.6,
+        name: str = "Obstacle",
+    ):
+        """
+        Render online/static/mobile obstacles at the first sample.
+        They are updated during animation.
+
+        Parameters
+        ----------
+        environment:
+            GaussianEnvironmentOnline instance.
+
+        The environment must provide:
+            obstacle_means_at(k) -> shape (n_obstacles, 3)
+            obstacle_covariances_at(k) -> shape (n_obstacles, 3, 3)
+        """
+        num_samples = self.trajectory.shape[0]
+
+        self.obstacle_means = np.stack(
+            [environment.obstacle_means_at(k) for k in range(num_samples)],
+            axis=0,
+        )
+
+        self.obstacle_covariances = np.stack(
+            [environment.obstacle_covariances_at(k) for k in range(num_samples)],
+            axis=0,
+        )
+
+        if self.obstacle_means.ndim != 3 or self.obstacle_means.shape[2] != 3:
+            raise ValueError(
+                "obstacle means must have shape "
+                f"(num_samples, n_obstacles, 3), got {self.obstacle_means.shape}."
+            )
+
+        if (
+            self.obstacle_covariances.ndim != 4
+            or self.obstacle_covariances.shape[2:] != (3, 3)
+        ):
+            raise ValueError(
+                "obstacle covariances must have shape "
+                "(num_samples, n_obstacles, 3, 3), "
+                f"got {self.obstacle_covariances.shape}."
+            )
+
+        if self.obstacle_means.shape[:2] != self.obstacle_covariances.shape[:2]:
+            raise ValueError(
+                "Obstacle means and covariances must match over samples and "
+                "obstacle indices. "
+                f"Got means shape {self.obstacle_means.shape} and "
+                f"covariances shape {self.obstacle_covariances.shape}."
+            )
+
+        self._obstacle_handles = []
+        self._obstacle_factory = EllipsoidFactory(n_std=float(n_std))
+
+        for obstacle_idx in range(self.obstacle_means.shape[1]):
+            mean = self.obstacle_means[0, obstacle_idx]
+            cov = self.obstacle_covariances[0, obstacle_idx]
+
+            radii, quat_wxyz = self._obstacle_factory.cov_to_ellipsoid(cov)
+
+            handle = self.server.scene.add_mesh_simple(
+                name=f"{name}_{obstacle_idx}",
+                vertices=self._create_ellipsoid_mesh(radii),
+                faces=self._ellipsoid_faces,
+                position=mean,
+                wxyz=quat_wxyz,
+                color=color,
+                opacity=opacity,
+            )
+
+            self._obstacle_handles.append(handle)
 
     def visualize_robot_gaussians(
         self,
@@ -768,6 +851,7 @@ class RobotVisualizerOnline:
 
             self._update_robot(q)
             self._update_robot_gaussians(sample_idx)
+            self._update_obstacles(sample_idx)
             self._update_camera(sample_idx)
 
             time.sleep(dt)
@@ -833,6 +917,24 @@ class RobotVisualizerOnline:
             cov = self.gaussian_covariances[sample_idx, gaussian_idx]
 
             _, quat_wxyz = self._ellipsoid_factory.cov_to_ellipsoid(cov)
+
+            handle.position = mean
+            handle.wxyz = quat_wxyz
+
+    def _update_obstacles(self, sample_idx: int):
+        if (
+            not self._obstacle_handles
+            or self._obstacle_factory is None
+            or self.obstacle_means is None
+            or self.obstacle_covariances is None
+        ):
+            return
+
+        for obstacle_idx, handle in enumerate(self._obstacle_handles):
+            mean = self.obstacle_means[sample_idx, obstacle_idx]
+            cov = self.obstacle_covariances[sample_idx, obstacle_idx]
+
+            _, quat_wxyz = self._obstacle_factory.cov_to_ellipsoid(cov)
 
             handle.position = mean
             handle.wxyz = quat_wxyz
