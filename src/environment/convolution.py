@@ -1,444 +1,679 @@
-import warp as wp
-from casadi import *
-import numpy as np
+
+from __future__ import annotations
+
+from abc import abstractmethod
+
 import math
+import warp as wp
+import numpy as np
+import casadi as cas
 
-wp.init()
-wp.set_device("cuda:0")
-# wp.set_device("cpu")
-
-# Integral over Gaussians https://arxiv.org/pdf/1811.04751v1
-# https://web.ist.utl.pt/susanavinga/renyi/convolution_normal.pdf
-
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ 
+PI_CUBIC: float = math.sqrt((2.0 * math.pi) ** 3)
 EPS = 1e-9
+ 
+# ---------------------------------------------------------------------------
+# Warp device-side helpers
+# ---------------------------------------------------------------------------
+ 
+@wp.func
+def det33(m: wp.mat33) -> wp.float32:
+    """Determinant of a 3×3 matrix."""
+    return (
+        m[0, 0] * (m[1, 1] * m[2, 2] - m[2, 1] * m[1, 2])
+        - m[0, 1] * (m[1, 0] * m[2, 2] - m[2, 0] * m[1, 2])
+        + m[0, 2] * (m[1, 0] * m[2, 1] - m[2, 0] * m[1, 1])
+    )
+ 
+ 
+@wp.func
+def inv33(m: wp.mat33) -> wp.mat33:
+    """Inverse of a 3×3 matrix (assumes non-singular)."""
+    inv_det = 1.0 / det33(m)
+    inv = wp.mat33()
+    inv[0, 0] = (m[1, 1] * m[2, 2] - m[2, 1] * m[1, 2]) * inv_det
+    inv[0, 1] = (m[0, 2] * m[2, 1] - m[0, 1] * m[2, 2]) * inv_det
+    inv[0, 2] = (m[0, 1] * m[1, 2] - m[0, 2] * m[1, 1]) * inv_det
+    inv[1, 0] = (m[1, 2] * m[2, 0] - m[1, 0] * m[2, 2]) * inv_det
+    inv[1, 1] = (m[0, 0] * m[2, 2] - m[0, 2] * m[2, 0]) * inv_det
+    inv[1, 2] = (m[1, 0] * m[0, 2] - m[0, 0] * m[1, 2]) * inv_det
+    inv[2, 0] = (m[1, 0] * m[2, 1] - m[2, 0] * m[1, 1]) * inv_det
+    inv[2, 1] = (m[2, 0] * m[0, 1] - m[0, 0] * m[2, 1]) * inv_det
+    inv[2, 2] = (m[0, 0] * m[1, 1] - m[1, 0] * m[0, 1]) * inv_det
+    return inv
+ 
+ 
+@wp.func
+def regularize33(m: wp.mat33, eps: wp.float32) -> wp.mat33:
+    """Add eps to the diagonal of a 3×3 matrix for numerical stability."""
+    out = m
+    out[0, 0] = out[0, 0] + eps
+    out[1, 1] = out[1, 1] + eps
+    out[2, 2] = out[2, 2] + eps
+    return out
+ 
+ 
+@wp.func
+def mat33_from_flat(flat: wp.array(dtype=wp.float32), offset: int) -> wp.mat33:
+    """Read a row-major 3x3 matrix from a flat float32 array at `offset`."""
+    return wp.mat33(
+        flat[offset + 0], flat[offset + 1], flat[offset + 2],
+        flat[offset + 3], flat[offset + 4], flat[offset + 5],
+        flat[offset + 6], flat[offset + 7], flat[offset + 8],
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Forward kernels
+# ---------------------------------------------------------------------------
+ 
+ 
+@wp.kernel
+def kernel_forward_static(
+    robot_means: wp.array(dtype=wp.vec3),
+    obstacle_means: wp.array(dtype=wp.vec3),
+    covs_det: wp.array(dtype=wp.float32),
+    covs_inv: wp.array(dtype=wp.mat33),
+    intermediate: wp.array(dtype=wp.float32),
+    pi_cubic: wp.float32,
+):
+    """Forward pass for the static functor.
+ 
+    The obstacle covariances are pre-convolved with the robot covariance and
+    uploaded as `covs_det` / `covs_inv` at construction time.
+ 
+    Thread grid: (num_points, num_obstacles).
+    """
+    m, n = wp.tid()
+    diff = robot_means[m] - obstacle_means[n]
+    pdf = (
+        wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
+        / (wp.sqrt(covs_det[n]) * pi_cubic)
+    )
+    wp.atomic_add(intermediate, n, pdf)
+ 
+ 
+@wp.kernel
+def kernel_forward_online(
+    robot_means: wp.array(dtype=wp.vec3),
+    robot_covs_flat: wp.array(dtype=wp.float32),
+    obstacle_means: wp.array(dtype=wp.vec3),
+    obstacle_covs_flat: wp.array(dtype=wp.float32),
+    intermediate: wp.array(dtype=wp.float32),
+    pi_cubic: wp.float32,
+    eps: wp.float32,
+):
+    """Forward pass for the online functor.
+ 
+    Covariances are passed at eval-time and summed on the fly.
+ 
+    Thread grid: (num_points, num_obstacles).
+    """
+    m, n = wp.tid()
+    diff = robot_means[m] - obstacle_means[n]
+ 
+    cov_sum = regularize33(
+        mat33_from_flat(robot_covs_flat, m * 9)
+        + mat33_from_flat(obstacle_covs_flat, n * 9),
+        eps,
+    )
+    pdf = wp.exp(-0.5 * wp.dot(diff, inv33(cov_sum) @ diff)) / (
+        wp.sqrt(det33(cov_sum)) * pi_cubic
+    )
+    wp.atomic_add(intermediate, n, pdf)
+ 
+ 
+# ---------------------------------------------------------------------------
+# Jacobian kernels
+# ---------------------------------------------------------------------------
+ 
+ 
+@wp.kernel
+def kernel_jacobian_static(
+    robot_means: wp.array(dtype=wp.vec3),
+    obstacle_means: wp.array(dtype=wp.vec3),
+    covs_det: wp.array(dtype=wp.float32),
+    covs_inv: wp.array(dtype=wp.mat33),
+    grad_means: wp.array2d(dtype=wp.vec3),
+    pi_cubic: wp.float32,
+):
+    """Jacobian of the forward cost w.r.t. robot_means for the static functor.
+ 
+    Thread grid: (num_points, num_obstacles).
+    Accumulates per-point, per-obstacle gradient contributions into
+    `grad_means[m, n]`; the caller sums over n.
+    """
+    m, n = wp.tid()
+    diff = robot_means[m] - obstacle_means[n]
+    inv = covs_inv[n]
+    pdf = (
+        wp.exp(-0.5 * wp.dot(diff, inv @ diff))
+        / (wp.sqrt(covs_det[n]) * pi_cubic)
+    )
+    grad_means[m, n] = -pdf * inv @ diff
+ 
+ 
+@wp.kernel
+def kernel_jacobian_online(
+    robot_means: wp.array(dtype=wp.vec3),
+    robot_covs_flat: wp.array(dtype=wp.float32),
+    obstacle_means: wp.array(dtype=wp.vec3),
+    obstacle_covs_flat: wp.array(dtype=wp.float32),
+    grad_means: wp.array(dtype=wp.vec3),
+    grad_robot_covs: wp.array(dtype=wp.float32),
+    grad_obstacle_means: wp.array(dtype=wp.vec3),
+    grad_obstacle_covs: wp.array(dtype=wp.float32),
+    pi_cubic: wp.float32,
+    eps: wp.float32,
+    normalizer: wp.float32,
+):
+    """Jacobian of the forward cost for the online functor.
+ 
+    Differentiates w.r.t. robot means, robot covariances, obstacle means,
+    and obstacle covariances.
+ 
+    Thread grid: (num_points, num_obstacles).
+    """
+    m, n = wp.tid()
+    diff = robot_means[m] - obstacle_means[n]
+ 
+    cov_sum = regularize33(
+        mat33_from_flat(robot_covs_flat, m * 9)
+        + mat33_from_flat(obstacle_covs_flat, n * 9),
+        eps,
+    )
+    inv = inv33(cov_sum)
+    inv_diff = inv @ diff
+    pdf = (
+        wp.exp(-0.5 * wp.dot(diff, inv_diff))
+        / (wp.sqrt(det33(cov_sum)) * pi_cubic)
+    ) * normalizer
+ 
+    # d cost / d mu_robot  =  -pdf * inv * diff
+    grad_mu = -pdf * inv_diff
+    wp.atomic_add(grad_means, m, grad_mu)
+    wp.atomic_add(grad_obstacle_means, n, -grad_mu)
+ 
+    # d cost / d Sigma  =  0.5 * pdf * (inv_diff ⊗ inv_diff - inv)
+    robot_idx = m * 9
+    obstacle_idx = n * 9
+    for i in range(3):
+        for j in range(3):
+            g = 0.5 * pdf * (inv_diff[i] * inv_diff[j] - inv[i, j])
+            wp.atomic_add(grad_robot_covs, robot_idx + i * 3 + j, g)
+            wp.atomic_add(grad_obstacle_covs, obstacle_idx + i * 3 + j, g)
 
+class BaseConvolutionFunctor(cas.Callback):
+    """Abstract CasADi callback for Gaussian convolution costs.
 
-class ConvolutionFunctorWarp(Callback):
+    Subclasses must implement:
+        get_n_in()
+        get_sparsity_in(i)
+        eval(arg)
+        get_jacobian(name, inames, onames, opts)
+
+    The output is always a scalar (the normalised mean pdf value).
+    """
+
+    # ------------------------------------------------------------------
+    # Shared construction helpers
+    # ------------------------------------------------------------------
+
+    def _init_shared(self, num_points: int, num_obstacles: int) -> None:
+        """Store dimensions and the normalisation constant."""
+        self.num_points = int(num_points)
+        self.num_obstacles = int(num_obstacles)
+        self.pi_cubic = float(PI_CUBIC)
+        self._normalizer = 1.0 / float(num_points * num_obstacles)
+
+    # ------------------------------------------------------------------
+    # CasADi Callback interface — shared across all subclasses
+    # ------------------------------------------------------------------
+
+    def get_n_out(self) -> int:
+        return 1
+
+    def get_sparsity_out(self, i: int) -> cas.Sparsity:  # noqa: ARG002
+        return cas.Sparsity.dense(1, 1)
+
+    def has_jacobian(self) -> bool:
+        return True
+
+    # ------------------------------------------------------------------
+    # Abstract interface
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_n_in(self) -> int: ...
+
+    @abstractmethod
+    def get_sparsity_in(self, i: int) -> cas.Sparsity: ...
+
+    @abstractmethod
+    def eval(self, arg): ...
+
+    @abstractmethod
+    def get_jacobian(self, name, inames, onames, opts): ...
+
+class _JacobianStatic(cas.Callback):
+    """Jacobian of ConvolutionFunctor w.r.t. robot body-point positions.
+ 
+    Input  0: robot_means, shape (num_points, 3)
+    Input  1: scalar cost output (passed by CasADi, unused here)
+    Output 0: Jacobian row, shape (1, num_points * 3)
+    """
+ 
     def __init__(
-        self, name, dim, num_points, obstacle_means, covs_det, covs_inv, opts={}
-    ):
-        Callback.__init__(self)
-
-        assert dim == 3, "Currently only 3D is supported"
-
-        assert len(obstacle_means) == len(covs_det) and len(covs_det) == len(
-            covs_inv
-        ), "The number of obstacles should be the same for all input arrays"
-        assert (
-            len(obstacle_means) > 0
-        ), "The number of obstacles should be greater than 0"
-        assert covs_inv.shape[1:] == (
-            dim,
-            dim,
-        ), "The shape of the covs_inv should be (dim,dim)"
-
-        self.dim = dim
+        self,
+        name: str,
+        num_points: int,
+        obstacle_means_wp: wp.array,
+        covs_det_wp: wp.array,
+        covs_inv_wp: wp.array,
+        normalizer: float,
+        opts: dict,
+    ) -> None:
+        cas.Callback.__init__(self)
+ 
         self.num_points = num_points
-        self.num_obstacles = len(obstacle_means)
-
-        self.obstacle_means = wp.from_numpy(obstacle_means, dtype=wp.vec3)
-        self.covs_det = wp.from_numpy(covs_det, dtype=float)
-        self.covs_inv = wp.from_numpy(covs_inv, dtype=wp.mat33)
-        self.intermediate = wp.zeros(self.num_obstacles, dtype=float)
-
-        self.out = wp.zeros(1, dtype=float)
-
+        self.num_obstacles = len(obstacle_means_wp)
+        self.obstacle_means = obstacle_means_wp
+        self.covs_det = covs_det_wp
+        self.covs_inv = covs_inv_wp
+        self._normalizer = normalizer
+        self.pi_cubic = float(PI_CUBIC)
+ 
+        # (num_points, num_obstacles) gradient buffer; summed over obstacles after launch
+        self._grad_means = wp.zeros((num_points, self.num_obstacles), dtype=wp.vec3)
+ 
         self.construct(name, opts)
-
-        @wp.kernel
-        def f(
-            points: wp.array(dtype=wp.vec3),
-            obstacle_means: wp.array(dtype=wp.vec3),
-            covs_det: wp.array(dtype=float),
-            covs_inv: wp.array(dtype=wp.mat33),
-            intermediate: wp.array(dtype=wp.float32),
-        ):
-
-            m, n = wp.tid()  # m is the point index, n is the obstacle index
-
-            diff = points[m] - obstacle_means[n]
-            normal = (
-                wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
-                / (wp.pow(2.0 * wp.pi, float(1.5)) * wp.sqrt(covs_det[n]))
-            )
-            wp.atomic_add(intermediate, n, normal)
-
-        self.f = f
-
-    def get_n_in(self):
+ 
+    def get_n_in(self) -> int:
+        return 2  # robot_means + scalar output
+ 
+    def get_n_out(self) -> int:
         return 1
-
-    def get_n_out(self):
-        return 1
-
-    def get_sparsity_in(self, i):
+ 
+    def get_sparsity_in(self, i: int) -> cas.Sparsity:
         if i == 0:
-            return Sparsity.dense(self.num_points, self.dim)
-        else:
-            return Sparsity.dense(6, 1)  # params
-
-    def get_sparsity_out(self, i):
-        return Sparsity.dense(1, 1)
-
-    # Evaluate numerically
+            return cas.Sparsity.dense(self.num_points, 3)
+        return cas.Sparsity.dense(1, 1)  # scalar output
+ 
+    def get_sparsity_out(self, i: int) -> cas.Sparsity:  # noqa: ARG002
+        return cas.Sparsity.dense(1, self.num_points * 3)
+ 
     def eval(self, arg):
-        points = np.array(arg[0])
-        self.points_gpu = wp.from_numpy(points, dtype=wp.vec3)
-        self.intermediate.zero_()
-        self.out.zero_()
-
+        robot_means = np.asarray(arg[0], dtype=np.float32).reshape(self.num_points, 3)
+        robot_means_wp = wp.from_numpy(robot_means, dtype=wp.vec3)
+ 
+        self._grad_means.zero_()
         wp.launch(
-            kernel=self.f,
+            kernel=kernel_jacobian_static,
             dim=(self.num_points, self.num_obstacles),
             inputs=[
-                self.points_gpu,
+                robot_means_wp,
                 self.obstacle_means,
                 self.covs_det,
                 self.covs_inv,
-                self.intermediate,
+                self._grad_means,
+                wp.float32(self.pi_cubic),
+            ],
+        )
+ 
+        # Sum gradient contributions over obstacles, then normalise
+        grad = wp.utils.array_sum(self._grad_means, axis=1)  # (num_points,) vec3
+        out = grad.numpy().transpose().reshape(1, self.num_points * 3)
+        return [out * self._normalizer]
+ 
+ 
+class ConvolutionFunctor(BaseConvolutionFunctor):
+    """Static Gaussian convolution functor.
+ 
+    Obstacle statistics are fixed at construction; only robot body-point
+    positions vary during optimisation.
+ 
+    Parameters
+    ----------
+    name:
+        CasADi callback name.
+    num_points:
+        Number of robot body points.
+    obstacle_means:
+        Shape (n_obstacles, 3).
+    covs_det:
+        Shape (n_obstacles,). Determinants of (obstacle + robot) covariances.
+    covs_inv:
+        Shape (n_obstacles, 3, 3). Inverses of (obstacle + robot) covariances.
+    opts:
+        CasADi callback options.
+    """
+ 
+    def __init__(
+        self,
+        name: str,
+        num_points: int,
+        obstacle_means: np.ndarray,
+        covs_det: np.ndarray,
+        covs_inv: np.ndarray,
+        opts: dict | None = None,
+    ) -> None:
+        cas.Callback.__init__(self)
+ 
+        if opts is None:
+            opts = {}
+ 
+        num_obstacles = len(obstacle_means)
+        self._init_shared(num_points, num_obstacles)
+ 
+        # Upload fixed obstacle data to the Warp device once
+        self._obstacle_means = wp.from_numpy(
+            obstacle_means.astype(np.float32), dtype=wp.vec3
+        )
+        self._covs_det = wp.from_numpy(
+            covs_det.astype(np.float32), dtype=wp.float32
+        )
+        self._covs_inv = wp.from_numpy(
+            covs_inv.astype(np.float32), dtype=wp.mat33
+        )
+ 
+        self._intermediate = wp.zeros(num_obstacles, dtype=wp.float32)
+        self._jacobian_callback: _JacobianStatic | None = None
+        self._opts = opts
+ 
+        self.construct(name, opts)
+ 
+    # ------------------------------------------------------------------
+    # CasADi Callback interface
+    # ------------------------------------------------------------------
+ 
+    def get_n_in(self) -> int:
+        return 1  # robot_means only
+ 
+    def get_sparsity_in(self, i: int) -> cas.Sparsity:
+        if i == 0:
+            return cas.Sparsity.dense(self.num_points, 3)
+        return cas.Sparsity.dense(0, 0)
+ 
+    def eval(self, arg):
+        robot_means = np.asarray(arg[0], dtype=np.float32).reshape(self.num_points, 3)
+        robot_means_wp = wp.from_numpy(robot_means, dtype=wp.vec3)
+ 
+        self._intermediate.zero_()
+        wp.launch(
+            kernel=kernel_forward_static,
+            dim=(self.num_points, self.num_obstacles),
+            inputs=[
+                robot_means_wp,
+                self._obstacle_means,
+                self._covs_det,
+                self._covs_inv,
+                self._intermediate,
+                wp.float32(self.pi_cubic),
+            ],
+        )
+ 
+        total = float(wp.utils.array_sum(self._intermediate))
+        return [np.array([[total * self._normalizer]], dtype=np.float64)]
+ 
+    def get_jacobian(self, name, inames, onames, opts):
+        if self._jacobian_callback is None:
+            self._jacobian_callback = _JacobianStatic(
+                name,
+                self.num_points,
+                self._obstacle_means,
+                self._covs_det,
+                self._covs_inv,
+                self._normalizer,
+                opts,
+            )
+        return self._jacobian_callback
+
+
+class _JacobianOnline(cas.Callback):
+    """Jacobian of ConvolutionFunctorOnline w.r.t. all four inputs.
+
+    Inputs  (5 total = 4 original inputs + scalar output passed by CasADi):
+        0. robot_means       (num_points,  3)
+        1. robot_covs_flat   (num_points,  9)
+        2. obstacle_means    (num_obstacles, 3)
+        3. obstacle_covs_flat(num_obstacles, 9)
+        4. scalar cost output (unused)
+
+    Outputs (4):
+        0. d cost / d robot_means       shape (1, num_points  * 3)
+        1. d cost / d robot_covs_flat   shape (1, num_points  * 9)
+        2. d cost / d obstacle_means    shape (1, num_obstacles * 3)
+        3. d cost / d obstacle_covs_flat shape (1, num_obstacles * 9)
+
+    Returning all four blocks is required because robot covariances typically
+    depend on q through the forward kinematics uncertainty propagation.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_points: int,
+        num_obstacles: int,
+        normalizer: float,
+        opts: dict,
+    ) -> None:
+        cas.Callback.__init__(self)
+
+        self.num_points = int(num_points)
+        self.num_obstacles = int(num_obstacles)
+        self._normalizer = normalizer
+        self.pi_cubic = float(PI_CUBIC)
+
+        # Gradient buffers; allocated lazily and reused across calls
+        self._grad_means: wp.array | None = None
+        self._grad_robot_covs: wp.array | None = None
+        self._grad_obstacle_means: wp.array | None = None
+        self._grad_obstacle_covs: wp.array | None = None
+
+        self.construct(name, opts)
+
+    # ------------------------------------------------------------------
+    # CasADi Callback interface
+    # ------------------------------------------------------------------
+
+    def get_n_in(self) -> int:
+        return 5
+
+    def get_n_out(self) -> int:
+        return 4
+
+    def get_sparsity_in(self, i: int) -> cas.Sparsity:
+        if i == 0:
+            return cas.Sparsity.dense(self.num_points, 3)
+        if i == 1:
+            return cas.Sparsity.dense(self.num_points, 9)
+        if i == 2:
+            return cas.Sparsity.dense(self.num_obstacles, 3)
+        if i == 3:
+            return cas.Sparsity.dense(self.num_obstacles, 9)
+        return cas.Sparsity.dense(1, 1)  # scalar output (input 4)
+
+    def get_sparsity_out(self, i: int) -> cas.Sparsity:
+        if i == 0:
+            return cas.Sparsity.dense(1, self.num_points * 3)
+        if i == 1:
+            return cas.Sparsity.dense(1, self.num_points * 9)
+        if i == 2:
+            return cas.Sparsity.dense(1, self.num_obstacles * 3)
+        if i == 3:
+            return cas.Sparsity.dense(1, self.num_obstacles * 9)
+        return cas.Sparsity.dense(0, 0)
+
+    def eval(self, arg):
+        robot_means = np.asarray(arg[0], dtype=np.float32).reshape(self.num_points, 3)
+        robot_covs = np.asarray(arg[1], dtype=np.float32).reshape(self.num_points, 9)
+        obstacle_means = np.asarray(arg[2], dtype=np.float32).reshape(self.num_obstacles, 3)
+        obstacle_covs = np.asarray(arg[3], dtype=np.float32).reshape(self.num_obstacles, 9)
+
+        self._ensure_buffers()
+
+        robot_means_wp = wp.from_numpy(robot_means, dtype=wp.vec3)
+        robot_covs_wp = wp.from_numpy(robot_covs.reshape(-1), dtype=wp.float32)
+        obstacle_means_wp = wp.from_numpy(obstacle_means, dtype=wp.vec3)
+        obstacle_covs_wp = wp.from_numpy(obstacle_covs.reshape(-1), dtype=wp.float32)
+
+        self._grad_means.zero_()
+        self._grad_robot_covs.zero_()
+        self._grad_obstacle_means.zero_()
+        self._grad_obstacle_covs.zero_()
+
+        wp.launch(
+            kernel=kernel_jacobian_online,
+            dim=(self.num_points, self.num_obstacles),
+            inputs=[
+                robot_means_wp,
+                robot_covs_wp,
+                obstacle_means_wp,
+                obstacle_covs_wp,
+                self._grad_means,
+                self._grad_robot_covs,
+                self._grad_obstacle_means,
+                self._grad_obstacle_covs,
+                wp.float32(self.pi_cubic),
+                wp.float32(EPS),
+                wp.float32(self._normalizer),
             ],
         )
 
-        wp.utils.array_sum(self.intermediate, out=self.out)
-        out = self.out.numpy()[0] / (self.num_obstacles * self.num_points)
-        return [out]
+        return [
+            self._grad_means.numpy().reshape(1, self.num_points * 3).astype(np.float64),
+            self._grad_robot_covs.numpy().reshape(1, self.num_points * 9).astype(np.float64),
+            self._grad_obstacle_means.numpy().reshape(1, self.num_obstacles * 3).astype(np.float64),
+            self._grad_obstacle_covs.numpy().reshape(1, self.num_obstacles * 9).astype(np.float64),
+        ]
 
-    def has_jacobian(self):
-        return True
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_buffers(self) -> None:
+        """Allocate or reallocate gradient buffers if dimensions changed."""
+        if self._grad_means is None or self._grad_means.shape[0] != self.num_points:
+            self._grad_means = wp.zeros(self.num_points, dtype=wp.vec3)
+            self._grad_robot_covs = wp.zeros(self.num_points * 9, dtype=wp.float32)
+
+        if (
+            self._grad_obstacle_means is None
+            or self._grad_obstacle_means.shape[0] != self.num_obstacles
+        ):
+            self._grad_obstacle_means = wp.zeros(self.num_obstacles, dtype=wp.vec3)
+            self._grad_obstacle_covs = wp.zeros(self.num_obstacles * 9, dtype=wp.float32)
+
+
+class ConvolutionFunctorOnline(BaseConvolutionFunctor):
+    """Online Gaussian convolution functor.
+
+    All four tensors (robot means, robot covariances, obstacle means, obstacle
+    covariances) are passed at eval-time, making this suitable for problems
+    where robot or obstacle covariances depend on optimisation variables.
+
+    Parameters
+    ----------
+    name:
+        CasADi callback name.
+    num_points:
+        Number of robot body points.
+    num_obstacles:
+        Number of obstacles.
+    opts:
+        CasADi callback options.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_points: int,
+        num_obstacles: int,
+        opts: dict | None = None,
+    ) -> None:
+        cas.Callback.__init__(self)
+
+        if opts is None:
+            opts = {}
+
+        self._init_shared(num_points, num_obstacles)
+
+        self._intermediate: wp.array | None = None
+        self._jacobian_callback: _JacobianOnline | None = None
+        self._opts = opts
+
+        self.construct(name, opts)
+
+    # ------------------------------------------------------------------
+    # CasADi Callback interface
+    # ------------------------------------------------------------------
+
+    def get_n_in(self) -> int:
+        return 4
+
+    def get_sparsity_in(self, i: int) -> cas.Sparsity:
+        if i == 0:
+            return cas.Sparsity.dense(self.num_points, 3)
+        if i == 1:
+            return cas.Sparsity.dense(self.num_points, 9)
+        if i == 2:
+            return cas.Sparsity.dense(self.num_obstacles, 3)
+        if i == 3:
+            return cas.Sparsity.dense(self.num_obstacles, 9)
+        return cas.Sparsity.dense(0, 0)
+
+    def eval(self, arg):
+        robot_means = np.asarray(arg[0], dtype=np.float32).reshape(self.num_points, 3)
+        robot_covs = np.asarray(arg[1], dtype=np.float32).reshape(self.num_points, 9)
+        obstacle_means = np.asarray(arg[2], dtype=np.float32).reshape(self.num_obstacles, 3)
+        obstacle_covs = np.asarray(arg[3], dtype=np.float32).reshape(self.num_obstacles, 9)
+
+        self._ensure_intermediate()
+
+        robot_means_wp = wp.from_numpy(robot_means, dtype=wp.vec3)
+        robot_covs_wp = wp.from_numpy(robot_covs.reshape(-1), dtype=wp.float32)
+        obstacle_means_wp = wp.from_numpy(obstacle_means, dtype=wp.vec3)
+        obstacle_covs_wp = wp.from_numpy(obstacle_covs.reshape(-1), dtype=wp.float32)
+
+        self._intermediate.zero_()
+        wp.launch(
+            kernel=kernel_forward_online,
+            dim=(self.num_points, self.num_obstacles),
+            inputs=[
+                robot_means_wp,
+                robot_covs_wp,
+                obstacle_means_wp,
+                obstacle_covs_wp,
+                self._intermediate,
+                wp.float32(self.pi_cubic),
+                wp.float32(EPS),
+            ],
+        )
+
+        total = float(wp.utils.array_sum(self._intermediate))
+        return [np.array([[total * self._normalizer]], dtype=np.float64)]
 
     def get_jacobian(self, name, inames, onames, opts):
-        class JacFun(Callback):
-            def __init__(
-                self,
-                dim,
-                num_points,
-                obstacle_means_gpu,
-                covs_det_gpu,
-                covs_inv_gpu,
-                opts={},
-            ):
-                Callback.__init__(self)
-
-                self.dim = dim
-                self.num_points = num_points
-                self.num_obstacles = len(obstacle_means_gpu)
-
-                self.obstacle_means = obstacle_means_gpu
-                self.covs_det = covs_det_gpu
-                self.covs_inv = covs_inv_gpu
-                self.intermediate = wp.zeros(
-                    (self.num_points, self.num_obstacles), dtype=wp.vec3
-                )
-                self.out = wp.zeros((self.num_points, 1), dtype=wp.vec3)
-
-                @wp.kernel
-                def f_jac(
-                    points: wp.array(dtype=wp.vec3),
-                    obstacle_means: wp.array(dtype=wp.vec3),
-                    covs_det: wp.array(dtype=float),
-                    covs_inv: wp.array(dtype=wp.mat33),
-                    intermediate: wp.array2d(dtype=wp.vec3),
-                ):
-
-                    m, n = wp.tid()  # m is the point index, n is the obstacle index
-
-                    diff = points[m] - obstacle_means[n]
-                    normal = (
-                        wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
-                        / (wp.pow(2.0 * wp.pi, float(1.5)) * wp.sqrt(covs_det[n]))
-                    )
-
-                    sub_gradient = -normal * covs_inv[n] @ diff
-                    intermediate[m, n] = sub_gradient
-
-                self.f_jac = f_jac
-
-                self.construct(name, opts)
-
-            def get_n_in(self):
-                return 2
-
-            def get_n_out(self):
-                return 1
-
-            def get_sparsity_in(self, i):
-                n = nlpsol_out(i)
-                if n == "f":
-                    return Sparsity.dense(1, 1)
-                elif n == "x":
-                    return Sparsity.dense(self.num_points, self.dim)
-                elif n == "p":
-                    return Sparsity.dense(6, 1)
-
-                else:
-                    return Sparsity.dense(0, 0)
-
-            def get_sparsity_out(self, i):
-                return Sparsity.dense(1, self.num_points * self.dim)
-
-            def eval(self, arg):
-                points = np.array(arg[0])
-                self.points_gpu = wp.from_numpy(points, dtype=wp.vec3)
-                self.intermediate.zero_()
-                self.out.zero_()
-                wp.launch(
-                    kernel=self.f_jac,
-                    dim=(self.num_points, self.num_obstacles),
-                    inputs=[
-                        self.points_gpu,
-                        self.obstacle_means,
-                        self.covs_det,
-                        self.covs_inv,
-                        self.intermediate,
-                    ],
-                )
-
-                # wp.utils.array_sum(self.intermediate, out = self.out, axis = 1)
-                out = wp.utils.array_sum(self.intermediate, axis=1)
-                out = out.numpy().transpose().reshape(1, self.num_points * self.dim)
-                out = out / (self.num_obstacles * self.num_points)
-                return [out]
-
-        self.jac_callback = JacFun(
-            self.dim, self.num_points, self.obstacle_means, self.covs_det, self.covs_inv
-        )
-        return self.jac_callback
-
-
-# class ConvolutionFunctorWarp_shared_mem(Callback):
-#     def __init__(self, name, dim, n_body_parts , obstacle_means, covs_det, covs_inv,opts={}):
-#         Callback.__init__(self)
-
-
-#         self.dim = dim
-#         self.num_points = n_body_parts
-#         self.num_obstacles = len(obstacle_means)
-
-#         self.obstacle_means = obstacle_means
-#         self.covs_det = covs_det
-#         self.covs_inv = covs_inv
-#         self.intermediate = wp.zeros(self.num_obstacles, dtype=float)
-
-
-#         self.out = wp.zeros(1, dtype=float)
-
-
-#         self.construct(name, opts)
-
-#         @wp.kernel
-#         def f(points: wp.array(dtype=wp.vec3),
-#             obstacle_means: wp.array(dtype=wp.vec3),
-#             covs_det: wp.array(dtype=float),
-#             covs_inv: wp.array(dtype=wp.mat33),
-#             intermediate: wp.array(dtype=wp.float32)):
-
-#             m,n = wp.tid() # m is the point index, n is the obstacle index
-
-#             diff = points[m] - obstacle_means[n]
-#             normal =  wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff)) * 1000.0/covs_det[n]
-#             wp.atomic_add(intermediate, n, normal)
-
-#         self.f = f
-
-
-#     def get_n_in(self): return 1
-#     def get_n_out(self): return 1
-
-#     def get_sparsity_in(self,i):
-#         if i == 0:
-#             return Sparsity.dense(self.num_points,self.dim)
-#         else:
-#             return Sparsity.dense(6,1) # params
-
-
-#     def get_sparsity_out(self,i):
-#         return Sparsity.dense(1,1)
-
-#     # Evaluate numerically
-#     def eval(self, arg):
-#         points= np.array(arg[0])
-#         self.points_gpu = wp.from_numpy(points, dtype=wp.vec3)
-#         self.intermediate.zero_()
-#         self.out.zero_()
-
-#         wp.launch(kernel = self.f,
-#                 dim = (self.num_points, self.num_obstacles),
-#                 inputs = [self.points_gpu, self.obstacle_means, self.covs_det, self.covs_inv,self.intermediate])
-
-#         wp.utils.array_sum(self.intermediate, out = self.out)
-#         out =  self.out.numpy()[0] / (self.num_obstacles * self.num_points)
-#         return [out]
-
-
-#     def has_jacobian(self):
-#         return True
-#     def get_jacobian(self,name,inames,onames,opts):
-#         class JacFun(Callback):
-#             def __init__(self, dim, num_points ,obstacle_means_gpu, covs_det_gpu, covs_inv_gpu ,opts={}):
-#                 Callback.__init__(self)
-
-#                 self.dim = dim
-#                 self.num_points = num_points
-#                 self.num_obstacles = len(obstacle_means_gpu)
-
-#                 self.obstacle_means = obstacle_means_gpu
-#                 self.covs_det = covs_det_gpu
-#                 self.covs_inv = covs_inv_gpu
-#                 self.intermediate = wp.zeros((self.num_points, self.num_obstacles), dtype=wp.vec3)
-#                 self.out = wp.zeros((self.num_points,1), dtype=wp.vec3)
-
-
-#                 @wp.kernel
-#                 def f_jac(points: wp.array(dtype=wp.vec3),
-#                     obstacle_means: wp.array(dtype=wp.vec3),
-#                     covs_det: wp.array(dtype=float),
-#                     covs_inv: wp.array(dtype=wp.mat33),
-#                     intermediate: wp.array2d(dtype=wp.vec3)):
-
-#                     m,n = wp.tid() # m is the point index, n is the obstacle index
-
-#                     diff = points[m] - obstacle_means[n]
-#                     normal =  wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff)) * 1000.0/covs_det[n]
-
-#                     sub_gradient = -normal * covs_inv[n] @ diff
-#                     intermediate[m,n] = sub_gradient
-
-#                 self.f_jac = f_jac
-
-#                 self.construct(name, opts)
-
-#             def get_n_in(self): return 2
-#             def get_n_out(self): return 1
-
-#             def get_sparsity_in(self,i):
-#                 n = nlpsol_out(i)
-#                 if n == "f":
-#                     return Sparsity.dense(1,1)
-#                 elif n == "x":
-#                     return Sparsity.dense(self.num_points,self.dim)
-#                 elif n == "p":
-#                     return Sparsity.dense(6,1)
-
-#                 else:
-#                     return Sparsity.dense(0,0)
-
-#             def get_sparsity_out(self,i):
-#                 return Sparsity.dense(1,self.num_points * self.dim)
-
-
-#             def eval(self, arg):
-#                 points = np.array(arg[0])
-#                 self.points_gpu = wp.from_numpy(points, dtype=wp.vec3)
-#                 self.intermediate.zero_()
-#                 self.out.zero_()
-#                 wp.launch(kernel = self.f_jac,
-#                         dim = (self.num_points, self.num_obstacles),
-#                         inputs = [self.points_gpu, self.obstacle_means, self.covs_det, self.covs_inv,self.intermediate])
-
-#                 # wp.utils.array_sum(self.intermediate, out = self.out, axis = 1)
-#                 out = wp.utils.array_sum(self.intermediate, axis = 1)
-#                 out = out.numpy().transpose().reshape(1, self.num_points * self.dim)
-#                 out = out / (self.num_obstacles * self.num_points)
-#                 return [out]
-
-#         self.jac_callback = JacFun(self.dim, self.num_points, self.obstacle_means, self.covs_det, self.covs_inv)
-#         return self.jac_callback
-
-
-# class Convolver():
-#     def __init__(self, dim, obstacle_means, covs_det, covs_inv, n_body_parts):
-
-#         assert dim == 3, "Currently only 3D is supported"
-
-#         assert len(obstacle_means) == len(covs_det) and len(covs_det) == len(covs_inv), "The number of obstacles should be the same for all input arrays"
-#         assert len(obstacle_means) > 0, "The number of obstacles should be greater than 0"
-#         assert covs_inv.shape[1:] == (dim,dim), "The shape of the covs_inv should be (dim,dim)"
-
-
-#         assert dim == 3, "Currently only 3D is supported"
-
-#         self.dim = dim
-#         self.num_points = num_points
-#         self.num_obstacles = len(obstacle_means)
-
-#         self.obstacle_means = wp.from_numpy(obstacle_means, dtype=wp.vec3)
-#         self.covs_det = wp.from_numpy(covs_det, dtype=float)
-#         self.covs_inv = wp.from_numpy(covs_inv, dtype=wp.mat33)
-
-#         pass
-
-
-#     def get_convolution_functors(self,num_samples):
-#         functors = []
-#         for i in range(num_samples):
-#             functors.append(ConvolutionFunctorWarp_shared_mem("conv_" + str(i), self.dim, self.num_points, self.obstacle_means, self.covs_det, self.covs_inv))
-#         return functors
-
-
-# if __name__ == "__main__":
-#     # Define the problem
-#     dim = 3
-#     num_obstacles = 66_416
-#     num_points = 30
-
-#     robot_cov = np.eye(dim)
-#     covs = np.array([np.eye(dim) * 10 for _ in range(num_obstacles)])
-#     covs_sum = covs + robot_cov
-
-#     covs_inv = covs.copy()
-#     covs_det = np.ones(num_obstacles)
-
-#     obstacle_means = np.ones((num_obstacles, dim))
-#     points = np.ones((num_points, dim)) * 0.9
-
-#     conv = ConvolutionFunctorWarp(
-#         "conv", dim, num_points, obstacle_means, covs_det, covs_inv
-#     )
-
-#     y = MX.sym("y", num_points, dim)
-#     jac = Function("jac_conv", [y], [jacobian(conv(y), y)])
-#     grad = Function("grad_conv", [y], [gradient(conv(y), y)])
-
-#     j = jac(points)
-#     g = grad(points)
-
-#     # import timeit
-#     # num_tests = 100
-#     # time = timeit.timeit(lambda: jac(points), number=num_tests)
-#     # print(time/num_tests)
-
-#     # params
-#     offset = MX.sym("offset", num_points, dim)
-
-#     # define optimization solver
-#     points_sym = MX.sym("points", num_points, dim)
-
-#     curve = spline_eval(points_sym, 30)
-
-#     dec_vars = vertcat(vec(points_sym))
-#     cost = conv(curve + offset)
-
-#     nlp = {"x": dec_vars, "f": cost, "p": vertcat(vec(offset))}
-
-#     ipopt_options = {
-#         "ipopt.print_level": 3,
-#         "ipopt.max_iter": 100,
-#         "ipopt.tol": 1e-9,
-#         "print_time": 0,
-#         "ipopt.acceptable_tol": 1e-9,
-#         "ipopt.hessian_approximation": "limited-memory",
-#         "ipopt.linear_solver": "ma27",
-#     }
-
-#     solver = nlpsol("solver", "ipopt", nlp, ipopt_options)
-
-#     res = solver(
-#         x0=0.95 * np.ones((num_points, dim)).flatten(),
-#         p=0.6 * np.ones((num_points, dim)).flatten(),
-#     )
-#     print(res["x"])
-
-#     control_points_opt = np.array(res["x"]).reshape(num_points, dim)
-#     opt_curve = spline_eval(control_points_opt, 200)
-
-#     print(opt_curve)
+        if self._jacobian_callback is None:
+            self._jacobian_callback = _JacobianOnline(
+                name,
+                self.num_points,
+                self.num_obstacles,
+                self._normalizer,
+                opts,
+            )
+        return self._jacobian_callback
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_intermediate(self) -> None:
+        if (
+            self._intermediate is None
+            or self._intermediate.shape[0] != self.num_obstacles
+        ):
+            self._intermediate = wp.zeros(self.num_obstacles, dtype=wp.float32)
