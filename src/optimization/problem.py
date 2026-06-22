@@ -1,4 +1,13 @@
-from typing import Any, List
+"""Static trajectory optimisation problem builder.
+
+Obstacle statistics are pre-computed from the environment at build time and
+uploaded once to the Warp device.  Robot covariances are fixed (not
+configuration-dependent).
+"""
+
+from __future__ import annotations
+
+from typing import Any
 
 import casadi as cas
 import numpy as np
@@ -8,50 +17,15 @@ from src.splines.bspline import BSpline
 from src.splines.minvo import minvo_hulls
 from src.planning.joints import JointGroups
 
-
-def _normalize_weights(weights: dict[str, float] | None) -> dict[str, float]:
-    default = {
-        "goal": 1.0,
-        "obstacle": 1.0,
-        "jerk": 1.0,
-        "virtual_jerk": 1.0
-    }
-
-    if weights is None:
-        return default
-
-    return {**default, **weights}
-
-
-def _goal_cost(
-    current_position,
-    target_position,
-    weight: float,
-):
-    return weight * cas.sum1((current_position - target_position) ** 2)
-
-
-def _jerk_cost(
-    dddcurve,
-    duration, 
-    real_indices: List[int], 
-    virtual_indices: List[int], 
-    real_weight: float,
-    virtual_weight: float
-):
-    
-    cost: float = 0.0
-    duration_factor = duration ** 6
-
-    if real_indices: 
-        real_jerk = dddcurve[:, real_indices]
-        cost += real_weight * duration_factor * cas.sum1(cas.sum2(real_jerk**2)) / len(real_indices)
-
-    if virtual_indices: 
-        virtual_jerk = dddcurve[:, virtual_indices]
-        cost += virtual_weight * duration_factor * cas.sum1(cas.sum2(virtual_jerk**2)) / len(virtual_indices)
-    
-    return cost
+from src.optimization.utils import (
+    normalize_weights,
+    goal_cost,
+    jerk_cost,
+    build_constraints,
+    build_collision_point_map,
+    estimate_duration,
+    validate_build_inputs,
+)
 
 
 def _obstacle_cost(
@@ -61,155 +35,55 @@ def _obstacle_cost(
     num_samples: int,
     weight: float,
 ):
-    """
-    Obstacle cost with one covariance per robot Gaussian.
+    """Obstacle cost for a static environment.
 
-    collision_points has shape:
+    For each robot Gaussian the obstacle + robot covariances are pre-convolved
+    once and uploaded to the Warp device.
 
-        (3 * n_gaussians, n_samples)
-
-    robot_covariances has shape:
-
-        (n_gaussians, 3, 3)
+    Parameters
+    ----------
+    collision_points:
+        Shape (3 * n_gaussians, num_samples).
+    environment:
+        GaussianEnvironment with fixed obstacle_means and obstacle_covariances.
+    robot_covariances:
+        Shape (n_gaussians, 3, 3).
+    num_samples:
+        Number of trajectory samples.
+    weight:
+        Scalar cost weight.
     """
     robot_covariances = np.asarray(robot_covariances, dtype=float)
 
     if robot_covariances.ndim != 3 or robot_covariances.shape[1:] != (3, 3):
-        raise ValueError(
-            "robot_covariances must have shape (n_gaussians, 3, 3)."
-        )
+        raise ValueError("robot_covariances must have shape (n_gaussians, 3, 3).")
 
     n_gaussians = robot_covariances.shape[0]
+    obstacle_means = environment.obstacle_means_at(0)         # static: k is irrelevant
+    obstacle_covariances = environment.obstacle_covariances_at(0)
 
     cost = 0
     callbacks = []
 
-    for gaussian_idx in range(n_gaussians):
-        row_start = gaussian_idx * 3
-        row_end = row_start + 3
+    for g in range(n_gaussians):
+        gaussian_points = collision_points[g * 3 : g * 3 + 3, :].T  # (num_samples, 3)
 
-        gaussian_points = collision_points[row_start:row_end, :].T
-
-        covs = environment.obstacle_covariances + robot_covariances[gaussian_idx]
+        covs = obstacle_covariances + robot_covariances[g]
         covs_det = np.linalg.det(covs)
         covs_inv = np.linalg.inv(covs)
 
         convolution = ConvolutionFunctorWarp(
-            f"conv_robot_gaussian_{gaussian_idx}",
+            f"conv_robot_gaussian_{g}",
             3,
             num_samples,
-            environment.obstacle_means,
+            obstacle_means,
             covs_det,
             covs_inv,
         )
-
         callbacks.append(convolution)
         cost += convolution(gaussian_points)
 
     return weight * cost / n_gaussians, callbacks
-
-def _append_scalar_constraint(
-    constraints,
-    lower_bounds,
-    upper_bounds,
-    expr,
-    lower: float,
-    upper: float,
-):
-    constraints = cas.vertcat(constraints, expr)
-    lower_bounds = np.concatenate((lower_bounds, [lower]))
-    upper_bounds = np.concatenate((upper_bounds, [upper]))
-    return constraints, lower_bounds, upper_bounds
-
-
-def _build_constraints(
-    symbolic_type,
-    curve,
-    start,
-    n_dof: int,
-    vel_hulls,
-    acc_hulls,
-    real_indices: List[int], 
-    virtual_indices: List[int],
-    real_wmax: float,
-    real_amax: float,
-    virtual_wmax: float,
-    virtual_amax: float,
-):
-    constraints = symbolic_type([])
-    lbg = np.array([], dtype=float)
-    ubg = np.array([], dtype=float)
-
-    # Start equality constraint.
-    for i in range(n_dof):
-        start_error = curve[0, i] - start[i]
-        constraints, lbg, ubg = _append_scalar_constraint(
-            constraints, 
-            lbg, 
-            ubg, 
-            start_error, 
-            0.0, 
-            0.0
-        )
-
-    # Velocity hull component-wise bounds.
-    for hull in vel_hulls: 
-        for row in range(hull.shape[0]):
-            virtual_joints_velocity_cost = 0.0
-            for joint_idx in range(hull.shape[1]):
-                if joint_idx in virtual_indices:
-                    virtual_joints_velocity_cost += hull[row, joint_idx]**2
-
-                else: 
-                    constraints, lbg, ubg = _append_scalar_constraint(
-                        constraints,
-                        lbg,
-                        ubg,
-                        hull[row, joint_idx],
-                        -real_wmax,
-                        real_wmax,
-                    )
-            
-            if virtual_indices:
-                constraints, lbg, ubg = _append_scalar_constraint(
-                    constraints,
-                    lbg,
-                    ubg,
-                    virtual_joints_velocity_cost,
-                    0.0,
-                    virtual_wmax**2,
-                )
-
-    
-    # Acceleration hull component-wise bounds.
-    for hull in acc_hulls: 
-        for row in range(hull.shape[0]):
-            virtual_joints_acceleration_cost = 0.0
-            for joint_idx in range(hull.shape[1]):
-                if joint_idx in virtual_indices:
-                    virtual_joints_acceleration_cost += hull[row, joint_idx]**2
-
-                else: 
-                    constraints, lbg, ubg = _append_scalar_constraint(
-                        constraints,
-                        lbg,
-                        ubg,
-                        hull[row, joint_idx],
-                        -real_amax,
-                        real_amax,
-                    )
-
-            if virtual_indices:
-                constraints, lbg, ubg = _append_scalar_constraint(
-                    constraints,
-                    lbg,
-                    ubg,
-                    virtual_joints_acceleration_cost,
-                    0.0,
-                    virtual_amax**2,
-                )
-
-    return constraints, lbg, ubg
 
 
 def build_problem(
@@ -220,26 +94,16 @@ def build_problem(
     joint_groups: JointGroups,
     weights: dict[str, float] | None = None,
     vmax: float = 1.0,
-) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
-    """
-    Build the trajectory optimization NLP.
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray, list]:
+    """Build the static trajectory optimisation NLP.
 
     Returns
     -------
-    nlp, lbg, ubg
+    nlp, lbg, ubg, callbacks
     """
-    if num_control_points < 4:
-        raise ValueError("num_control_points must be at least 4.")
+    validate_build_inputs(num_control_points, num_samples, vmax)
 
-    if num_samples <= 0:
-        raise ValueError("num_samples must be positive.")
-
-    if vmax <= 0:
-        raise ValueError("vmax must be positive.")
-
-    weights = _normalize_weights(weights)
-
-    robot_covariance = robot.collision_covariances()
+    weights = normalize_weights(weights)
 
     symbolic_type = cas.MX
     n_dof = robot.n_dof
@@ -248,98 +112,36 @@ def build_problem(
     real_indices = joint_groups.real_indices(n_dof)
     virtual_indices = joint_groups.virtual_indices
 
-    # ==========================================================
-    # Decision variables
-    # ==========================================================
-
-    control_points = symbolic_type.sym(
-        "control_points",
-        num_control_points,
-        n_dof,
-    )
-
+    # --- Decision variables and parameters ---------------------------
+    control_points = symbolic_type.sym("control_points", num_control_points, n_dof)
     decision_variables = cas.vertcat(cas.vec(control_points))
 
-    # ==========================================================
-    # Parameters
-    # ==========================================================
-
     start = symbolic_type.sym("start", n_dof, 1)
-    goal = symbolic_type.sym("goal", 3, 1)
+    goal  = symbolic_type.sym("goal",  3,     1)
+    params = cas.vertcat(cas.vec(start), cas.vec(goal))
 
-    params = cas.vertcat(
-        cas.vec(start),
-        cas.vec(goal),
-    )
-
-    # ==========================================================
-    # Spline
-    # ==========================================================
-
+    # --- Spline and time scaling -------------------------------------
     bspline = BSpline(control_points)
+    curve   = bspline.spline_eval(num_samples)
 
-    curve = bspline.spline_eval(num_samples)
+    start_task         = robot.f_task(curve[0, :])
+    estimated_duration = estimate_duration(goal, start_task, vmax)
+    time_scale         = (num_control_points - 4) / estimated_duration
 
-    start_task = robot.f_task(curve[0, :])
+    dddcurve = time_scale ** 3 * bspline.spline_eval(num_samples, derivative_order=3)
 
-    estimated_duration = cas.norm_2(goal - start_task) / vmax
-    estimated_duration = cas.fmax(estimated_duration, 1e-3)
-
-    num_segments = num_control_points - 4
-    time_scale = num_segments / estimated_duration
-
-    dcurve = time_scale * bspline.spline_eval(
-        num_samples,
-        derivative_order=1,
-    )
-
-    ddcurve = (time_scale**2) * bspline.spline_eval(
-        num_samples,
-        derivative_order=2,
-    )
-
-    dddcurve = (time_scale**3) * bspline.spline_eval(
-        num_samples,
-        derivative_order=3,
-    )
-
-    # ==========================================================
-    # Collision points
-    # ==========================================================
-
+    # --- Collision points --------------------------------------------
     q_sym = symbolic_type.sym("q", n_dof)
-
-    collision_points_raw = robot.collision_points(q_sym) # (n_gaussias, 3)
-    n_gaussians = collision_points_raw.shape[0]
-
-    collision_points_vec = cas.reshape(collision_points_raw.T, 3 * n_gaussians, 1) # (3 * n_gaussians, 1)
-
-    collision_fun = cas.Function(
-        "collision_points",
-        [q_sym],
-        [collision_points_vec],
+    n_gaussians = int(robot.collision_points(q_sym).shape[0])
+    mapped_collision_points = build_collision_point_map(
+        robot, q_sym, n_gaussians, num_samples, curve
     )
-   
-    collision_map = collision_fun.map(num_samples, "openmp")
-    mapped_collision_points = collision_map(curve.T) # (3*n_gaussians, num_samples)
 
+    # --- Constraints -------------------------------------------------
+    vel_hulls = [time_scale      * h for h in minvo_hulls(control_points, derivative_order=1)]
+    acc_hulls = [time_scale ** 2 * h for h in minvo_hulls(control_points, derivative_order=2)]
 
-    # ==========================================================
-    # Constraints
-    # ==========================================================
-
-    vel_hulls = [
-        time_scale * h
-        for h in minvo_hulls(control_points, derivative_order=1)
-    ]
-
-    acc_hulls = [
-        (time_scale**2) * h
-        for h in minvo_hulls(control_points, derivative_order=2)
-    ]
-
-    
-    constraints, lbg, ubg = _build_constraints(
+    constraints, lbg, ubg = build_constraints(
         symbolic_type=symbolic_type,
         curve=curve,
         start=start,
@@ -350,48 +152,29 @@ def build_problem(
         virtual_indices=virtual_indices,
         real_wmax=joint_groups.real_wmax,
         real_amax=joint_groups.real_amax,
-        virtual_wmax=joint_groups.virtual_wmax, 
-        virtual_amax=joint_groups.virtual_amax
+        virtual_wmax=joint_groups.virtual_wmax,
+        virtual_amax=joint_groups.virtual_amax,
     )
 
-    # ==========================================================
-    # Costs
-    # ==========================================================
-
-    final_task = robot.f_task(curve[-1, :])
-
-    cost_goal = _goal_cost(
-        final_task,
-        goal,
-        weight=weights["goal"],
+    # --- Costs -------------------------------------------------------
+    cost_goal, cost_jerk, (cost_obstacles, callbacks) = (
+        goal_cost(robot.f_task(curve[-1, :]), goal, weight=weights["goal"]),
+        jerk_cost(
+            dddcurve, estimated_duration,
+            real_indices=real_indices, virtual_indices=virtual_indices,
+            real_weight=weights["jerk"], virtual_weight=weights["virtual_jerk"],
+        ),
+        _obstacle_cost(
+            mapped_collision_points, environment,
+            robot.collision_covariances(),
+            num_samples=num_samples, weight=weights["obstacle"],
+        ),
     )
 
-    cost_jerk = _jerk_cost(
-        dddcurve,
-        estimated_duration,
-        real_indices=real_indices, 
-        virtual_indices=virtual_indices, 
-        real_weight=weights["jerk"], 
-        virtual_weight=weights["virtual_jerk"]
-    )
-
-    cost_obstacles, callbacks = _obstacle_cost(
-        mapped_collision_points,
-        environment,
-        robot_covariance,
-        num_samples=num_samples,
-        weight=weights["obstacle"],
-    )
-
-    total_cost = cost_goal + cost_obstacles + cost_jerk
-
-    # ==========================================================
-    # NLP
-    # ==========================================================
-
+    # --- NLP ---------------------------------------------------------
     nlp = {
         "x": decision_variables,
-        "f": total_cost,
+        "f": cost_goal + cost_obstacles + cost_jerk,
         "p": params,
         "g": constraints,
     }

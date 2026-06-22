@@ -57,7 +57,7 @@ class RRTStarInitializer(PathInitializer):
         self.n_dof = robot.n_dof
         self.joint_limits = self._joint_limits(robot)
         self.occupancy_map = self._build_occupancy_map(
-            environment.obstacle_means,
+            environment.obstacle_means_at(0),
             self.voxel_size,
         )
 
