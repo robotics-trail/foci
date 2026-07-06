@@ -7,7 +7,7 @@ from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
 from src.benchmark.utils import minimum_robot_environment_distance
-from src.benchmark.chomp_planner import CHOMPPlanner
+# from src.benchmark.chomp_planner import CHOMPPlanner
 
 def mobile_robot_demo():
     obstacle_means = np.array(
@@ -27,30 +27,27 @@ def mobile_robot_demo():
     )
 
     gaussian_specs = [ 
-        LinkGaussian(4, 0.7, np.eye(3) * 0.1**2), 
-        LinkGaussian(5, 0.2, np.eye(3) * 0.1**2), 
+        LinkGaussian(4, 0.5, np.eye(3) * 0.1**2), 
         LinkGaussian(5, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(5, 0.8, np.eye(3) * 0.1**2), 
         LinkGaussian(6, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(7, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(8, 0.5, np.eye(3) * 0.1**2), 
+        LinkGaussian(7, 0.5, np.eye(3) * 0.2**2), 
     ]
 
     theta_start = np.array(
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     )
 
     goal = np.array([3.0, 3.0, 4.0])
 
     robot = ManipulatorRobot(
-        urdf_path="urdfs/ur5_extended_move.urdf",
+        urdf_path="urdfs/ur5/ur5.urdf",
         root_link="world",
         tip_link="ee_link",
         gaussian_specs=gaussian_specs,
     )
 
     joint_groups = JointGroups(
-        virtual_indices=[0,1,2], 
+        virtual_indices=[0,1], 
         virtual_wmax=4.5, 
         virtual_amax=5.0, 
         real_wmax=4.5, 
@@ -64,9 +61,9 @@ def mobile_robot_demo():
 
 
     initializer = RRTStarInitializer(
-        voxel_size=0.001,
-        goal_threshold=0.001,
-        random_seed=10,
+        voxel_size=0.01,
+        goal_threshold=0.01,
+        random_seed=42,
         max_time=None,   
 )
     

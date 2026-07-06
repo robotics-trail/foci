@@ -12,7 +12,7 @@ from typing import Any
 import casadi as cas
 import numpy as np
 
-from src.environment.convolution import ConvolutionFunctorWarp
+from src.environment.convolution import ConvolutionFunctor
 from src.splines.bspline import BSpline
 from src.splines.minvo import minvo_hulls
 from src.planning.joints import JointGroups
@@ -72,9 +72,8 @@ def _obstacle_cost(
         covs_det = np.linalg.det(covs)
         covs_inv = np.linalg.inv(covs)
 
-        convolution = ConvolutionFunctorWarp(
+        convolution = ConvolutionFunctor(
             f"conv_robot_gaussian_{g}",
-            3,
             num_samples,
             obstacle_means,
             covs_det,
