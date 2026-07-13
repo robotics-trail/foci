@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +11,18 @@ from .base import BaseRobot
 
 @dataclass(frozen=True)
 class LinkGaussian:
-    link: int
+    """
+    `link` accepts either:
+    - an int: raw index into the robot's link chain (fragile -- breaks
+      silently if the URDF chain changes, e.g. links added/removed/reordered).
+    - a str: the URDF link name (e.g. "wrist_3_link"). Resolved to an index
+      against the actual robot chain at ManipulatorRobot construction time,
+      so it stays correct across URDF changes as long as the link name exists.
+
+    Prefer str whenever possible.
+    """
+
+    link: int | str
     t: float = 0.5
     covariance: np.ndarray = field(
         default_factory=lambda: np.eye(3) * 0.1**2
@@ -72,7 +83,11 @@ class URDFBackend:
             if item in self.parser.robot_desc.link_map
         ]
 
-        self.joint_map = self.parser.robot_desc.joint_map
+        self.joint_map = {
+            item: self.parser.robot_desc.joint_map[item]
+            for item in chain
+            if item in self.parser.robot_desc.joint_map
+        }
 
         self.n_dof = self.parser.get_n_joints(root_link, tip_link)
         self.n_links = len(self.links)
@@ -403,7 +418,7 @@ class ManipulatorRobot(BaseRobot):
 
             elif isinstance(spec, dict):
                 gaussian = LinkGaussian(
-                    link=int(spec["link"]),
+                    link=spec["link"],
                     t=float(spec.get("t", 0.5)),
                     covariance=np.asarray(
                         spec.get("covariance", np.eye(3) * 0.1**2),
@@ -424,18 +439,43 @@ class ManipulatorRobot(BaseRobot):
                     )
 
                 gaussian = LinkGaussian(
-                    link=int(link),
+                    link=link,
                     t=float(t),
                     covariance=np.asarray(covariance, dtype=float),
                     name=f"gaussian_{idx}",
                 )
 
-            if gaussian.link < 0 or gaussian.link >= self.n_links:
-                raise ValueError(
-                    f"Gaussian link index {gaussian.link} is invalid. "
-                    f"Expected a value in [0, {self.n_links - 1}]."
-                )
+            gaussian = self._resolve_gaussian_link(gaussian)
 
             parsed.append(gaussian)
 
         return parsed
+
+    def _resolve_gaussian_link(self, gaussian: LinkGaussian) -> LinkGaussian:
+        """
+        Resolve LinkGaussian.link to a valid integer index into self.links,
+        accepting either a raw index (int) or a URDF link name (str).
+        """
+        link_ref = gaussian.link
+
+        if isinstance(link_ref, str):
+            if link_ref not in self.links:
+                raise ValueError(
+                    f"Unknown link name '{link_ref}' for gaussian "
+                    f"'{gaussian.name}'. Available links: {self.links}"
+                )
+            resolved_index = self.links.index(link_ref)
+            gaussian = replace(gaussian, link=resolved_index)
+
+        else:
+            resolved_index = int(link_ref)
+            gaussian = replace(gaussian, link=resolved_index)
+
+        if resolved_index < 0 or resolved_index >= self.n_links:
+            raise ValueError(
+                f"Gaussian link index {resolved_index} is invalid. "
+                f"Expected a value in [0, {self.n_links - 1}]. "
+                f"Available links: {self.links}"
+            )
+
+        return gaussian
