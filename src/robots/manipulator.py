@@ -79,8 +79,16 @@ class URDFBackend:
 
         self.link_fk_funcs, self.link_joint_counts = self._build_link_fk_cache()
 
+        self.link_offsets: dict[str, cas.DM] = {
+            link_name: self._compute_visual_offset(
+                self.parser.robot_desc.link_map.get(link_name)
+            )
+            for link_name in self.links
+        }
+
         self.tip_link_object = self.parser.robot_desc.link_map.get(self.tip_link)
-        self.ee_offset = self._compute_ee_visual_offset()
+        self.ee_offset = self.link_offsets[self.tip_link]
+
 
     def _build_link_fk_cache(self) -> tuple[dict[str, Any], dict[str, int]]:
         link_fk_funcs = {}
@@ -103,7 +111,8 @@ class URDFBackend:
 
     def link_transform(self, q: Any, link_name: str) -> Any:
         """
-        Return the homogeneous transform of a link.
+        Return the homogeneous transform of a link, with the visual
+        offset already baked into the translation component.
         """
         if link_name not in self.link_fk_funcs:
             raise KeyError(f"Unknown link '{link_name}'.")
@@ -111,14 +120,20 @@ class URDFBackend:
         transform_fn = self.link_fk_funcs[link_name]
         joint_count = self.link_joint_counts[link_name]
 
-        return transform_fn(q[:joint_count])
+        T = transform_fn(q[:joint_count])
+
+        offset = self.link_offsets[link_name]
+        if cas.norm_2(offset) != 0:
+            rotation = T[:3, :3]
+            position = T[:3, 3] + rotation @ offset
+            T[:3, 3] = position
+
+        return T
 
     def link_positions(self, q: Any) -> Any:
         """
-        Return link origins plus the final visual end-effector point.
-
-        Shape:
-            (n_links + 1, 3)
+        Return link origins (already offset-corrected) plus the final
+        visual end-effector point.
         """
         positions = []
 
@@ -143,62 +158,84 @@ class URDFBackend:
     def end_effector_position(self, q: Any) -> Any:
         """
         Return visual end-effector point in world coordinates.
+        Kept for backward compatibility — now link_transform() already
+        applies the offset, so this is equivalent to taking the tip's
+        translation column.
         """
         transform = self.link_transform(q, self.tip_link)
+        return transform[:3, 3]
 
-        rotation = transform[:3, :3]
-        position = transform[:3, 3]
 
-        return position + rotation @ self.ee_offset
+    @staticmethod
+    def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        """
+        URDF convention: R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
+        """
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
 
-    def _compute_ee_visual_offset(self) -> cas.DM:
-        tip = self.tip_link_object
+        Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
 
-        if tip is None or tip.visual is None:
+        return Rz @ Ry @ Rx
+
+    def _compute_visual_offset(self, link_object) -> cas.DM:
+        """
+        Generalized version of the old _compute_ee_visual_offset:
+        works for any link, not just the tip.
+
+        Properly accounts for the visual <origin> rotation (rpy), not just
+        its translation (xyz) -- otherwise shape-derived offsets (e.g. "half
+        the cylinder length along local Z") point in the wrong direction
+        whenever the URDF rotates the visual geometry relative to the link
+        frame, which is extremely common for cylinder/capsule links.
+        """
+        if link_object is None or link_object.visual is None:
             return cas.DM([0.0, 0.0, 0.0])
 
-        geometry = tip.visual.geometry
-        origin = tip.visual.origin
+        geometry = link_object.visual.geometry
+        origin = link_object.visual.origin
 
-        local_offset = np.zeros(3)
+        origin_xyz = np.zeros(3)
+        origin_rpy = np.zeros(3)
+
+        if origin is not None:
+            if origin.xyz is not None:
+                origin_xyz = np.array(origin.xyz)
+            if origin.rpy is not None:
+                origin_rpy = np.array(origin.rpy)
+
+        rotation = self._rpy_to_matrix(*origin_rpy)
+
+        # Shape-local offset, expressed in the *unrotated* geometry frame
+        # (i.e. before applying the visual origin's own rpy).
+        shape_offset = np.zeros(3)
 
         if hasattr(geometry, "filename"):
-            scale = (
-                np.array(geometry.scale)
-                if hasattr(geometry, "scale") and geometry.scale is not None
-                else np.ones(3)
-            )
-
-            if origin is not None and origin.xyz is not None:
-                local_offset = np.array(origin.xyz) * scale
+            # We cannot infer the true mesh centroid from the URDF alone
+            # (would require loading and analyzing the mesh file itself).
+            # `scale` only rescales mesh vertices, it must NOT be applied
+            # to the origin translation.
+            shape_offset = np.zeros(3)
 
         elif hasattr(geometry, "length"):
             length = geometry.length or 0.0
-            local_offset = np.array([0.0, 0.0, length / 2.0])
-
-            if origin is not None and origin.xyz is not None:
-                local_offset += np.array(origin.xyz)
+            shape_offset = np.array([0.0, 0.0, length / 2.0])
 
         elif hasattr(geometry, "size"):
             size = np.array(geometry.size)
-            local_offset = np.array([0.0, 0.0, size[2] / 2.0])
-
-            if origin is not None and origin.xyz is not None:
-                local_offset += np.array(origin.xyz)
+            shape_offset = np.array([0.0, 0.0, size[2] / 2.0])
 
         elif hasattr(geometry, "radius"):
             radius = geometry.radius or 0.0
-            local_offset = np.array([0.0, 0.0, radius])
+            shape_offset = np.array([0.0, 0.0, radius])
 
-            if origin is not None and origin.xyz is not None:
-                local_offset += np.array(origin.xyz)
-
-        else:
-            if origin is not None and origin.xyz is not None:
-                local_offset = np.array(origin.xyz)
+        local_offset = origin_xyz + rotation @ shape_offset
 
         return cas.DM(local_offset)
-
+    
     def joint_limits(self) -> list[tuple[float, float]]:
         limits = []
 

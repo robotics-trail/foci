@@ -28,13 +28,13 @@ def mobile_robot_demo():
 
     gaussian_specs = [ 
         LinkGaussian(4, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(5, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(6, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(7, 0.5, np.eye(3) * 0.2**2), 
+        LinkGaussian(5, 0.5, np.eye(3) * 0.15**2), 
+        LinkGaussian(6, 0.5, np.eye(3) * 0.25**2), 
+        LinkGaussian(7, 0.5, np.eye(3) * 0.25**2), 
     ]
 
     theta_start = np.array(
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [0.0, 0.0, 0.0, -np.pi/2.0, 0.0, -np.pi/2.0, np.pi/2.0, 0.0]
     )
 
     goal = np.array([3.0, 3.0, 4.0])
@@ -42,7 +42,7 @@ def mobile_robot_demo():
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5/ur5.urdf",
         root_link="world",
-        tip_link="ee_link",
+        tip_link="wrist_3_link",
         gaussian_specs=gaussian_specs,
     )
 
@@ -61,7 +61,7 @@ def mobile_robot_demo():
 
 
     initializer = RRTStarInitializer(
-        voxel_size=0.01,
+        voxel_size=0.005,
         goal_threshold=0.01,
         random_seed=42,
         max_time=None,   
@@ -81,7 +81,7 @@ def mobile_robot_demo():
             "jerk": 0.001,
             "virtual_jerk": 0.001,
         },
-        vmax=4.5,
+        vmax=5.5,
         linear_solver="mumps",
     )
 
