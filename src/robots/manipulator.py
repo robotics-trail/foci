@@ -92,6 +92,10 @@ class URDFBackend:
         self.n_dof = self.parser.get_n_joints(root_link, tip_link)
         self.n_links = len(self.links)
 
+        _, self.actuated_joint_names, _, _ = self.parser.get_joint_info(
+            root_link, tip_link
+        )
+
         self.link_fk_funcs, self.link_joint_counts = self._build_link_fk_cache()
 
         self.link_offsets: dict[str, cas.DM] = {
@@ -306,6 +310,14 @@ class ManipulatorRobot(BaseRobot):
     @property
     def links(self) -> list[str]:
         return self.urdf_backend.links
+
+    @property
+    def actuated_joint_names(self) -> list[str]:
+        """
+        Actuated joint names, in the same order as the q vector expected
+        by forward_kinematics/collision_points/etc.
+        """
+        return self.urdf_backend.actuated_joint_names
 
     @property
     def urdf_path(self) -> str:
