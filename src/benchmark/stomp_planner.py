@@ -51,37 +51,16 @@ _EPS = 1e-10
 # Smoothness precision matrix  R  and its inverse
 # =============================================================================
 
-def _build_smoothness_matrix(num_waypoints: int, dt: float) -> np.ndarray:
-    """
-    Build the (T, T) finite-difference smoothness matrix R = K^T K.
-
-    K is the (T-1)×T first-difference operator, so R penalises squared
-    velocities.  Scaling by 1/dt gives units consistent with the dt used
-    in the jerk and constraint costs.
-
-    Why R and not A?
-    ----------------
-    In STOMP the same matrix serves two roles:
-      - Precision matrix of the noise distribution: noise ~ N(0, R^{-1}).
-        Drawing noise from R^{-1} guarantees that perturbations are smooth
-        by construction — most of the variance is in low-frequency modes.
-      - Smoothing filter for the update: Δξ = R^{-1} (weighted sum of δξ_k).
-        Multiplying by R^{-1} re-smooths the update, preventing the
-        trajectory from becoming jagged after many iterations.
-
-    A small ridge term is added to guarantee invertibility even for very
-    short trajectories.
-    """
+def _build_smoothness_matrix(num_waypoints, dt):
     T = num_waypoints
-    K = np.zeros((T - 1, T), dtype=float)
-    for i in range(T - 1):
-        K[i, i]     = -1.0
-        K[i, i + 1] =  1.0
-
-    R = (K.T @ K) / max(dt, _EPS)
-    R += 1e-6 * np.eye(T, dtype=float)   # ridge for invertibility
+    A = np.zeros((T - 2, T))
+    for i in range(T - 2):
+        A[i, i]     = 1.0
+        A[i, i + 1] = -2.0
+        A[i, i + 2] = 1.0
+    R = (A.T @ A) / max(dt ** 2, _EPS)
+    R += 1e-6 * np.eye(T)
     return R
-
 
 def _build_precision_inverse(R: np.ndarray) -> np.ndarray:
     """
