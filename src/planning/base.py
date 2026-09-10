@@ -86,6 +86,47 @@ class BasePlanner(ABC):
     # Shared helpers
     # ------------------------------------------------------------------
 
+    def _variable_bounds(self):
+        """
+        Joint limits as per-variable bounds on the decision vector.
+
+        `x` is vec(control_points) with control_points of shape
+        (num_control_points, n_dof), and CasADi's vec() is column-major, so
+        the num_control_points variables belonging to one joint are
+        contiguous: that is np.repeat, not np.tile.
+
+        Bounding the control points is conservative but sound: by the convex
+        hull property of a B-spline the curve lies inside the convex hull of
+        its control points, so control points within the limits imply a
+        trajectory within the limits.
+
+        Returns (None, None) when the robot does not declare limits.
+        """
+        get_limits = getattr(self.robot, "joint_limits", None)
+        limits = get_limits() if callable(get_limits) else None
+
+        if limits is None:
+            return None, None
+
+        limits = list(limits)
+        n_dof = self.robot.n_dof
+
+        if len(limits) != n_dof:
+            raise ValueError(
+                f"{type(self.robot).__name__}.joint_limits() returned "
+                f"{len(limits)} entries for {n_dof} degrees of freedom; the "
+                "bounds would be assigned to the wrong joints."
+            )
+
+        lower = np.repeat(
+            np.array([float(lo) for lo, _ in limits]), self.num_control_points
+        )
+        upper = np.repeat(
+            np.array([float(hi) for _, hi in limits]), self.num_control_points
+        )
+
+        return lower, upper
+
     def _build_parameter_vector(
         self, start: np.ndarray, goal: np.ndarray
     ) -> np.ndarray:
@@ -153,12 +194,20 @@ class BasePlanner(ABC):
         # --- Solve NLP -----------------------------------------------
         solve_start = perf_counter()
 
-        solution = solver(
-            x0=x0,
-            p=self._build_parameter_vector(start, goal),
-            lbg=lbg,
-            ubg=ubg,
-        )
+        solver_arguments = {
+            "x0": x0,
+            "p": self._build_parameter_vector(start, goal),
+            "lbg": lbg,
+            "ubg": ubg,
+        }
+
+        lbx, ubx = self._variable_bounds()
+
+        if lbx is not None:
+            solver_arguments["lbx"] = lbx
+            solver_arguments["ubx"] = ubx
+
+        solution = solver(**solver_arguments)
 
         solve_time = perf_counter() - solve_start
 

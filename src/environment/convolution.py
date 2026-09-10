@@ -137,14 +137,14 @@ def kernel_jacobian_static(
     obstacle_means: wp.array(dtype=wp.vec3),
     covs_det: wp.array(dtype=wp.float32),
     covs_inv: wp.array(dtype=wp.mat33),
-    grad_means: wp.array2d(dtype=wp.vec3),
+    grad_means: wp.array(dtype=wp.vec3),
     pi_cubic: wp.float32,
 ):
     """Jacobian of the forward cost w.r.t. robot_means for the static functor.
  
     Thread grid: (num_points, num_obstacles).
-    Accumulates per-point, per-obstacle gradient contributions into
-    `grad_means[m, n]`; the caller sums over n.
+    Reduces the per-obstacle contributions into `grad_means[m]` with
+    atomic_add, so the caller gets a (num_points,) buffer directly.
     """
     m, n = wp.tid()
     diff = robot_means[m] - obstacle_means[n]
@@ -153,7 +153,7 @@ def kernel_jacobian_static(
         wp.exp(-0.5 * wp.dot(diff, inv @ diff))
         / (wp.sqrt(covs_det[n]) * pi_cubic)
     )
-    grad_means[m, n] = -pdf * inv @ diff
+    wp.atomic_add(grad_means, m, -pdf * inv @ diff)
  
  
 @wp.kernel
@@ -286,8 +286,11 @@ class _JacobianStatic(cas.Callback):
         self._normalizer = normalizer
         self.pi_cubic = float(PI_CUBIC)
  
-        # (num_points, num_obstacles) gradient buffer; summed over obstacles after launch
-        self._grad_means = wp.zeros((num_points, self.num_obstacles), dtype=wp.vec3)
+        # One slot per body point; obstacle contributions are accumulated in the
+        # kernel with atomic_add.  Materialising a (num_points, num_obstacles)
+        # buffer instead would cost ~30 MB per robot Gaussian for a 1e5-splat
+        # scene and run out of device memory at 1e6.
+        self._grad_means = wp.zeros(num_points, dtype=wp.vec3)
  
         self.construct(name, opts)
  
@@ -323,9 +326,10 @@ class _JacobianStatic(cas.Callback):
             ],
         )
  
-        # Sum gradient contributions over obstacles, then normalise
-        grad = wp.utils.array_sum(self._grad_means, axis=1)  # (num_points,) vec3
-        out = grad.numpy().transpose().reshape(1, self.num_points * 3)
+        # Already reduced over obstacles by the kernel.  CasADi indexes a
+        # Jacobian row by vec(input), which is column-major, hence the
+        # transpose of the (num_points, 3) buffer.
+        out = self._grad_means.numpy().T.reshape(1, self.num_points * 3)
         return [out * self._normalizer]
  
  
@@ -543,11 +547,17 @@ class _JacobianOnline(cas.Callback):
             ],
         )
 
+        # CasADi indexes a Jacobian row by vec(input), which is COLUMN-major.
+        # The vec3 buffers give (N, 3) and can be transposed directly; the
+        # covariance buffers are flat (N * 9,), so a bare .transpose() is a
+        # no-op on them and they need the intermediate reshape.
+        n_p, n_o = self.num_points, self.num_obstacles
+
         return [
-            self._grad_means.numpy().reshape(1, self.num_points * 3).astype(np.float64),
-            self._grad_robot_covs.numpy().reshape(1, self.num_points * 9).astype(np.float64),
-            self._grad_obstacle_means.numpy().reshape(1, self.num_obstacles * 3).astype(np.float64),
-            self._grad_obstacle_covs.numpy().reshape(1, self.num_obstacles * 9).astype(np.float64),
+            self._grad_means.numpy().T.reshape(1, n_p * 3).astype(np.float64),
+            self._grad_robot_covs.numpy().reshape(n_p, 9).T.reshape(1, n_p * 9).astype(np.float64),
+            self._grad_obstacle_means.numpy().T.reshape(1, n_o * 3).astype(np.float64),
+            self._grad_obstacle_covs.numpy().reshape(n_o, 9).T.reshape(1, n_o * 9).astype(np.float64),
         ]
 
     # ------------------------------------------------------------------

@@ -21,7 +21,8 @@ from typing import Any
 import casadi as cas
 import numpy as np
 
-from src.environment.convolution import ConvolutionFunctorWarp
+from src.benchmark.utils import limit_scaling_factor
+from src.environment.convolution import ConvolutionFunctor
 from src.planning.joints import JointGroups
 from src.planning.result import PlanningResult
 
@@ -104,6 +105,7 @@ class CHOMPPlanner:
         weights: dict[str, float] | None = None,
         convergence_tol: float = 1e-4,
         joint_limit_margin: float = 1e-6,
+        total_time: float = 1.0,
     ):
         self.robot = robot
         self.environment = environment
@@ -120,7 +122,13 @@ class CHOMPPlanner:
             **(weights or {}),
         }
 
-        self.dt = 1.0 / max(self.num_waypoints - 1, 1)
+        # Horizon of the trajectory.  It must be settable: the covariant step
+        # balances the obstacle gradient (dt-invariant) against the smoothness
+        # gradient (scales as 1/dt), so a hardcoded 1.0 makes the same nominal
+        # weights mean something 2-5x different from STOMP's, which is given
+        # total_time=2.0 or 5.0 by the benchmarks.
+        self.total_time = float(total_time)
+        self.dt = self.total_time / max(self.num_waypoints - 1, 1)
 
         self._robot_covariances = self._load_robot_collision_covariances()
         self._n_collision_points = int(self._robot_covariances.shape[0])
@@ -184,16 +192,15 @@ class CHOMPPlanner:
 
         for point_idx in range(self._n_collision_points):
             x = cas.MX.sym(f"x_chomp_obs_{point_idx}", 3)
-            point = x.T  # ConvolutionFunctorWarp expects shape (1, 3).
+            point = x.T  # ConvolutionFunctor expects shape (num_points, 3).
 
             covs = self.environment.obstacle_covariances + self._robot_covariances[point_idx]
             covs_det = np.linalg.det(covs)
             covs_inv = np.linalg.inv(covs)
 
-            convolution = ConvolutionFunctorWarp(
+            convolution = ConvolutionFunctor(
                 f"chomp_workspace_obs_{point_idx}",
-                3,
-                1,
+                1,                       # num_points = 1 (one waypoint at a time)
                 self.environment.obstacle_means,
                 covs_det,
                 covs_inv,
@@ -444,6 +451,17 @@ class CHOMPPlanner:
         final_ee = self._ee_position(xi[-1])
         goal_error = float(np.linalg.norm(xi[-1] - goal))
 
+        # CHOMP's objective has no velocity/acceleration term at all, so the
+        # trajectory it returns is not dynamically feasible in general.
+        # Report the uniform time scaling that would make it feasible, so it
+        # can be compared against a planner that enforces the limits.
+        limit_scale, feasible_duration = limit_scaling_factor(
+            xi,
+            duration=self.total_time,
+            joint_groups=self.joint_groups,
+            n_dof=int(xi.shape[1]),
+        )
+
         return PlanningResult(
             trajectory=xi,
             control_points=None,
@@ -470,6 +488,9 @@ class CHOMPPlanner:
                 "learning_rate": self.learning_rate,
                 "weights": self.weights,
                 "dt": self.dt,
+                "total_time": self.total_time,
+                "limit_scale": limit_scale,
+                "feasible_duration": feasible_duration,
                 "endpoint_mode": "fixed_start_and_fixed_configuration_goal",
                 "optimized_waypoints": "interior_only",
             },

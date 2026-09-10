@@ -98,6 +98,10 @@ class URDFBackend:
 
         self.link_fk_funcs, self.link_joint_counts = self._build_link_fk_cache()
 
+        # Informational only: the offset is applied exclusively to the tip (see
+        # link_positions).  Baking it into every link would make link_positions()[i]
+        # the *distal end* of link i instead of its origin, which shifts every
+        # collision segment one link outwards.
         self.link_offsets: dict[str, cas.DM] = {
             link_name: self._compute_visual_offset(
                 self.parser.robot_desc.link_map.get(link_name)
@@ -130,8 +134,12 @@ class URDFBackend:
 
     def link_transform(self, q: Any, link_name: str) -> Any:
         """
-        Return the homogeneous transform of a link, with the visual
-        offset already baked into the translation component.
+        Return the plain homogeneous transform of a link frame.
+
+        No visual offset is applied here: link i's body is the segment between
+        link i's origin and link i+1's origin, so the origins are what
+        link_positions() needs.  The tip is the only link with no "next
+        origin", and it gets its visual offset there.
         """
         if link_name not in self.link_fk_funcs:
             raise KeyError(f"Unknown link '{link_name}'.")
@@ -139,20 +147,14 @@ class URDFBackend:
         transform_fn = self.link_fk_funcs[link_name]
         joint_count = self.link_joint_counts[link_name]
 
-        T = transform_fn(q[:joint_count])
-
-        offset = self.link_offsets[link_name]
-        if cas.norm_2(offset) != 0:
-            rotation = T[:3, :3]
-            position = T[:3, 3] + rotation @ offset
-            T[:3, 3] = position
-
-        return T
+        return transform_fn(q[:joint_count])
 
     def link_positions(self, q: Any) -> Any:
         """
-        Return link origins (already offset-corrected) plus the final
-        visual end-effector point.
+        Return the link origins plus the visual end-effector point.
+
+        Shape (n_links + 1, 3), so that row i and row i+1 bracket the body of
+        link i for every i in [0, n_links - 1].
         """
         positions = []
 
@@ -170,19 +172,22 @@ class URDFBackend:
         Return flattened vector:
 
             [link_0_xyz, link_1_xyz, ..., link_N_xyz, ee_xyz]
+
+        cas.reshape is column-major, so the (n+1, 3) matrix has to be
+        transposed first or the result would be [all x, all y, all z].
         """
         positions = self.link_positions(q)
-        return cas.reshape(positions, 3 * (self.n_links + 1), 1)
+        return cas.reshape(positions.T, 3 * (self.n_links + 1), 1)
 
     def end_effector_position(self, q: Any) -> Any:
         """
-        Return visual end-effector point in world coordinates.
-        Kept for backward compatibility — now link_transform() already
-        applies the offset, so this is equivalent to taking the tip's
-        translation column.
+        Return the visual end-effector point in world coordinates: the tip
+        frame's origin displaced by the tip's own visual offset.  This is the
+        extra row of link_positions(), i.e. the far end of the tip link's
+        body, which has no "next link origin" to bracket it.
         """
         transform = self.link_transform(q, self.tip_link)
-        return transform[:3, 3]
+        return transform[:3, 3] + transform[:3, :3] @ self.ee_offset
 
 
     @staticmethod
@@ -256,13 +261,24 @@ class URDFBackend:
         return cas.DM(local_offset)
     
     def joint_limits(self) -> list[tuple[float, float]]:
+        """
+        One (lower, upper) pair per actuated joint, in q order.
+
+        The joint types must match what urdf2casadi counts as actuated
+        (prismatic, revolute AND continuous), or the list ends up shorter than
+        n_dof and every consumer silently pairs a joint with the next joint's
+        limits.  Continuous joints are unbounded by definition.
+        """
         limits = []
 
         for _, joint in self.joint_map.items():
-            if joint.type in ["revolute", "prismatic"]:
-                lower = joint.limit.lower if joint.limit is not None else -np.inf
-                upper = joint.limit.upper if joint.limit is not None else np.inf
-                limits.append((lower, upper))
+            if joint.type not in ("revolute", "prismatic", "continuous"):
+                continue
+
+            if joint.type == "continuous" or joint.limit is None:
+                limits.append((-np.inf, np.inf))
+            else:
+                limits.append((joint.limit.lower, joint.limit.upper))
 
         return limits
 
@@ -298,6 +314,30 @@ class ManipulatorRobot(BaseRobot):
         )
 
         self.gaussian_specs = self._parse_gaussian_specs(gaussian_specs)
+        self._validate_tip_gaussians()
+
+    def _validate_tip_gaussians(self) -> None:
+        """
+        A Gaussian on the tip link is bracketed by the tip's origin and the
+        tip's visual offset.  If that offset is zero -- a mesh visual with no
+        origin translation, for instance -- the two points coincide and the
+        Gaussian silently collapses to a single point instead of covering the
+        link, so refuse it instead of planning with a hole in the robot.
+        """
+        tip_index = self.n_links - 1
+        targets_tip = any(spec.link == tip_index for spec in self.gaussian_specs)
+
+        if not targets_tip:
+            return
+
+        if float(cas.norm_2(self.urdf_backend.ee_offset)) == 0.0:
+            raise ValueError(
+                f"A Gaussian targets the tip link '{self.tip_link}' (index "
+                f"{tip_index}) but its visual offset is zero, so the last "
+                "collision segment would degenerate to a point. Give the tip "
+                "link a visual with a non-zero origin or extent, or move that "
+                "Gaussian to another link."
+            )
 
     @property
     def n_dof(self) -> int:

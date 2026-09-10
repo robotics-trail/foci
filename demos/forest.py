@@ -64,7 +64,7 @@ def forest_demo():
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
-        #initializer=initializer,
+        initializer=initializer,
         num_control_points=12,
         num_samples=25,
         weights={

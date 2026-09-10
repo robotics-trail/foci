@@ -39,7 +39,8 @@ from typing import Any
 import casadi as cas
 import numpy as np
 
-from src.environment.convolution import ConvolutionFunctorWarp
+from src.benchmark.utils import limit_scaling_factor
+from src.environment.convolution import ConvolutionFunctor
 from src.planning.joints import JointGroups
 from src.planning.result import PlanningResult
 
@@ -52,15 +53,33 @@ _EPS = 1e-10
 # =============================================================================
 
 def _build_smoothness_matrix(num_waypoints, dt):
+    """
+    Build the finite-difference precision matrix R = A^T A / dt^2.
+
+    A is the (T+2, T) second-difference operator of Kalakrishnan et al., i.e.
+    it INCLUDES the two boundary rows at each end, which reference waypoints
+    outside the trajectory and are therefore truncated.  Those rows are what
+    makes A full column rank.
+
+    Dropping them (a (T-2, T) operator with interior rows only) leaves A^T A
+    with a 2-dimensional nullspace -- constants and ramps -- so any ridge
+    added to invert it becomes the dominant term of R^{-1}, and the sampled
+    noise degenerates into a rigid affine shift of the whole trajectory whose
+    per-waypoint sigma is LARGEST at the pinned endpoints.  With the boundary
+    rows, cond(R) drops from ~5e8 to ~1e3 and the noise recovers the
+    bell-shaped profile that lets STOMP deform one part of the path.
+    """
     T = num_waypoints
-    A = np.zeros((T - 2, T))
-    for i in range(T - 2):
-        A[i, i]     = 1.0
-        A[i, i + 1] = -2.0
-        A[i, i + 2] = 1.0
-    R = (A.T @ A) / max(dt ** 2, _EPS)
-    R += 1e-6 * np.eye(T)
-    return R
+    A = np.zeros((T + 2, T))
+
+    for i in range(T + 2):
+        for offset, value in ((0, 1.0), (1, -2.0), (2, 1.0)):
+            j = i - 2 + offset
+            if 0 <= j < T:
+                A[i, j] = value
+
+    # No ridge needed: A has full column rank, so A^T A is already invertible.
+    return (A.T @ A) / max(dt ** 2, _EPS)
 
 def _build_precision_inverse(R: np.ndarray) -> np.ndarray:
     """
@@ -191,12 +210,16 @@ def _jerk_cost_numpy(
     virtual_weight: float,
 ) -> float:
     """
-    Jerk cost matching the _jerk_cost() formula in problem.py.
+    STOMP's internal jerk cost.
 
-    problem.py scales by duration^6 to make the cost dimensionless with
-    respect to the trajectory duration.  We replicate that here so that
-    the obstacle and jerk weights have the same order of magnitude across
-    different trajectory lengths.
+    This is NOT comparable with problem.py's jerk cost and must not be used
+    to compare planners: FOCI sums over samples while this averages over
+    waypoints (a factor of T), and a 4-point stencil on a handful of
+    waypoints recovers only a fraction of the true jerk of the same curve.
+    Use benchmark.utils.jerk_metric for anything cross-planner.
+
+    The duration^6 factor is kept only so that the obstacle and jerk weights
+    keep the same order of magnitude across different trajectory lengths.
 
         cost = weight * duration^6 * mean( jerk² ) over real/virtual joints
     """
@@ -308,7 +331,7 @@ def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
     Why per-Gaussian instead of one joint function?
     -----------------------------------------------
     Each Gaussian has its own combined covariance
-    (env_cov + robot_cov_g), so the ConvolutionFunctorWarp is
+    (env_cov + robot_cov_g), so the ConvolutionFunctor is
     parameterised differently per Gaussian.  Building one function per
     Gaussian makes the cost evaluation trivially parallelisable and mirrors
     the loop structure of _obstacle_cost() in problem.py exactly.
@@ -316,7 +339,7 @@ def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
     Returns
     -------
     fns       : list of K CasADi functions, one per Gaussian
-    callbacks : ConvolutionFunctorWarp objects (kept alive to avoid GC)
+    callbacks : ConvolutionFunctor objects (kept alive to avoid GC)
     """
     robot_covariances = np.asarray(robot.collision_covariances(), dtype=float)
     n_gaussians       = robot_covariances.shape[0]
@@ -325,16 +348,15 @@ def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
 
     for g in range(n_gaussians):
         x_sym = cas.MX.sym(f"x_stomp_g{g}", 3)
-        pt    = x_sym.T                             # (1, 3) — ConvolutionFunctorWarp expects (n_samples, 3)
+        pt    = x_sym.T                             # (1, 3) — ConvolutionFunctor expects (num_points, 3)
 
         combined_cov     = environment.obstacle_covariances + robot_covariances[g]
         combined_cov_det = np.linalg.det(combined_cov)
         combined_cov_inv = np.linalg.inv(combined_cov)
 
-        conv = ConvolutionFunctorWarp(
+        conv = ConvolutionFunctor(
             f"stomp_conv_g{g}",
-            3,
-            1,                                      # num_samples = 1 (one waypoint at a time)
+            1,                                      # num_points = 1 (one waypoint at a time)
             environment.obstacle_means,
             combined_cov_det,
             combined_cov_inv,
@@ -394,11 +416,16 @@ def _compute_sample_weights(costs: np.ndarray, temperature: float) -> np.ndarray
     """
     Convert per-sample costs to probability weights using the softmin.
 
-        w_k = exp(-h * (Q_k - min Q)) / Σ exp(-h * (Q_k - min Q))
+        w_k = exp(-h * (Q_k - min Q) / (max Q - min Q)) / Σ (...)
 
-    Subtracting min Q before exponentiating prevents numerical underflow
-    when costs are large.  The temperature h controls how sharply the
-    distribution concentrates on the best samples:
+    Costs are shifted by their minimum AND divided by their range, as in
+    Kalakrishnan et al.  The range normalisation is what makes h dimensionless:
+    without it, h carries units of 1/cost, and since these costs are dominated
+    by a jerk term of order 1e4-1e5, any h around 10 collapses the weights onto
+    a single sample and STOMP degenerates into greedy 1-sample random search.
+
+    The temperature h controls how sharply the distribution concentrates on
+    the best samples:
       - Large h  → winner-takes-all (only the best sample matters).
       - Small h  → uniform averaging (all samples contribute equally).
 
@@ -411,9 +438,9 @@ def _compute_sample_weights(costs: np.ndarray, temperature: float) -> np.ndarray
     -------
     weights : (K,)  normalised, sum to 1
     """
-    shifted   = costs - costs.min()
-    log_w     = -temperature * shifted
-    log_w    -= log_w.max()             # numerical stability
+    spread    = float(costs.max() - costs.min())
+    shifted   = (costs - costs.min()) / max(spread, _EPS)
+    log_w     = -temperature * shifted  # already <= 0, so exp cannot overflow
     weights   = np.exp(log_w)
     total     = weights.sum()
     if total < _EPS:
@@ -467,10 +494,21 @@ class STOMPPlanner:
     weights : dict[str, float] | None
         Per-term cost weights: 'obstacle', 'jerk', 'constraint'.
     convergence_tol : float
-        Stop early if ||Δξ|| < tol.
+        Stop early when the total cost fails to improve by more than this
+        much for `patience` consecutive iterations.  It is measured on the
+        cost and not on ||Δξ||, because the step size has a floor set by
+        noise_scale and can never reach a small tolerance however good the
+        trajectory already is.
     noise_scale : float
         Global scaling applied to all sampled noise perturbations.
         Increase if the optimizer is stuck; decrease for fine-tuning.
+    noise_decay : float
+        Per-iteration multiplicative decay of noise_scale.  Without it the
+        exploration never narrows and the trajectory keeps random-walking
+        around the optimum.
+    patience : int
+        Number of consecutive non-improving iterations tolerated before
+        declaring convergence.
     seed : int | None
         Random seed for reproducibility.
     total_time : float
@@ -490,6 +528,8 @@ class STOMPPlanner:
         weights:         dict[str, float] | None = None,
         convergence_tol: float = 1e-4,
         noise_scale:     float = 0.1,
+        noise_decay:     float = 0.99,
+        patience:        int   = 20,
         seed:            int | None = None,
         total_time:      float = 1.0,
     ):
@@ -502,6 +542,8 @@ class STOMPPlanner:
         self.temperature     = float(temperature)
         self.convergence_tol = float(convergence_tol)
         self.noise_scale     = float(noise_scale)
+        self.noise_decay     = float(noise_decay)
+        self.patience        = int(patience)
         self.total_time      = float(total_time)
 
         self.weights = {
@@ -744,6 +786,8 @@ class STOMPPlanner:
         solve_start = perf_counter()
 
         converged              = False
+        best_cost              = np.inf
+        stalled_iters          = 0
         iterations_run         = 0
         final_cost             = np.inf
         final_obstacle_cost    = np.inf
@@ -760,8 +804,10 @@ class STOMPPlanner:
             # noise shape: (K, T, n_dof)
             # Each noise[k] is drawn from N(0, R^{-1}) so it is smooth
             # by construction and has zero mean across samples.
+            decay = self.noise_decay ** iteration
             noise = (
                 self.noise_scale
+                * decay
                 * _sample_noise(self._R_inv, n_dof, self.n_samples, self._rng)
             )
 
@@ -823,9 +869,19 @@ class STOMPPlanner:
             update_norm = float(np.linalg.norm(xi_new - xi))
             xi          = xi_new
 
-            if update_norm < self.convergence_tol:
-                converged = True
-                break
+            # Convergence on the cost, not on the step: ||Δξ|| is bounded
+            # below by the sampled noise, so testing it against a tolerance
+            # like 1e-3 can never succeed.
+            current_cost = self._total_cost(xi)
+
+            if best_cost - current_cost < self.convergence_tol:
+                stalled_iters += 1
+                if stalled_iters >= self.patience:
+                    converged = True
+                    break
+            else:
+                best_cost     = current_cost
+                stalled_iters = 0
 
         # ----------------------------------------------------------
         # Final cost breakdown on the converged mean trajectory
@@ -859,6 +915,17 @@ class STOMPPlanner:
         final_cost     = final_obstacle_cost + final_jerk_cost + final_constraint_cost
         final_update_norm = update_norm
 
+        # The constraint term above is a soft penalty whose weight relative to
+        # the jerk term is arbitrary, so the returned trajectory may well
+        # violate the limits.  Report the uniform time scaling that would make
+        # it feasible, which is comparable across planners.
+        limit_scale, feasible_duration = limit_scaling_factor(
+            xi,
+            duration=self.total_time,
+            joint_groups=self.joint_groups,
+            n_dof=n_dof_final,
+        )
+
         solve_time = perf_counter() - solve_start
         total_time = perf_counter() - total_start
 
@@ -889,8 +956,12 @@ class STOMPPlanner:
                 "n_samples":             self.n_samples,
                 "temperature":           self.temperature,
                 "noise_scale":           self.noise_scale,
+                "noise_decay":           self.noise_decay,
+                "patience":              self.patience,
                 "weights":               self.weights,
                 "dt":                    self.dt,
                 "total_time":            self.total_time,
+                "limit_scale":           limit_scale,
+                "feasible_duration":     feasible_duration,
             },
         )

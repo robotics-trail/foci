@@ -47,9 +47,23 @@ def jerk_cost(
     real_weight: float,
     virtual_weight: float,
 ):
-    """Integrated squared jerk cost, split by real and virtual joints."""
+    """Integrated squared jerk, per joint, split by real and virtual joints.
+
+        cost = weight * mean_over_joints( integral ||d3q/dt3||^2 dt )
+
+    The quadrature weight is dt = duration / (num_samples - 1).  It must NOT
+    be duration**6: `dddcurve` already carries time_scale**3, whose square is
+    ((num_control_points - 3) / duration)**6, so a duration**6 factor cancels
+    the duration exactly and leaves a bare sum of squared parameter-space
+    jerks -- a quantity with no physical units, independent of how long the
+    motion takes and proportional to num_samples.
+
+    Because of that, `weights["jerk"]` and `weights["virtual_jerk"]` are in
+    different units from before this fix and have to be re-tuned.
+    """
     cost = 0.0
-    duration_factor = duration ** 6
+    num_samples = dddcurve.shape[0]
+    duration_factor = duration / max(num_samples - 1, 1)
 
     if real_indices:
         real_jerk = dddcurve[:, real_indices]

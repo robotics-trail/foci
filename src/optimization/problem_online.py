@@ -134,7 +134,11 @@ def _obstacle_cost(
         callbacks.append(convolution)
         cost += convolution(gaussian_points, gaussian_covs, obstacle_points, obstacle_covs)
 
-    return weight * cost / n_gaussians, callbacks
+    # The functor already averages over Gaussians and obstacles for each
+    # sample (num_points == n_gaussians here), so what is left to average over
+    # is the samples.  Dividing by n_gaussians again would divide it out twice
+    # and leave the cost scaling with num_samples.
+    return weight * cost / num_samples, callbacks
 
 
 # ---------------------------------------------------------------------------

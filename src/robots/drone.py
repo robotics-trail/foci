@@ -52,10 +52,14 @@ class DroneRobot(BaseRobot):
 
     The task point is the drone center [x, y, z].
 
-    Collision is represented by body-frame Gaussian points. By default:
-    - center
-    - left arm endpoint
-    - right arm endpoint
+    Collision is represented by body-frame Gaussian points.  The default is a
+    generic quadrotor footprint derived from `arm_length`: the body centre plus
+    the four rotor hubs at (+-arm_length/sqrt(2), +-arm_length/sqrt(2), 0).
+
+    That default is a stand-in, not a model of any particular airframe: pass
+    `gaussian_specs` explicitly to match the real geometry of the URDF being
+    used (urdfs/drone_example.urdf, for instance, has its rotors at
+    (+-0.16, +-0.13, 0) with a 0.13 m radius).
     """
 
     def __init__(
@@ -176,13 +180,34 @@ class DroneRobot(BaseRobot):
         Normalize user-defined drone Gaussian specs.
         """
         if gaussian_specs is None:
-            return [
+            # Generic quadrotor footprint: body centre plus four rotor hubs.
+            # A single centre Gaussian would model the whole airframe as one
+            # small sphere and let the rotors fly through obstacles.
+            reach = self.arm_length / np.sqrt(2.0)
+
+            specs = [
                 DroneGaussian(
                     offset=np.array([0.0, 0.0, 0.0]),
                     covariance=np.eye(3) * 0.1**2,
                     name="center",
-                ),
+                )
             ]
+
+            for sign_x, sign_y, name in (
+                (+1.0, +1.0, "rotor_front_left"),
+                (+1.0, -1.0, "rotor_front_right"),
+                (-1.0, +1.0, "rotor_back_left"),
+                (-1.0, -1.0, "rotor_back_right"),
+            ):
+                specs.append(
+                    DroneGaussian(
+                        offset=np.array([sign_x * reach, sign_y * reach, 0.0]),
+                        covariance=np.eye(3) * 0.06**2,
+                        name=name,
+                    )
+                )
+
+            return specs
 
         parsed = []
 

@@ -1,4 +1,7 @@
 import os
+import sys
+
+from time import perf_counter
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -10,7 +13,13 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
-from src.benchmark.utils import minimum_robot_environment_distance
+from src.benchmark.utils import (
+    jerk_metric,
+    limit_scaling_factor,
+    minimum_robot_environment_distance,
+    path_length,
+    resample_trajectory,
+)
 from src.benchmark.stomp_planner import STOMPPlanner
 from src.benchmark.chomp_planner import CHOMPPlanner
 
@@ -70,6 +79,7 @@ def bonsai_demo():
         max_time=None,   
     ) 
 
+    _t = perf_counter()
     foci_planner = Planner(
         robot=robot,
         environment=environment,
@@ -87,6 +97,9 @@ def bonsai_demo():
         linear_solver="ma27",
     )
 
+    foci_build_time = perf_counter() - _t
+
+    _t = perf_counter()
     stomp_planner = STOMPPlanner(
         robot=robot, 
         environment=environment, 
@@ -98,9 +111,13 @@ def bonsai_demo():
         weights={"obstacle": 1.0, "jerk": 1.0, "constraint": 1.0},
         noise_scale=0.1,
         convergence_tol=1e-3, 
+        seed=42,
         total_time=2.0,
     )
 
+    stomp_build_time = perf_counter() - _t
+
+    _t = perf_counter()
     chomp_planner = CHOMPPlanner(
         robot=robot, 
         environment=environment, 
@@ -109,8 +126,11 @@ def bonsai_demo():
         max_iter=1_000, 
         learning_rate=0.01, 
         weights={"obstacle": 1.0, "smoothness": 1.0},
-        convergence_tol=1e-3,            
+        convergence_tol=1e-3,
+        total_time=2.0,
     )
+
+    chomp_build_time = perf_counter() - _t
 
     foci_result = foci_planner.plan(
         start=theta_start,
@@ -132,28 +152,66 @@ def bonsai_demo():
     )
 
 
-    stomp_min_dist, info = minimum_robot_environment_distance(robot,environment,stomp_result.trajectory)
-    chomp_min_dist, info = minimum_robot_environment_distance(robot,environment,chomp_result.trajectory)
+    # ---- Metrics ------------------------------------------------------
+    # One function per quantity for the three planners, all evaluated at the
+    # same resolution.  Every path and derivative metric is resolution
+    # dependent, and the waypoint planners have nothing finer than their own
+    # waypoints to offer, so num_waypoints is the common ground.
+    metric_samples = 12
 
-    print("\n--- Planning timings STOMP---")
-    print(f"Build:       {stomp_result.timings['build']:.6f} s")
-    print(f"Solver:      {stomp_result.timings['solve']:.6f} s")
-    print(f"Total:       {stomp_result.timings['total']:.6f} s")
-    print(f"Success:     {stomp_result.success}")
+    # Same duration the NLP assumes: ||goal - f_task(start)|| / vmax.
+    foci_duration = max(
+        float(
+            np.linalg.norm(goal - np.asarray(robot.f_task(theta_start)).ravel())
+            / foci_planner.vmax
+        ),
+        1e-3,
+    )
 
-    print("\n--- Planning timings CHOMP---")
-    print(f"Build:       {chomp_result.timings['build']:.6f} s")
-    print(f"Solver:      {chomp_result.timings['solve']:.6f} s")
-    print(f"Total:       {chomp_result.timings['total']:.6f} s")
-    print(f"Success:     {chomp_result.success}")
+    runs = (
+        ("FOCI",  foci_result,  foci_duration,  foci_build_time),
+        ("STOMP", stomp_result, stomp_result.metadata["total_time"], stomp_build_time),
+        ("CHOMP", chomp_result, chomp_result.metadata["total_time"], chomp_build_time),
+    )
 
     print("\n--- Benchmark metrics ---")
-    print(f"Number of environment gaussians: {len(obstacle_means)}")
-    print(f"Number of robot gaussians: {len(gaussian_specs)}")
-    print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
-    print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
+    print(f"Environment gaussians: {len(obstacle_means)}"
+          f"   robot gaussians: {len(gaussian_specs)}"
+          f"   metric samples: {metric_samples}")
+    print(
+        f"{'planner':<7} {'wall [s]':>9} {'min dist [m]':>13} {'length':>9} "
+        f"{'jerk':>11} {'T [s]':>7} {'T feasible':>11} {'x limits':>9} {'success':>8}"
+    )
+    print("-" * 92)
 
-    visualize_stomp = True
+    for name, result, duration, build_time in runs:
+        # Wall time includes construction: FOCI builds its NLP and instantiates
+        # IPOPT inside plan(), while the baselines prepare their CasADi
+        # callbacks and matrices in __init__, so their own `timings` are not
+        # comparable with each other.
+        wall = build_time + result.timings["total"]
+
+        xi = resample_trajectory(result.trajectory, metric_samples)
+        min_dist, _ = minimum_robot_environment_distance(robot, environment, xi)
+        scale, feasible_duration = limit_scaling_factor(
+            xi, duration, joint_groups, robot.n_dof, metric_samples
+        )
+
+        print(
+            f"{name:<7} {wall:9.3f} {min_dist:13.3f} {path_length(xi):9.3f} "
+            f"{jerk_metric(xi, duration, metric_samples):11.3e} {duration:7.2f} "
+            f"{feasible_duration:11.2f} {scale:9.2f} {str(result.success):>8}"
+        )
+
+    print(
+        "\n'T feasible' is the duration each trajectory would need to respect "
+        "wmax/amax;\n'x limits' is the factor over the nominal duration "
+        "(1.00 = already feasible)."
+    )
+
+    # Opt in with --vis: the visualizer loops forever and would
+    # otherwise block the benchmark.
+    visualize_stomp = "--vis" in sys.argv
 
     if visualize_stomp: 
         vis = RobotVisualizer(

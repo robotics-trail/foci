@@ -5,7 +5,7 @@ from src.robots.mobile import MobileRobot, MobileGaussian
 from src.robots.manipulator import ManipulatorRobot, LinkGaussian
 # from src.environment.environment import GaussianEnvironment
 from src.environment.obstacle import StaticObstacle, MobileObstacle
-from src.environment.environment_online import GaussianEnvironmentOnline
+from src.environment.environment import GaussianEnvironmentOnline
 from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner_online import OnlinePlanner
 from src.planning.joints import JointGroups
