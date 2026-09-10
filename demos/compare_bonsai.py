@@ -22,6 +22,7 @@ from scipy.spatial.transform import Rotation as R
 from src.benchmark.comparison import (
     print_metrics,
     run_comparison,
+    save_runs,
     visualize_comparison,
 )
 from src.environment.environment import GaussianEnvironment
@@ -57,8 +58,25 @@ def compare_bonsai(stomp_iters: int = 200, chomp_iters: int = 1000):
         LinkGaussian(7, 0.5, np.eye(3) * 0.1 ** 2),
     ]
 
-    theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
-    goal = np.array([-1.5, 2.25, 0.5])
+    # Start and goal on OPPOSITE sides of the bonsai, both low, so the plant
+    # sits between them and clearing it means lifting the arm.
+    #
+    # Measured on this scene after the transform above: the bonsai spans
+    # x[-1.75, 1.56], y[0.21, 3.51], z[-0.08, 1.85], and 52.5% of the splats
+    # sit in z[-0.10, 0.10) -- that is the wooden table, which is an obstacle
+    # too (unlike coffe_table.py, this scene has no floor filter).  Putting
+    # both end-effector points at z = 0.25, i.e. 25 cm above the table at
+    # x = -/+2.0, leaves a 1.60 m climb to clear the canopy.
+    #
+    # theta_start is an inverse-kinematics solution for [-2.0, 1.8, 0.25],
+    # picked among 280 collision-free branches together with the goal branch
+    # that makes the problem hardest: the naive straight line in configuration
+    # space between them has 10 of 12 waypoints in collision and keeps the
+    # end effector at z in [-0.25, 0.25], ploughing through the pot and the
+    # table instead of going over.  A mirror-image IK pair would have made the
+    # straight line arc over the top on its own and the scene trivial.
+    theta_start = np.array([-0.6433, -0.7384, 1.8594, 1.7848, 1.7889, 1.5122])
+    goal = np.array([2.0, 1.8, 0.25])
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5_extended.urdf",
@@ -112,6 +130,7 @@ def compare_bonsai(stomp_iters: int = 200, chomp_iters: int = 1000):
         ),
     )
 
+    save_runs("bonsai_runs.npz", runs)
     print_metrics("Bonsai", runs, environment, len(gaussian_specs))
 
     if "--vis" in sys.argv:

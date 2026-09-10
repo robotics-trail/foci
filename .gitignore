@@ -191,3 +191,4 @@ coinhsl
 jit_tmp*.c
 tmp_casadi_compiler_shell*.o
 tmp_casadi_compiler_shell*.so
+*.npz

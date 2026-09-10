@@ -127,6 +127,26 @@ def run_comparison(
     return runs
 
 
+def save_runs(path, runs: list[PlannerRun]) -> None:
+    """
+    Save every planner's trajectory and metrics to an .npz.
+
+    A full comparison costs several minutes (STOMP alone is ~2.5 s/iteration on
+    a splat scene), so anything you want to measure afterwards -- smoothness,
+    clearance profiles, a different metric -- should not require re-running it.
+    """
+    import numpy as _np
+
+    payload = {}
+    for r in runs:
+        payload[f"{r.name}_trajectory"] = r.result.trajectory
+        payload[f"{r.name}_metrics"] = _np.array([
+            r.initial_guess_time, r.build_time, r.solve_time, r.min_distance,
+        ])
+    _np.savez_compressed(path, **payload)
+    print(f"trajectories saved to {path}", flush=True)
+
+
 def print_metrics(
     scene: str,
     runs: list[PlannerRun],

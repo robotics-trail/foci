@@ -21,6 +21,7 @@ _DEFAULT_PORT = 8081
 from src.benchmark.comparison import (
     print_metrics,
     run_comparison,
+    save_runs,
     visualize_comparison,
 )
 from src.environment.environment import GaussianEnvironment
@@ -119,6 +120,7 @@ def compare_coffe_table(stomp_iters: int = 200, chomp_iters: int = 1000):
         ),
     )
 
+    save_runs("coffe_table_runs.npz", runs)
     print_metrics("Coffee Table", runs, environment, len(gaussian_specs))
 
     if "--vis" in sys.argv:

@@ -81,6 +81,40 @@ def _build_smoothness_matrix(num_waypoints, dt):
     # No ridge needed: A has full column rank, so A^T A is already invertible.
     return (A.T @ A) / max(dt ** 2, _EPS)
 
+def _build_update_matrix(R_inv: np.ndarray) -> np.ndarray:
+    """
+    STOMP's update projection M (Kalakrishnan et al. 2011, sec. III):
+
+        M = R^-1, with each column scaled so its largest element is 1/N
+
+    and the update is  delta_xi = M @ sum_k w_k * eps_k, not the bare sum.
+
+    Why it is needed: each eps_k is drawn from N(0, R^-1) and so is smooth on
+    its own, but the probability-weighted SUM is not -- the weights depend on
+    the sampled costs, so the average leaves the smooth subspace the samples
+    came from.  M is the low-pass filter that puts it back, and it is the
+    reason the paper's updates keep a trajectory smooth.  Without it nothing
+    constrains the high-frequency content of the step, and the result shows
+    visible kinks (worst at the endpoints, where the finite-difference jerk
+    term is blind).
+
+    Why the column normalisation matters, and why dropping M was a misdiagnosis:
+    a previous version removed the projection because `R_inv @ delta` exploded
+    the step ("row sums ~1,000,000").  Measured, that gain belonged to the
+    SINGULAR (T-2, T) smoothness matrix plus its 1e-6 ridge -- ||R_old^-1||_inf
+    is 1.6e6 for every T -- which commit 26b73fe already fixed.  With the
+    full-rank (T+2, T) operator, ||R^-1||_inf is 3.2 (T=12), 27.6 (T=15),
+    5.3 (T=40), and the paper's normalisation bounds the row sums by 1, giving
+    ||M||_inf <= 0.94.  So the step stays the size of the noise that produced
+    it, and the update comes out ~260x smoother (normalised second differences
+    5.00 -> 0.019 at T=12).
+    """
+    n = R_inv.shape[0]
+    M = np.array(R_inv, dtype=float, copy=True)
+    column_max = M.max(axis=0)
+    return M / np.maximum(column_max, _EPS) / float(n)
+
+
 def _build_precision_inverse(R: np.ndarray) -> np.ndarray:
     """
     Return R^{-1}.
@@ -616,7 +650,8 @@ class STOMPPlanner:
         # It is NOT applied to the update step — see plan() block 3e.
         R           = _build_smoothness_matrix(self.num_waypoints, self.dt)
         self._R     = R
-        self._R_inv = _build_precision_inverse(R)   # kept for noise sampling via cholesky(R_inv)
+        self._R_inv = _build_precision_inverse(R)   # noise sampling via cholesky(R_inv)
+        self._M     = _build_update_matrix(self._R_inv)  # update projection
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -860,22 +895,15 @@ class STOMPPlanner:
             delta_xi = np.einsum("k,ktd->td", weights, noise)           # (T, n_dof)
 
             # ----------------------------------------------------------
-            # 3e. Apply the update  Δξ = Σ_k w_k δξ_k
+            # 3e. Apply the update  Δξ = M · Σ_k w_k δξ_k
             # ----------------------------------------------------------
-            # delta_xi is already smooth because every noise[k] was sampled
-            # from N(0, R^{-1}): low-frequency modes dominate, high-frequency
-            # modes are suppressed by construction.
-            #
-            # We do NOT multiply by R^{-1} here.  R^{-1} has diagonal
-            # values ~25,000 and row sums ~1,000,000 (for T=40, dt=1/39).
-            # Applying it to delta_xi (magnitude ~0.03-0.1 units) would
-            # produce updates of ~100,000 units — exactly the teleportation
-            # bug observed with DroneRobot (DOFs are metres, not radians).
-            #
-            # The noise sampling step (3a) already encodes the smoothness
-            # prior via cholesky(R^{-1}); applying R^{-1} again in the
-            # update would double-count it and explode the step size.
-            xi_new = xi + delta_xi
+            # M is the paper's update projection (see _build_update_matrix).
+            # The probability-weighted noise sum is not smooth by itself --
+            # the weights depend on the costs -- so M is what keeps the
+            # trajectory smooth.  Its column normalisation bounds the step,
+            # which is what an earlier version was missing when it dropped
+            # the projection to stop the update exploding.
+            xi_new = xi + self._M @ delta_xi
 
             # ----------------------------------------------------------
             # 3f. Re-pin endpoints and clip to joint limits
