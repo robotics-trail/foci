@@ -390,8 +390,15 @@ def _obstacle_cost_trajectory(
     For each waypoint t and each robot Gaussian g, we:
       1. Compute the Gaussian's 3-D position via FK (collision_geometry_fn).
       2. Evaluate the convolution cost at that position.
-      3. Sum over waypoints and Gaussians, normalise by n_gaussians
-         (matching the `/ n_gaussians` in _obstacle_cost() of problem.py).
+      3. Average over waypoints, Gaussians and obstacles.
+
+    The average over obstacles comes from the functor itself: it is built with
+    num_points=1, so its normaliser is 1 / n_obstacles.  What is left is the
+    division by n_gaussians AND by T.  Dividing only by n_gaussians -- as this
+    did -- leaves a cost T times larger than problem.py's for the same
+    geometry, which silently made `weights["obstacle"]` mean something T times
+    heavier here than in FOCI and broke the very comparison this planner
+    exists for.  With both divisions, weights["obstacle"] is in FOCI's units.
     """
     T    = xi.shape[0]
     cost = 0.0
@@ -405,7 +412,7 @@ def _obstacle_cost_trajectory(
             c = float(collision_cost_fns[g](pts_np[g]))
             cost += c
 
-    return cost / max(float(n_g), _EPS)
+    return cost / max(float(n_g) * float(T), _EPS)
 
 
 # =============================================================================
@@ -545,6 +552,19 @@ class STOMPPlanner:
         self.noise_decay     = float(noise_decay)
         self.patience        = int(patience)
         self.total_time      = float(total_time)
+
+        # max_iter >= 1 so the optimisation loop runs at least once: the
+        # post-loop cost breakdown reads values the loop body defines.
+        # num_waypoints >= 3 so the finite-difference derivatives and the
+        # (T+2, T) smoothness operator are well defined.
+        if self.max_iter < 1:
+            raise ValueError(f"max_iter must be at least 1, got {self.max_iter}.")
+        if self.num_waypoints < 3:
+            raise ValueError(
+                f"num_waypoints must be at least 3, got {self.num_waypoints}."
+            )
+        if self.n_samples < 1:
+            raise ValueError(f"n_samples must be at least 1, got {self.n_samples}.")
 
         self.weights = {
             "obstacle":   1.0,
@@ -794,6 +814,9 @@ class STOMPPlanner:
         final_jerk_cost        = np.inf
         final_constraint_cost  = np.inf
         final_update_norm      = np.inf
+        # Defined before the loop: the post-loop breakdown reads it, and it
+        # would be an unbound local if the loop body never ran.
+        update_norm            = np.inf
 
         for iteration in range(self.max_iter):
             iterations_run = iteration + 1
@@ -919,11 +942,17 @@ class STOMPPlanner:
         # the jerk term is arbitrary, so the returned trajectory may well
         # violate the limits.  Report the uniform time scaling that would make
         # it feasible, which is comparable across planners.
+        # num_samples=self.num_waypoints, NOT the default 200: the metric is
+        # resolution dependent (see src/benchmark/utils.py) and leaving the
+        # default inflates the scale by ~3x on a 12-waypoint trajectory, so
+        # this metadata would contradict the benchmark table, which passes
+        # num_waypoints.
         limit_scale, feasible_duration = limit_scaling_factor(
             xi,
             duration=self.total_time,
             joint_groups=self.joint_groups,
             n_dof=n_dof_final,
+            num_samples=self.num_waypoints,
         )
 
         solve_time = perf_counter() - solve_start

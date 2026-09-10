@@ -1,9 +1,8 @@
-import os
-
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from src.utils.ply import extract_splat_data_2
+from src.utils.paths import data_path
 from src.robots.drone import DroneRobot, DroneGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
@@ -14,8 +13,7 @@ from src.benchmark.utils import minimum_robot_environment_distance
 
 def forest_demo():
     
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ply_file = os.path.join(PROJECT_ROOT, "data/Forest.ply")
+    ply_file = data_path("Forest.ply")
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 
@@ -34,10 +32,16 @@ def forest_demo():
     theta_start = np.array([0.0, -3.0, 1.0, 0.0])
     goal = np.array([14.0, 5.0, 3.5])
 
+    # xyz_limits are REQUIRED here, not optional: with the default
+    # (-inf, +inf) the RRT* initializer has to substitute an artificial box
+    # around the start, and RRT* samples its state space uniformly, so the
+    # tree never gets near the goal.  This box covers the scene (obstacles are
+    # scaled x10 and translated by [8, 0, 0]) plus the start and the goal.
     robot = DroneRobot(
         urdf_path="urdfs/drone_example.urdf",
         arm_length=0.15,
         gaussian_specs=gaussian_specs,
+        xyz_limits=[(-4.0, 20.0), (-8.0, 10.0), (0.0, 8.0)],
     )
 
     joint_groups = JointGroups(

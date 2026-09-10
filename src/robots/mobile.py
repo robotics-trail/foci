@@ -58,7 +58,7 @@ class MobileRobot(BaseRobot):
         urdf_path: str,
         body_center_height: float = 1.0,
         gaussian_specs: list[MobileGaussian | dict | tuple] | None = None,
-        xy_limits: list[tuple[float, float]] =  [(-np.inf, np.inf), (-np.inf, np.inf)],
+        xy_limits: list[tuple[float, float]] | None = None,
         yaw_limits: tuple[float, float] = (-np.pi, np.pi),
     ):
         if body_center_height <= 0:
@@ -68,8 +68,21 @@ class MobileRobot(BaseRobot):
         self.body_center_height = float(body_center_height)
         self.gaussian_specs = self._parse_gaussian_specs(gaussian_specs)
 
+        # Built here rather than as a default argument: a list literal in the
+        # signature is one object shared by every instance.
+        if xy_limits is None:
+            xy_limits = [(-np.inf, np.inf)] * 2
+
+        xy_limits = [(float(lo), float(hi)) for lo, hi in xy_limits]
+
+        if len(xy_limits) != 2:
+            raise ValueError(
+                f"xy_limits must contain 2 (lower, upper) pairs, got "
+                f"{len(xy_limits)}."
+            )
+
         self.xy_limits = xy_limits
-        self.yaw_limits = yaw_limits
+        self.yaw_limits = (float(yaw_limits[0]), float(yaw_limits[1]))
 
     @property
     def n_dof(self) -> int:

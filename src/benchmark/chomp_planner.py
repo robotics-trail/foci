@@ -455,11 +455,17 @@ class CHOMPPlanner:
         # trajectory it returns is not dynamically feasible in general.
         # Report the uniform time scaling that would make it feasible, so it
         # can be compared against a planner that enforces the limits.
+        # num_samples=self.num_waypoints, NOT the default 200: the metric is
+        # resolution dependent (see src/benchmark/utils.py) and leaving the
+        # default inflates the scale by ~3x on a 12-waypoint trajectory, so
+        # this metadata would contradict the benchmark table, which passes
+        # num_waypoints.
         limit_scale, feasible_duration = limit_scaling_factor(
             xi,
             duration=self.total_time,
             joint_groups=self.joint_groups,
             n_dof=int(xi.shape[1]),
+            num_samples=self.num_waypoints,
         )
 
         return PlanningResult(

@@ -59,9 +59,7 @@ def drone_demo():
         random_seed=10,
         max_time=None,   
 )
-    rrt_result = initializer.initialize(robot, environment, theta_start, goal, num_control_points=40)
-    
-    
+
     planner = Planner(
         robot=robot,
         environment=environment,

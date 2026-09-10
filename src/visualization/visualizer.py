@@ -33,6 +33,7 @@ class RobotVisualizer:
         follow_camera: bool = False,
         camera_offset: np.ndarray | None = None,
         camera_lookahead: float = 0.5,
+        port: int | None = None,
     ):
         trajectory = np.asarray(trajectory, dtype=float)
 
@@ -61,7 +62,9 @@ class RobotVisualizer:
         self.camera_lookahead = float(camera_lookahead)
 
 
-        self.server = ViserServer()
+        # `port` lets several scenes be served at once (viser defaults to 8080,
+        # so two visualizers in one session would collide on it).
+        self.server = ViserServer() if port is None else ViserServer(port=int(port))
         self.robot_urdf = robot.urdf_path
 
         self._ellipsoid_faces = self._create_ellipsoid_faces()
@@ -470,6 +473,7 @@ class RobotVisualizerOnline:
         follow_camera: bool = False,
         camera_offset: np.ndarray | None = None,
         camera_lookahead: float = 0.5,
+        port: int | None = None,
     ):
         trajectory = np.asarray(trajectory, dtype=float)
 
@@ -498,7 +502,9 @@ class RobotVisualizerOnline:
         self.camera_lookahead = float(camera_lookahead)
 
 
-        self.server = ViserServer()
+        # `port` lets several scenes be served at once (viser defaults to 8080,
+        # so two visualizers in one session would collide on it).
+        self.server = ViserServer() if port is None else ViserServer(port=int(port))
         self.robot_urdf = robot.urdf_path
 
         self._ellipsoid_faces = self._create_ellipsoid_faces()

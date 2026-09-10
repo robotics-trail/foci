@@ -123,7 +123,15 @@ def build_problem(
     bspline = BSpline(control_points)
     curve   = bspline.spline_eval(num_samples)
 
-    start_task         = robot.f_task(curve[0, :])
+    # f_task(start), NOT f_task(curve[0, :]).  The start equality constraint
+    # forces curve[0, :] == start at the solution, so the two agree there, but
+    # going through curve[0, :] makes `estimated_duration` -- and therefore
+    # `time_scale` -- a nonlinear function of the decision variables.  That
+    # turns every MINVO velocity/acceleration hull constraint nonlinear and the
+    # jerk cost non-quadratic for no gain.  Through the `start` parameter,
+    # time_scale is a constant of the solve and the hull constraints stay
+    # linear in the control points.
+    start_task         = robot.f_task(start)
     estimated_duration = estimate_duration(goal, start_task, vmax)
 
     # A uniform cubic B-spline with N control points spans N - 3 segments

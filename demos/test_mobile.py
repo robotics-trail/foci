@@ -31,7 +31,13 @@ def mobile_demo():
 
 
     theta_start = np.array([0.0, 0.0, 0.0])
-    goal = np.array([4.0, 3.0, 0.5])
+
+    # The goal z MUST equal body_center_height below: MobileRobot.f_task
+    # returns [x, y, body_center_height], so any other z is unreachable by
+    # construction -- distanceGoal never drops under goal_threshold, the RRT*
+    # goal region can never be satisfied, and the goal cost keeps an
+    # irreducible residual of (body_center_height - goal_z)^2.
+    goal = np.array([4.0, 3.0, 1.0])
 
     robot = MobileRobot(
         urdf_path="urdfs/anymal.urdf",

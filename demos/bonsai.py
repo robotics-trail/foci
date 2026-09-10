@@ -1,9 +1,8 @@
-import os
-
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from src.utils.ply import extract_splat_data_2
+from src.utils.paths import data_path
 from src.robots.manipulator import ManipulatorRobot, LinkGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
@@ -14,8 +13,7 @@ from src.benchmark.utils import minimum_robot_environment_distance
 
 
 def bonsai_demo():
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ply_file = os.path.join(PROJECT_ROOT, "data", "Bonsai.ply")
+    ply_file = data_path("Bonsai.ply")
     
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 

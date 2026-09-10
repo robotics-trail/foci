@@ -98,19 +98,15 @@ class URDFBackend:
 
         self.link_fk_funcs, self.link_joint_counts = self._build_link_fk_cache()
 
-        # Informational only: the offset is applied exclusively to the tip (see
-        # link_positions).  Baking it into every link would make link_positions()[i]
-        # the *distal end* of link i instead of its origin, which shifts every
-        # collision segment one link outwards.
-        self.link_offsets: dict[str, cas.DM] = {
-            link_name: self._compute_visual_offset(
-                self.parser.robot_desc.link_map.get(link_name)
-            )
-            for link_name in self.links
-        }
-
-        self.tip_link_object = self.parser.robot_desc.link_map.get(self.tip_link)
-        self.ee_offset = self.link_offsets[self.tip_link]
+        # Only the tip gets a visual offset.  link i's body is bracketed by
+        # link i's origin and link i+1's origin (see link_positions), and the
+        # tip is the one link with no "next origin"; baking the offset into
+        # every link would make link_positions()[i] the *distal end* of link i
+        # instead of its origin, shifting every collision segment one link
+        # outwards.  The per-link dict this used to build was never read.
+        self.ee_offset = self._compute_visual_offset(
+            self.parser.robot_desc.link_map.get(self.tip_link)
+        )
 
 
     def _build_link_fk_cache(self) -> tuple[dict[str, Any], dict[str, int]]:
@@ -231,20 +227,27 @@ class URDFBackend:
             if origin.rpy is not None:
                 origin_rpy = np.array(origin.rpy)
 
+        if hasattr(geometry, "filename"):
+            # A mesh gives us nothing to measure: its extent lives in the mesh
+            # file, and its visual <origin> xyz is a placement transform for
+            # the mesh, not a distance along the link.  Returning that
+            # placement (which is what this used to do) puts the tip point at
+            # an arbitrary spot -- for urdfs/ur5/ur5.urdf's wrist_3_link it is
+            # [0, 0, -0.3272], i.e. 33 cm off the link frame in -z, and that
+            # is where f_task claimed the end effector was.  Zero at least
+            # means "the tip frame origin", and a Gaussian placed on a
+            # zero-offset tip is rejected by
+            # ManipulatorRobot._validate_tip_gaussians instead of silently
+            # collapsing.
+            return cas.DM([0.0, 0.0, 0.0])
+
         rotation = self._rpy_to_matrix(*origin_rpy)
 
         # Shape-local offset, expressed in the *unrotated* geometry frame
         # (i.e. before applying the visual origin's own rpy).
         shape_offset = np.zeros(3)
 
-        if hasattr(geometry, "filename"):
-            # We cannot infer the true mesh centroid from the URDF alone
-            # (would require loading and analyzing the mesh file itself).
-            # `scale` only rescales mesh vertices, it must NOT be applied
-            # to the origin translation.
-            shape_offset = np.zeros(3)
-
-        elif hasattr(geometry, "length"):
+        if hasattr(geometry, "length"):
             length = geometry.length or 0.0
             shape_offset = np.array([0.0, 0.0, length / 2.0])
 

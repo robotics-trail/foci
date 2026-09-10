@@ -191,6 +191,16 @@ class BasePlanner(ABC):
         )
         x0 = np.asarray(x0, dtype=float).reshape(-1, order="F")
 
+        lbx, ubx = self._variable_bounds()
+
+        if lbx is not None:
+            # The initializer knows nothing about the joint limits -- the
+            # RRT* least-squares fit in particular can overshoot past the
+            # extremes of the path it is fitting -- so an unclipped guess can
+            # start outside its own bounds.  IPOPT would silently drag it
+            # inside; clipping here keeps the guess we actually chose.
+            x0 = np.clip(x0, lbx, ubx)
+
         # --- Solve NLP -----------------------------------------------
         solve_start = perf_counter()
 
@@ -200,8 +210,6 @@ class BasePlanner(ABC):
             "lbg": lbg,
             "ubg": ubg,
         }
-
-        lbx, ubx = self._variable_bounds()
 
         if lbx is not None:
             solver_arguments["lbx"] = lbx

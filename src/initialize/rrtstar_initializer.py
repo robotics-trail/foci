@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+import warnings
+
 from time import perf_counter
 from typing import Optional
 
@@ -19,6 +21,29 @@ from src.initialize.initializer import InitializerResult, PathInitializer
 # The fit must be over-determined, otherwise the spline interpolates the path
 # and can overshoot around corners.
 _PATH_SAMPLES_PER_CONTROL_POINT: int = 5
+
+# Wall-clock budget used when `max_time` is None.  The search MUST be bounded:
+# whenever RRT* stores no solution at all -- an invalid start state (a start
+# configuration in collision) reports "Invalid start" on every call -- the old
+# `while True` with max_time=None spun forever with no diagnostic.  Measured
+# with ompl 1.7.0.
+_DEFAULT_MAX_TIME: float = 10.0
+
+# Half-width of the artificial box substituted for an infinite joint limit,
+# centred on the start configuration.  RRT* samples its state space uniformly,
+# so an enormous box (the old +-1e6 clamp gave a 2e6-wide one) destroys the
+# sampling density and the tree never gets anywhere near the goal.
+_DEFAULT_UNBOUNDED_RADIUS: float = 50.0
+
+# RRT* keeps the tree node closest to the goal as its approximate solution and
+# replaces it only when it finds a better one.  Once that distance stops
+# improving the search has plateaued and sitting out the rest of the budget
+# only burns wall time: the returned path will not change.  Waiting out the
+# full budget on a goal_threshold that is effectively unreachable cost ~10 s on
+# every call, where the previous code returned this same path after one slice
+# (mislabelled as an exact success).  Plateauing has to be just as cheap.
+_DEFAULT_APPROXIMATE_PATIENCE: int = 2
+_DEFAULT_IMPROVEMENT_TOL: float = 1e-4
 
 
 def fit_control_points(
@@ -51,6 +76,12 @@ def fit_control_points(
     regularization : float, default=1e-9
         Tikhonov term keeping the normal equations non-singular.
 
+    Raises
+    ------
+    ValueError
+        If there are fewer path samples than control points, i.e. if the fit
+        would be under-determined.
+
     Returns
     -------
     np.ndarray
@@ -58,6 +89,20 @@ def fit_control_points(
     """
     path_points = np.asarray(path_points, dtype=float)
     start = np.asarray(start, dtype=float).reshape(1, -1)
+
+    if path_points.ndim != 2:
+        raise ValueError(
+            f"path_points must have shape (num_path_samples, n_dof), got "
+            f"{path_points.shape}."
+        )
+
+    if path_points.shape[0] < num_control_points:
+        raise ValueError(
+            f"{path_points.shape[0]} path samples cannot determine "
+            f"{num_control_points} control points: the least-squares fit would "
+            "be rank deficient and the result dominated by `regularization`. "
+            "Interpolate the path to at least num_control_points samples first."
+        )
 
     n_dof = path_points.shape[1]
 
@@ -106,12 +151,54 @@ class RRTStarInitializer(PathInitializer):
     drone, or future mobile robot.
     """
 
-    def __init__(self, voxel_size: float = 0.10, goal_threshold: float = 0.01, random_seed: Optional[int] = 42, check_interval: float = 0.2, max_time: float | None = None):
-        
+    def __init__(
+        self,
+        voxel_size: float = 0.10,
+        goal_threshold: float = 0.01,
+        random_seed: Optional[int] = 42,
+        check_interval: float = 0.2,
+        max_time: float | None = None,
+        unbounded_radius: float = _DEFAULT_UNBOUNDED_RADIUS,
+        approximate_patience: int = _DEFAULT_APPROXIMATE_PATIENCE,
+        improvement_tol: float = _DEFAULT_IMPROVEMENT_TOL,
+    ):
+        """
+        Parameters
+        ----------
+        voxel_size:
+            Resolution of the occupancy grid built from the obstacle means.
+        goal_threshold:
+            Task-space radius accepted as reaching the goal.  Keep it loose:
+            the goal region is not sampleable (see TaskSpaceGoal), so RRT* has
+            to hit it by chance.
+        random_seed:
+            Seed for OMPL's global RNG. None leaves it untouched.
+        check_interval:
+            Length of one planner.solve() slice, in seconds.
+        max_time:
+            Wall-clock budget for the search, in seconds.  None means
+            `_DEFAULT_MAX_TIME`; it does NOT mean "unbounded".  When the budget
+            expires the best approximate path found so far is returned and
+            `InitializerResult.success` is False.
+        unbounded_radius:
+            Half-width of the box substituted for an infinite joint limit,
+            centred on the start configuration.  Prefer declaring real limits
+            on the robot over relying on this.
+        approximate_patience:
+            Give up after this many consecutive `check_interval` slices in
+            which the approximate solution's distance to the goal did not
+            improve.  This is what keeps a tight, unreachable goal_threshold
+            from costing the whole `max_time` on every call.
+        improvement_tol:
+            Distance-to-goal improvement below which a slice counts as stalled.
+        """
         self.voxel_size: float = voxel_size
         self.goal_threshold: float = goal_threshold
         self.check_interval: float = check_interval
-        self.max_time: float = max_time
+        self.max_time: float | None = max_time
+        self.unbounded_radius: float = float(unbounded_radius)
+        self.approximate_patience: int = int(approximate_patience)
+        self.improvement_tol: float = float(improvement_tol)
 
         if random_seed is not None:
             ou.RNG.setSeed(random_seed)
@@ -129,7 +216,7 @@ class RRTStarInitializer(PathInitializer):
         self.robot = robot
         self.environment = environment
         self.n_dof = robot.n_dof
-        self.joint_limits = self._joint_limits(robot)
+        self.joint_limits = self._joint_limits(robot, start)
         self.occupancy_map = self._build_occupancy_map(
             environment.obstacle_means_at(0),
             self.voxel_size,
@@ -144,7 +231,7 @@ class RRTStarInitializer(PathInitializer):
             threshold=self.goal_threshold,
         )
 
-        path_points, success = self._solve_until_solution(
+        path_points, exact = self._solve_until_solution(
             space_info=space_info,
             start_state=start_state,
             goal_region=goal_region,
@@ -153,10 +240,16 @@ class RRTStarInitializer(PathInitializer):
 
         t1 = perf_counter()
 
-        if path_points is None:
+        # `exact` is what `success` reports.  An approximate path -- the tree
+        # node that happened to end up closest to the goal -- is still a much
+        # better warm start than a constant guess, so it is used, but it must
+        # never be reported as a solved planning problem.
+        success = exact
+        fitted = path_points is not None and path_points.shape[0] >= num_control_points
+
+        if not fitted:
             # Constant guess: every control point equal, so curve(0) == start.
             control_points = np.tile(start, (num_control_points, 1))
-            success = False
         else:
             control_points = fit_control_points(
                 path_points,
@@ -177,6 +270,10 @@ class RRTStarInitializer(PathInitializer):
                 "type": "rrtstar",
                 "max_time": self.max_time,
                 "check_interval": self.check_interval,
+                "exact_solution": exact,
+                "search_seconds": t1 - t0,
+                "path_samples": 0 if path_points is None else int(path_points.shape[0]),
+                "fitted_to_path": bool(fitted),
             },
         )
     
@@ -187,7 +284,23 @@ class RRTStarInitializer(PathInitializer):
         goal_region: ob.GoalRegion,
         num_control_points: int,
     ) -> tuple[np.ndarray | None, bool]:
-        """Run RRT* and return the solution path as an array of samples."""
+        """Run RRT* and return (path samples, exact).
+
+        `exact` distinguishes a path that actually reaches the goal region from
+        an approximate one.  The truthiness of OMPL's PlannerStatus does NOT:
+        measured with ompl 1.7.0, an APPROXIMATE_SOLUTION gives
+        `bool(status) == True`, so the previous `if solved: return path, True`
+        reported the tree node that merely ended up closest to the goal as a
+        solved problem.  `ProblemDefinition.hasExactSolution()` is the query
+        that separates the two.
+
+        The loop ends on the first of three conditions: an exact solution, an
+        approximate solution that has stopped improving for
+        `approximate_patience` slices, or the `max_time` budget.  The middle one
+        is what keeps the honest reporting cheap; the last one is what makes
+        termination unconditional, including when RRT* produces nothing at all
+        (an invalid start state) -- the case where the old loop spun forever.
+        """
         problem = ob.ProblemDefinition(space_info)
         problem.addStartState(start_state)
         problem.setGoal(goal_region)
@@ -196,21 +309,44 @@ class RRTStarInitializer(PathInitializer):
         planner.setProblemDefinition(problem)
         planner.setup()
 
+        budget = _DEFAULT_MAX_TIME if self.max_time is None else float(self.max_time)
         t0 = perf_counter()
+        best_approximate = np.inf
+        stalled_slices = 0
 
         while True:
-            solved = planner.solve(self.check_interval)
+            planner.solve(self.check_interval)
 
-            if solved:
-                path = problem.getSolutionPath()
-                path.interpolate(
-                    _PATH_SAMPLES_PER_CONTROL_POINT * num_control_points
-                )
-                return self._path_to_numpy(path), True
+            exact = bool(problem.hasExactSolution())
 
-            if self.max_time is not None:
-                if perf_counter() - t0 >= self.max_time:
-                    return None, False
+            if not exact:
+                if problem.hasSolution():
+                    approximate = float(problem.getSolutionDifference())
+
+                    if best_approximate - approximate > self.improvement_tol:
+                        best_approximate = approximate
+                        stalled_slices = 0
+                    else:
+                        stalled_slices += 1
+
+                plateaued = stalled_slices >= self.approximate_patience
+                expired = perf_counter() - t0 >= budget
+
+                if not plateaued and not expired:
+                    continue
+
+            if not problem.hasSolution():
+                return None, False
+
+            path = problem.getSolutionPath()
+
+            # PathGeometric.interpolate() only ever ADDS states, and does
+            # nothing at all on a path of fewer than two states, so the caller
+            # still has to check the returned count.
+            path.interpolate(
+                _PATH_SAMPLES_PER_CONTROL_POINT * num_control_points
+            )
+            return self._path_to_numpy(path), exact
 
     def _setup_space(self):
         space = ob.RealVectorStateSpace(self.n_dof)
@@ -230,11 +366,31 @@ class RRTStarInitializer(PathInitializer):
 
         return space, space_info
 
-    def _joint_limits(self, robot) -> list[tuple[float, float]]:
+    def _joint_limits(self, robot, start: np.ndarray) -> list[tuple[float, float]]:
+        """
+        Finite per-joint bounds for the OMPL state space.
+
+        ob.RealVectorBounds cannot hold an infinity, so an unbounded joint has
+        to be replaced by an artificial box.  It is centred on the start
+        configuration and only `unbounded_radius` wide, NOT the +-1e6 this used
+        to substitute: RRT* samples its state space uniformly, so a 2e6-wide
+        box makes every sample land astronomically far from the scene and the
+        tree never approaches the goal.  Substituting a bound is still a guess,
+        so it warns -- declare real limits on the robot instead.
+        """
+        start = np.asarray(start, dtype=float).reshape(-1)
+
+        if start.shape[0] != robot.n_dof:
+            raise ValueError(
+                f"start has {start.shape[0]} entries for n_dof={robot.n_dof}."
+            )
+
         limits = robot.joint_limits()
 
         if limits is None:
-            return [(-np.inf, np.inf) for _ in range(robot.n_dof)]
+            limits = [(-np.inf, np.inf) for _ in range(robot.n_dof)]
+
+        limits = list(limits)
 
         if len(limits) != robot.n_dof:
             raise ValueError(
@@ -243,11 +399,36 @@ class RRTStarInitializer(PathInitializer):
             )
 
         clean_limits = []
+        substituted = []
 
-        for lower, upper in limits:
-            lower = -1e6 if np.isneginf(lower) else lower
-            upper = 1e6 if np.isposinf(upper) else upper
+        for joint_idx, (lower, upper) in enumerate(limits):
+            lower = float(lower)
+            upper = float(upper)
+            was_infinite = False
+
+            if np.isneginf(lower):
+                lower = start[joint_idx] - self.unbounded_radius
+                was_infinite = True
+
+            if np.isposinf(upper):
+                upper = start[joint_idx] + self.unbounded_radius
+                was_infinite = True
+
+            if was_infinite:
+                substituted.append(joint_idx)
+
             clean_limits.append((lower, upper))
+
+        if substituted:
+            warnings.warn(
+                f"{type(robot).__name__} declares no finite limits for joints "
+                f"{substituted}; RRT* will sample "
+                f"start +- {self.unbounded_radius} on them. Pass explicit "
+                "limits (e.g. xyz_limits / xy_limits) covering the scene, "
+                "otherwise the initial guess will be poor.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         return clean_limits
 
@@ -321,6 +502,13 @@ class RRTStarInitializer(PathInitializer):
 class TaskSpaceGoal(ob.GoalRegion):
     """
     OMPL goal region defined through robot.f_task(q).
+
+    This is an ob.GoalRegion and NOT an ob.GoalSampleableRegion: sampling a
+    configuration that puts f_task(q) on the goal would need inverse
+    kinematics.  RRT* therefore cannot goal-bias towards it and only satisfies
+    it by landing inside `threshold` by chance, which is why the search has to
+    be time-bounded and why an approximate result is the normal outcome for a
+    tight threshold.
     """
 
     def __init__(

@@ -67,7 +67,7 @@ class DroneRobot(BaseRobot):
         urdf_path: str,
         arm_length: float = 0.15,
         gaussian_specs: list[DroneGaussian | dict | tuple] | None = None,
-        xyz_limits: list[tuple[float, float]] =  [(-np.inf, np.inf), (-np.inf, np.inf), (-np.inf, np.inf)],
+        xyz_limits: list[tuple[float, float]] | None = None,
         yaw_limits: tuple[float, float] = (-np.pi, np.pi),
     ):
         if arm_length <= 0:
@@ -77,8 +77,21 @@ class DroneRobot(BaseRobot):
         self.arm_length = float(arm_length)
         self.gaussian_specs = self._parse_gaussian_specs(gaussian_specs)
 
+        # Built here rather than as a default argument: a list literal in the
+        # signature is one object shared by every instance.
+        if xyz_limits is None:
+            xyz_limits = [(-np.inf, np.inf)] * 3
+
+        xyz_limits = [(float(lo), float(hi)) for lo, hi in xyz_limits]
+
+        if len(xyz_limits) != 3:
+            raise ValueError(
+                f"xyz_limits must contain 3 (lower, upper) pairs, got "
+                f"{len(xyz_limits)}."
+            )
+
         self.xyz_limits = xyz_limits
-        self.yaw_limits = yaw_limits
+        self.yaw_limits = (float(yaw_limits[0]), float(yaw_limits[1]))
 
     @property
     def n_dof(self) -> int:

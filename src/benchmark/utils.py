@@ -3,9 +3,23 @@
 Everything a benchmark script compares across planners lives here, so the
 three planners are measured with one function instead of each reporting its
 own internal cost in its own units.
-"""
 
-from time import perf_counter
+Resolution is part of every derivative metric here
+--------------------------------------------------
+`jerk_metric` and `limit_scaling_factor` both resample to `num_samples` and
+then take finite differences.  A planner's output is a POLYLINE, so its second
+and third derivatives are impulses at the corners and any finite-difference
+estimate of them grows without bound as `num_samples` grows.  Measured on a
+12-waypoint trajectory:
+
+    num_samples   12     25     50    100    200
+    max|acc|    17.1   20.0   43.9   93.0  170.0
+
+Every planner in a comparison must therefore be measured at the SAME
+`num_samples`, and that value must be the coarsest representation involved
+(a waypoint planner has nothing finer to offer).  Pass the benchmark's
+`num_waypoints` explicitly -- never rely on the default.
+"""
 
 import numpy as np
 
@@ -29,6 +43,12 @@ def resample_trajectory(trajectory, num_samples: int) -> np.ndarray:
         raise ValueError(
             f"trajectory must be a 2D array of shape (N, D), got {trajectory.shape}."
         )
+    if trajectory.shape[0] < 2:
+        raise ValueError(
+            f"trajectory must contain at least two points, got {trajectory.shape[0]}."
+        )
+    if num_samples < 2:
+        raise ValueError(f"num_samples must be at least 2, got {num_samples}.")
     if trajectory.shape[0] == num_samples:
         return trajectory.copy()
 
@@ -40,9 +60,24 @@ def resample_trajectory(trajectory, num_samples: int) -> np.ndarray:
     ).T
 
 
+_MIN_DERIVATIVE_SAMPLES: int = 3
+
+
 def _central_derivative(xi: np.ndarray, dt: float, order: int) -> np.ndarray:
-    """Central finite differences of a waypoint trajectory, edges replicated."""
+    """Central finite differences of a waypoint trajectory, edges replicated.
+
+    Needs at least three rows: a central difference consumes one row at each
+    end, and with two rows `inner` comes out empty, which collapses the result
+    to shape (0, D) and every later `.max()` raises "zero-size array to
+    reduction operation" from somewhere unrelated.  Fail here instead.
+    """
     d = np.asarray(xi, dtype=float)
+
+    if d.shape[0] < _MIN_DERIVATIVE_SAMPLES:
+        raise ValueError(
+            f"a central derivative needs at least {_MIN_DERIVATIVE_SAMPLES} "
+            f"samples, got {d.shape[0]}."
+        )
 
     for _ in range(order):
         inner = (d[2:] - d[:-2]) / (2.0 * max(dt, _EPS))
@@ -72,6 +107,12 @@ def jerk_metric(trajectory, duration: float, num_samples: int = 200) -> float:
     This is deliberately NOT any planner's internal cost: those are in
     different units and are not comparable with each other.
     """
+    if num_samples < _MIN_DERIVATIVE_SAMPLES:
+        raise ValueError(
+            f"num_samples must be at least {_MIN_DERIVATIVE_SAMPLES}, got "
+            f"{num_samples}."
+        )
+
     xi = resample_trajectory(trajectory, num_samples)
     dt = float(duration) / max(num_samples - 1, 1)
     jerk = _central_derivative(xi, dt, order=3)
@@ -100,11 +141,24 @@ def limit_scaling_factor(
     arbitrary) can then be compared on equal footing: the returned duration is
     how long each one actually needs to be executable.
 
+    `num_samples` is part of the metric, exactly as in `jerk_metric`: the
+    acceleration of a polyline is an impulse at every corner, so max|acc| --
+    and with it the returned scale -- grows with the resampling resolution.
+    Always pass the benchmark's `num_waypoints`; leaving the default 200 on a
+    12-waypoint trajectory inflates the scale by roughly 3x (see the module
+    docstring).
+
     Returns
     -------
     (scale, feasible_duration)
         `scale` is 1.0 when the trajectory already satisfies the limits.
     """
+    if num_samples < _MIN_DERIVATIVE_SAMPLES:
+        raise ValueError(
+            f"num_samples must be at least {_MIN_DERIVATIVE_SAMPLES}, got "
+            f"{num_samples}."
+        )
+
     xi = resample_trajectory(trajectory, num_samples)
     dt = float(duration) / max(num_samples - 1, 1)
 
@@ -141,25 +195,6 @@ def limit_scaling_factor(
     return scale, scale * float(duration)
 
 
-def timed_plan(make_planner, **plan_kwargs):
-    """
-    Build a planner and run it, timing both phases together.
-
-    Each planner splits its own work differently between __init__ and plan()
-    -- FOCI builds its NLP and instantiates IPOPT inside plan(), while the
-    baselines prepare their CasADi callbacks and matrices in __init__ -- so
-    the per-planner `timings` are not comparable with each other.  This wall
-    time is.
-
-    Returns
-    -------
-    (result, wall_seconds, planner)
-    """
-    t0 = perf_counter()
-    planner = make_planner()
-    result = planner.plan(**plan_kwargs)
-
-    return result, perf_counter() - t0, planner
 def path_length(trajectory) -> float:
     """
     Compute the length of a trajectory as the sum of the Euclidean

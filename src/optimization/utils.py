@@ -181,31 +181,6 @@ def build_constraints(
 # ---------------------------------------------------------------------------
 
 
-def build_spline_quantities(bspline, num_samples: int, time_scale):
-    """Return the curve and its first three time-scaled derivatives.
-
-    Parameters
-    ----------
-    bspline:
-        A BSpline instance constructed from the control-point symbolic variable.
-    num_samples:
-        Number of evaluation points along the spline.
-    time_scale:
-        Symbolic or numeric scalar converting spline-parameter units (segments)
-        to real time, i.e. num_segments / duration with
-        num_segments = num_control_points - 3.
-
-    Returns
-    -------
-    curve, dcurve, ddcurve, dddcurve
-    """
-    curve = bspline.spline_eval(num_samples)
-    dcurve   = time_scale       * bspline.spline_eval(num_samples, derivative_order=1)
-    ddcurve  = time_scale ** 2  * bspline.spline_eval(num_samples, derivative_order=2)
-    dddcurve = time_scale ** 3  * bspline.spline_eval(num_samples, derivative_order=3)
-    return curve, dcurve, ddcurve, dddcurve
-
-
 def estimate_duration(goal, start_task, vmax: float):
     """Symbolic estimate of trajectory duration from distance and max velocity."""
     duration = cas.norm_2(goal - start_task) / vmax

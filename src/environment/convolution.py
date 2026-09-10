@@ -14,6 +14,15 @@ import casadi as cas
  
 PI_CUBIC: float = math.sqrt((2.0 * math.pi) ** 3)
 EPS = 1e-9
+
+# Every kernel below reduces over a (num_points, num_obstacles) thread grid with
+# wp.atomic_add, whose summation order is not reproducible.  The per-term maths
+# stays in float32 (that is the precision of the uploaded splat data), but the
+# ACCUMULATORS are float64.  Measured on 2e5 obstacles and 7 body points, the
+# gradient's run-to-run spread at a FIXED x is 5.1e-6 relative with a float32
+# accumulator and 1.5e-14 with a float64 one.  5e-6 of jitter on the gradient
+# is enough to stall IPOPT's line search near its 1e-3 tolerance, since the
+# solver assumes it is sampling one fixed function.
  
 # ---------------------------------------------------------------------------
 # Warp device-side helpers
@@ -77,7 +86,7 @@ def kernel_forward_static(
     obstacle_means: wp.array(dtype=wp.vec3),
     covs_det: wp.array(dtype=wp.float32),
     covs_inv: wp.array(dtype=wp.mat33),
-    intermediate: wp.array(dtype=wp.float32),
+    intermediate: wp.array(dtype=wp.float64),
     pi_cubic: wp.float32,
 ):
     """Forward pass for the static functor.
@@ -93,7 +102,7 @@ def kernel_forward_static(
         wp.exp(-0.5 * wp.dot(diff, covs_inv[n] @ diff))
         / (wp.sqrt(covs_det[n]) * pi_cubic)
     )
-    wp.atomic_add(intermediate, n, pdf)
+    wp.atomic_add(intermediate, n, wp.float64(pdf))
  
  
 @wp.kernel
@@ -102,7 +111,7 @@ def kernel_forward_online(
     robot_covs_flat: wp.array(dtype=wp.float32),
     obstacle_means: wp.array(dtype=wp.vec3),
     obstacle_covs_flat: wp.array(dtype=wp.float32),
-    intermediate: wp.array(dtype=wp.float32),
+    intermediate: wp.array(dtype=wp.float64),
     pi_cubic: wp.float32,
     eps: wp.float32,
 ):
@@ -123,7 +132,7 @@ def kernel_forward_online(
     pdf = wp.exp(-0.5 * wp.dot(diff, inv33(cov_sum) @ diff)) / (
         wp.sqrt(det33(cov_sum)) * pi_cubic
     )
-    wp.atomic_add(intermediate, n, pdf)
+    wp.atomic_add(intermediate, n, wp.float64(pdf))
  
  
 # ---------------------------------------------------------------------------
@@ -137,7 +146,7 @@ def kernel_jacobian_static(
     obstacle_means: wp.array(dtype=wp.vec3),
     covs_det: wp.array(dtype=wp.float32),
     covs_inv: wp.array(dtype=wp.mat33),
-    grad_means: wp.array(dtype=wp.vec3),
+    grad_means: wp.array(dtype=wp.vec3d),
     pi_cubic: wp.float32,
 ):
     """Jacobian of the forward cost w.r.t. robot_means for the static functor.
@@ -153,7 +162,12 @@ def kernel_jacobian_static(
         wp.exp(-0.5 * wp.dot(diff, inv @ diff))
         / (wp.sqrt(covs_det[n]) * pi_cubic)
     )
-    wp.atomic_add(grad_means, m, -pdf * inv @ diff)
+    grad = -pdf * inv @ diff
+    wp.atomic_add(
+        grad_means,
+        m,
+        wp.vec3d(wp.float64(grad[0]), wp.float64(grad[1]), wp.float64(grad[2])),
+    )
  
  
 @wp.kernel
@@ -162,10 +176,10 @@ def kernel_jacobian_online(
     robot_covs_flat: wp.array(dtype=wp.float32),
     obstacle_means: wp.array(dtype=wp.vec3),
     obstacle_covs_flat: wp.array(dtype=wp.float32),
-    grad_means: wp.array(dtype=wp.vec3),
-    grad_robot_covs: wp.array(dtype=wp.float32),
-    grad_obstacle_means: wp.array(dtype=wp.vec3),
-    grad_obstacle_covs: wp.array(dtype=wp.float32),
+    grad_means: wp.array(dtype=wp.vec3d),
+    grad_robot_covs: wp.array(dtype=wp.float64),
+    grad_obstacle_means: wp.array(dtype=wp.vec3d),
+    grad_obstacle_covs: wp.array(dtype=wp.float64),
     pi_cubic: wp.float32,
     eps: wp.float32,
     normalizer: wp.float32,
@@ -194,15 +208,18 @@ def kernel_jacobian_online(
  
     # d cost / d mu_robot  =  -pdf * inv * diff
     grad_mu = -pdf * inv_diff
-    wp.atomic_add(grad_means, m, grad_mu)
-    wp.atomic_add(grad_obstacle_means, n, -grad_mu)
+    grad_mu64 = wp.vec3d(
+        wp.float64(grad_mu[0]), wp.float64(grad_mu[1]), wp.float64(grad_mu[2])
+    )
+    wp.atomic_add(grad_means, m, grad_mu64)
+    wp.atomic_add(grad_obstacle_means, n, -grad_mu64)
  
     # d cost / d Sigma  =  0.5 * pdf * (inv_diff ⊗ inv_diff - inv)
     robot_idx = m * 9
     obstacle_idx = n * 9
     for i in range(3):
         for j in range(3):
-            g = 0.5 * pdf * (inv_diff[i] * inv_diff[j] - inv[i, j])
+            g = wp.float64(0.5 * pdf * (inv_diff[i] * inv_diff[j] - inv[i, j]))
             wp.atomic_add(grad_robot_covs, robot_idx + i * 3 + j, g)
             wp.atomic_add(grad_obstacle_covs, obstacle_idx + i * 3 + j, g)
 
@@ -289,8 +306,9 @@ class _JacobianStatic(cas.Callback):
         # One slot per body point; obstacle contributions are accumulated in the
         # kernel with atomic_add.  Materialising a (num_points, num_obstacles)
         # buffer instead would cost ~30 MB per robot Gaussian for a 1e5-splat
-        # scene and run out of device memory at 1e6.
-        self._grad_means = wp.zeros(num_points, dtype=wp.vec3)
+        # scene and run out of device memory at 1e6.  float64 accumulator: see
+        # the note at the top of this module.
+        self._grad_means = wp.zeros(num_points, dtype=wp.vec3d)
  
         self.construct(name, opts)
  
@@ -330,7 +348,7 @@ class _JacobianStatic(cas.Callback):
         # Jacobian row by vec(input), which is column-major, hence the
         # transpose of the (num_points, 3) buffer.
         out = self._grad_means.numpy().T.reshape(1, self.num_points * 3)
-        return [out * self._normalizer]
+        return [(out * self._normalizer).astype(np.float64)]
  
  
 class ConvolutionFunctor(BaseConvolutionFunctor):
@@ -383,7 +401,7 @@ class ConvolutionFunctor(BaseConvolutionFunctor):
             covs_inv.astype(np.float32), dtype=wp.mat33
         )
  
-        self._intermediate = wp.zeros(num_obstacles, dtype=wp.float32)
+        self._intermediate = wp.zeros(num_obstacles, dtype=wp.float64)
         self._jacobian_callback: _JacobianStatic | None = None
         self._opts = opts
  
@@ -419,7 +437,10 @@ class ConvolutionFunctor(BaseConvolutionFunctor):
             ],
         )
  
-        total = float(wp.utils.array_sum(self._intermediate))
+        # numpy's pairwise sum over the (num_obstacles,) float64 buffer: the
+        # kernel's atomic_add order is already irreproducible, this final
+        # reduction must not add any further variability on top of it.
+        total = float(self._intermediate.numpy().sum(dtype=np.float64))
         return [np.array([[total * self._normalizer]], dtype=np.float64)]
  
     def get_jacobian(self, name, inames, onames, opts):
@@ -567,15 +588,15 @@ class _JacobianOnline(cas.Callback):
     def _ensure_buffers(self) -> None:
         """Allocate or reallocate gradient buffers if dimensions changed."""
         if self._grad_means is None or self._grad_means.shape[0] != self.num_points:
-            self._grad_means = wp.zeros(self.num_points, dtype=wp.vec3)
-            self._grad_robot_covs = wp.zeros(self.num_points * 9, dtype=wp.float32)
+            self._grad_means = wp.zeros(self.num_points, dtype=wp.vec3d)
+            self._grad_robot_covs = wp.zeros(self.num_points * 9, dtype=wp.float64)
 
         if (
             self._grad_obstacle_means is None
             or self._grad_obstacle_means.shape[0] != self.num_obstacles
         ):
-            self._grad_obstacle_means = wp.zeros(self.num_obstacles, dtype=wp.vec3)
-            self._grad_obstacle_covs = wp.zeros(self.num_obstacles * 9, dtype=wp.float32)
+            self._grad_obstacle_means = wp.zeros(self.num_obstacles, dtype=wp.vec3d)
+            self._grad_obstacle_covs = wp.zeros(self.num_obstacles * 9, dtype=wp.float64)
 
 
 class ConvolutionFunctorOnline(BaseConvolutionFunctor):
@@ -663,7 +684,8 @@ class ConvolutionFunctorOnline(BaseConvolutionFunctor):
             ],
         )
 
-        total = float(wp.utils.array_sum(self._intermediate))
+        # See the note in ConvolutionFunctor.eval: deterministic final sum.
+        total = float(self._intermediate.numpy().sum(dtype=np.float64))
         return [np.array([[total * self._normalizer]], dtype=np.float64)]
 
     def get_jacobian(self, name, inames, onames, opts):
@@ -686,4 +708,4 @@ class ConvolutionFunctorOnline(BaseConvolutionFunctor):
             self._intermediate is None
             or self._intermediate.shape[0] != self.num_obstacles
         ):
-            self._intermediate = wp.zeros(self.num_obstacles, dtype=wp.float32)
+            self._intermediate = wp.zeros(self.num_obstacles, dtype=wp.float64)

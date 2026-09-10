@@ -1,4 +1,3 @@
-import os
 import sys
 
 from time import perf_counter
@@ -7,6 +6,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from src.utils.ply import extract_splat_data_2
+from src.utils.paths import data_path
 from src.robots.drone import DroneGaussian, DroneRobot
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
@@ -25,9 +25,8 @@ from src.benchmark.chomp_planner import CHOMPPlanner
 
 
 
-def bonsai_demo(): 
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ply_file = os.path.join(PROJECT_ROOT, "data/Forest.ply")
+def forest_benchmark():
+    ply_file = data_path("Forest.ply")
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 
@@ -45,10 +44,16 @@ def bonsai_demo():
     theta_start = np.array([0.0, -3.0, 1.0, 0.0])
     goal = np.array([14.0, 5.0, 3.5])
 
+    # xyz_limits are REQUIRED here, not optional: with the default
+    # (-inf, +inf) the RRT* initializer has to substitute an artificial box
+    # around the start, and RRT* samples its state space uniformly, so the
+    # tree never gets near the goal.  This box covers the scene (obstacles are
+    # scaled x10 and translated by [8, 0, 0]) plus the start and the goal.
     robot = DroneRobot(
         urdf_path="urdfs/drone_example.urdf",
         arm_length=0.15,
         gaussian_specs=gaussian_specs,
+        xyz_limits=[(-4.0, 20.0), (-8.0, 10.0), (0.0, 8.0)],
     )
 
     joint_groups = JointGroups(
@@ -100,7 +105,10 @@ def bonsai_demo():
         n_samples=25, 
         max_iter=1_000,
         temperature=10, 
-        weights={"obstacle": 1.0, "jerk": 1.0, "constraint": 1.0},
+        # _obstacle_cost_trajectory now averages over waypoints too, so its
+        # scale matches FOCI's.  12.0 = num_waypoints keeps the previous
+        # effective obstacle/jerk/constraint balance under the new units.
+        weights={"obstacle": 12.0, "jerk": 1.0, "constraint": 1.0},
         noise_scale=0.1,
         convergence_tol=1e-3, 
         seed=42,
@@ -201,34 +209,28 @@ def bonsai_demo():
         "(1.00 = already feasible)."
     )
 
-    # Opt in with --vis: the visualizer loops forever and would
-    # otherwise block the benchmark.
-    visualize_stomp = "--vis" in sys.argv
+    # Visualisation is opt-in: the visualizer animates in an endless loop, so
+    # opening it at all makes the benchmark impossible to run unattended.  This
+    # used to be a `if --vis: show STOMP else: show CHOMP`, i.e. BOTH branches
+    # blocked and the flag only picked the trajectory.  Now no flag means no
+    # visualizer, `--vis` shows STOMP and `--vis --chomp` shows CHOMP.
+    if "--vis" not in sys.argv:
+        return
 
-    if visualize_stomp: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=stomp_result.trajectory
-        )
+    name, shown = (("CHOMP", chomp_result) if "--chomp" in sys.argv
+                   else ("STOMP", stomp_result))
 
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="STOMP")
-        vis.visualize_initializer_path(stomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+    vis = RobotVisualizer(robot=robot, trajectory=shown.trajectory)
+    vis.visualize_goal(goal)
+    vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs,
+                                 colors, opacities)
+    vis.visualize_robot_gaussians()
+    vis.visualize_path(name=name)
+    vis.visualize_initializer_path(shown.initial_trajectory)
+    vis.visualize_initializer_path(foci_result.trajectory, name="FOCI",
+                                   color=(0, 0, 255))
+    vis.visualize_trajectory(loop=True)
 
-    else: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=chomp_result.trajectory
-        )
 
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="CHOMP")
-        vis.visualize_initializer_path(chomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+if __name__ == "__main__":
+    forest_benchmark()

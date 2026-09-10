@@ -1,4 +1,3 @@
-import os
 import sys
 
 from time import perf_counter
@@ -7,6 +6,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from src.utils.ply import extract_splat_data
+from src.utils.paths import data_path
 from src.robots.manipulator import ManipulatorRobot, LinkGaussian
 from src.environment.environment import GaussianEnvironment
 from src.initialize.rrtstar_initializer import RRTStarInitializer
@@ -25,9 +25,8 @@ from src.benchmark.chomp_planner import CHOMPPlanner
 
 
 
-def bonsai_demo(): 
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ply_file = os.path.join(PROJECT_ROOT, "data", "Coffee_Table.ply")
+def coffe_table_benchmark():
+    ply_file = data_path("Coffee_Table.ply")
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
 
@@ -119,7 +118,10 @@ def bonsai_demo():
         n_samples=30, 
         max_iter=1_000,
         temperature=10, 
-        weights={"obstacle": 1.0, "jerk": 1.0, "constraint": 1.0},
+        # _obstacle_cost_trajectory now averages over waypoints too, so its
+        # scale matches FOCI's.  15.0 = num_waypoints keeps the previous
+        # effective obstacle/jerk/constraint balance under the new units.
+        weights={"obstacle": 15.0, "jerk": 1.0, "constraint": 1.0},
         noise_scale=0.1,
         convergence_tol=1e-3, 
         seed=42,
@@ -220,34 +222,28 @@ def bonsai_demo():
         "(1.00 = already feasible)."
     )
 
-    # Opt in with --vis: the visualizer loops forever and would
-    # otherwise block the benchmark.
-    visualize_stomp = "--vis" in sys.argv
+    # Visualisation is opt-in: the visualizer animates in an endless loop, so
+    # opening it at all makes the benchmark impossible to run unattended.  This
+    # used to be a `if --vis: show STOMP else: show CHOMP`, i.e. BOTH branches
+    # blocked and the flag only picked the trajectory.  Now no flag means no
+    # visualizer, `--vis` shows STOMP and `--vis --chomp` shows CHOMP.
+    if "--vis" not in sys.argv:
+        return
 
-    if visualize_stomp: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=stomp_result.trajectory
-        )
+    name, shown = (("CHOMP", chomp_result) if "--chomp" in sys.argv
+                   else ("STOMP", stomp_result))
 
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Coffee Table", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="STOMP")
-        vis.visualize_initializer_path(stomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+    vis = RobotVisualizer(robot=robot, trajectory=shown.trajectory)
+    vis.visualize_goal(goal)
+    vis.visualize_gaussian_splat("Coffee Table", obstacle_means, obstacle_covs,
+                                 colors, opacities)
+    vis.visualize_robot_gaussians()
+    vis.visualize_path(name=name)
+    vis.visualize_initializer_path(shown.initial_trajectory)
+    vis.visualize_initializer_path(foci_result.trajectory, name="FOCI",
+                                   color=(0, 0, 255))
+    vis.visualize_trajectory(loop=True)
 
-    else: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=chomp_result.trajectory
-        )
 
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Coffee Table", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="CHOMP")
-        vis.visualize_initializer_path(chomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+if __name__ == "__main__":
+    coffe_table_benchmark()

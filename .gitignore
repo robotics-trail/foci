@@ -180,3 +180,14 @@ cython_debug/
 
 #coin-or-tools
 coinhsl
+
+# CasADi JIT scratch files, written into the CURRENT WORKING DIRECTORY.
+# urdf2casadi builds its forward-kinematics functions with
+# {"jit": True, "compiler": "shell"}, so every manipulator demo/benchmark run
+# compiles them through the shell importer from wherever it was launched.
+# One run of demos/test_manipulator.py creates ~150 jit_tmp*.c (transient) and
+# leaves ~40 tmp_casadi_compiler_shell*.so behind; the .o files only survive
+# when the process dies mid-compile.  (*.so is already covered above.)
+jit_tmp*.c
+tmp_casadi_compiler_shell*.o
+tmp_casadi_compiler_shell*.so
