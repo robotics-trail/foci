@@ -70,8 +70,8 @@ def mobile_demo():
         weights={
             "goal": 5.0,
             "obstacle": 0.05,
-            "jerk": 0.001,
-            "virtual_jerk": 0.001,
+            "jerk": 0.00049327,
+            "virtual_jerk": 0.00049327,
         },
         vmax=5.0,
         linear_solver="mumps"

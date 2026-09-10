@@ -187,7 +187,12 @@ def build_problem(
 
     start_task         = robot.f_task(curve[0, :])
     estimated_duration = estimate_duration(goal, start_task, vmax)
-    time_scale         = (num_control_points - 4) / estimated_duration
+
+    # A uniform cubic B-spline with N control points spans N - 3 segments
+    # (see BSpline.max_parameter and minvo_hulls), so N - 3 is the number of
+    # segments traversed in `estimated_duration`.  Do not change to N - 4:
+    # that was an off-by-one from an older spline convention.
+    time_scale         = (num_control_points - 3) / estimated_duration
 
     dddcurve = time_scale ** 3 * bspline.spline_eval(num_samples, derivative_order=3)
 

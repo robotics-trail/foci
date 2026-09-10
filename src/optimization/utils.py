@@ -167,7 +167,7 @@ def build_constraints(
 # ---------------------------------------------------------------------------
 
 
-def build_spline_quantities(bspline, num_samples: int, time_scale, num_control_points: int):
+def build_spline_quantities(bspline, num_samples: int, time_scale):
     """Return the curve and its first three time-scaled derivatives.
 
     Parameters
@@ -177,9 +177,9 @@ def build_spline_quantities(bspline, num_samples: int, time_scale, num_control_p
     num_samples:
         Number of evaluation points along the spline.
     time_scale:
-        Symbolic or numeric scalar that converts normalised time to real time.
-    num_control_points:
-        Used only to compute num_segments (= num_control_points - 4).
+        Symbolic or numeric scalar converting spline-parameter units (segments)
+        to real time, i.e. num_segments / duration with
+        num_segments = num_control_points - 3.
 
     Returns
     -------

@@ -14,7 +14,81 @@ from ompl import util as ou
 from src.splines.bspline import BSpline
 from src.initialize.initializer import InitializerResult, PathInitializer
 
-    
+
+# How many path samples per control point are used to fit the initial guess.
+# The fit must be over-determined, otherwise the spline interpolates the path
+# and can overshoot around corners.
+_PATH_SAMPLES_PER_CONTROL_POINT: int = 5
+
+
+def fit_control_points(
+    path_points: np.ndarray,
+    num_control_points: int,
+    start: np.ndarray,
+    regularization: float = 1e-9,
+) -> np.ndarray:
+    """
+    Fit B-spline control points to a configuration-space path.
+
+    A uniform cubic B-spline does not interpolate its control points: with
+    control points p, the curve starts at (p_0 + 4 p_1 + p_2) / 6.  Using the
+    path samples directly as control points therefore produces a guess whose
+    first curve point is not `start`, i.e. one that violates the start equality
+    constraint of the NLP.  Here the control points are instead obtained from a
+    least-squares fit of the curve to the path, with curve(0) == start imposed
+    as a hard equality constraint.
+
+    Path samples are assumed to be uniformly spaced in the spline parameter.
+
+    Parameters
+    ----------
+    path_points : np.ndarray
+        Path samples of shape (num_path_samples, n_dof).
+    num_control_points : int
+        Number of control points of the resulting spline.
+    start : np.ndarray
+        Start configuration of shape (n_dof,), imposed exactly on curve(0).
+    regularization : float, default=1e-9
+        Tikhonov term keeping the normal equations non-singular.
+
+    Returns
+    -------
+    np.ndarray
+        Control points of shape (num_control_points, n_dof).
+    """
+    path_points = np.asarray(path_points, dtype=float)
+    start = np.asarray(start, dtype=float).reshape(1, -1)
+
+    n_dof = path_points.shape[1]
+
+    if start.shape[1] != n_dof:
+        raise ValueError(
+            f"start has {start.shape[1]} entries but the path has {n_dof} columns."
+        )
+
+    # Only the shape of the control points matters to build the basis.
+    bspline = BSpline(np.zeros((num_control_points, n_dof)))
+
+    basis = bspline.basis_matrix(
+        bspline.sample_parameters(path_points.shape[0])
+    )                                                    # (num_path_samples, N)
+    start_basis = bspline.basis_matrix([0.0])            # (1, N)
+
+    normal_matrix = basis.T @ basis + regularization * np.eye(num_control_points)
+
+    # KKT system of  min ||basis @ P - path||^2  s.t.  start_basis @ P == start
+    kkt_matrix = np.block(
+        [
+            [normal_matrix, start_basis.T],
+            [start_basis, np.zeros((1, 1))],
+        ]
+    )
+    kkt_rhs = np.vstack((basis.T @ path_points, start))
+
+    solution = np.linalg.solve(kkt_matrix, kkt_rhs)
+
+    return solution[:num_control_points, :]
+
 
 class RRTStarInitializer(PathInitializer):
     """
@@ -70,7 +144,7 @@ class RRTStarInitializer(PathInitializer):
             threshold=self.goal_threshold,
         )
 
-        control_points, success = self._solve_until_solution(
+        path_points, success = self._solve_until_solution(
             space_info=space_info,
             start_state=start_state,
             goal_region=goal_region,
@@ -79,9 +153,16 @@ class RRTStarInitializer(PathInitializer):
 
         t1 = perf_counter()
 
-        if control_points is None:
+        if path_points is None:
+            # Constant guess: every control point equal, so curve(0) == start.
             control_points = np.tile(start, (num_control_points, 1))
             success = False
+        else:
+            control_points = fit_control_points(
+                path_points,
+                num_control_points,
+                start,
+            )
 
         bspline = BSpline(control_points)
         trajectory = np.array(bspline.spline_eval(num_control_points))
@@ -106,6 +187,7 @@ class RRTStarInitializer(PathInitializer):
         goal_region: ob.GoalRegion,
         num_control_points: int,
     ) -> tuple[np.ndarray | None, bool]:
+        """Run RRT* and return the solution path as an array of samples."""
         problem = ob.ProblemDefinition(space_info)
         problem.addStartState(start_state)
         problem.setGoal(goal_region)
@@ -121,7 +203,9 @@ class RRTStarInitializer(PathInitializer):
 
             if solved:
                 path = problem.getSolutionPath()
-                path.interpolate(num_control_points)
+                path.interpolate(
+                    _PATH_SAMPLES_PER_CONTROL_POINT * num_control_points
+                )
                 return self._path_to_numpy(path), True
 
             if self.max_time is not None:

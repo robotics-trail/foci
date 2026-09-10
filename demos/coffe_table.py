@@ -87,8 +87,8 @@ def coffe_table_demo():
         weights={
             "goal": 150.0,
             "obstacle": 550.0,
-            "jerk": 0.004,
-            "virtual_jerk": 0.01,
+            "jerk": 0.00237317,
+            "virtual_jerk": 0.00593292,
         },
         vmax=1.0,
         linear_solver="ma27"

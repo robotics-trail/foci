@@ -70,8 +70,8 @@ def forest_demo():
         weights={
             "goal": 100.0,
             "obstacle": 200.0,
-            "jerk": 0.1,
-            "virtual_jerk": 0.001,
+            "jerk": 0.049327,
+            "virtual_jerk": 0.00049327,
         },
         vmax=1.0,
         linear_solver="ma27"

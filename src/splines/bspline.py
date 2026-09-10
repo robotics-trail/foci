@@ -18,6 +18,10 @@ class BSpline:
         self.control_points = control_points
         self.n_control_points = control_points.shape[0]
         self.dimension = control_points.shape[1]
+
+        # A uniform cubic B-spline with N control points has N - 3 fully
+        # supported segments, so the parameter domain is [0, N - 3] measured in
+        # segments (one unit of parameter == one segment).
         self.max_parameter = self.n_control_points - 3
 
     def _build_basis_matrix(
@@ -53,6 +57,45 @@ class BSpline:
 
         return basis_matrix
 
+    def sample_parameters(self, num_samples: int) -> np.ndarray:
+        """
+        Uniformly spaced parameters covering the full spline domain.
+
+        Returns
+        -------
+        np.ndarray
+            1D array of `num_samples` values spanning [0, max_parameter].
+        """
+        return np.linspace(0.0, self.max_parameter, num_samples)
+
+    def basis_matrix(
+        self,
+        sample_parameters: np.ndarray,
+        derivative_order: int = 0,
+    ) -> np.ndarray:
+        """
+        Basis matrix evaluated at arbitrary parameter values.
+
+        Useful to fit control points to a given set of samples without going
+        through the control points stored in this instance.
+
+        Parameters
+        ----------
+        sample_parameters : array-like
+            Parameter values in [0, max_parameter].
+        derivative_order : int, default=0
+            Derivative order of the spline basis.
+
+        Returns
+        -------
+        np.ndarray
+            Basis matrix of shape (len(sample_parameters), num_control_points).
+        """
+        return self._build_basis_matrix(
+            np.atleast_1d(np.asarray(sample_parameters, dtype=float)),
+            derivative_order=derivative_order,
+        )
+
     def spline_eval(self, num_samples: int, derivative_order: int = 0) -> np.ndarray:
         """
         Evaluate the spline or one of its derivatives.
@@ -69,9 +112,8 @@ class BSpline:
         np.ndarray
             Evaluated points with shape (num_samples, dim).
         """
-        sample_parameters = np.linspace(0.0, self.max_parameter, num_samples)
-        basis_matrix = self._build_basis_matrix(
-            sample_parameters,
+        basis_matrix = self.basis_matrix(
+            self.sample_parameters(num_samples),
             derivative_order=derivative_order,
         )
         return basis_matrix @ self.control_points
