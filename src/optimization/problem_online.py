@@ -41,9 +41,9 @@ def _flatten_covariances_row_major(covs_raw, n_gaussians: int):
 
     Supported input shapes
     ----------------------
-    (9*n_gaussians, 1)  — already flattened.
-    (n_gaussians, 9)    — one row-major covariance per Gaussian.
-    (3*n_gaussians, 3)  — one 3×3 block per Gaussian (stacked vertically).
+    (9*n_gaussians, 1)  ? already flattened.
+    (n_gaussians, 9)    ? one row-major covariance per Gaussian.
+    (3*n_gaussians, 3)  ? one 3�3 block per Gaussian (stacked vertically).
     """
     shape = covs_raw.shape
 
@@ -118,11 +118,11 @@ def _obstacle_cost(
     callbacks = []
 
     for k in range(num_samples):
-        # Robot quantities at sample k — reshape to (n_gaussians, 3/9)
+        # Robot quantities at sample k ? reshape to (n_gaussians, 3/9)
         gaussian_points = cas.reshape(collision_points[:, k], 3, n_gaussians).T
         gaussian_covs   = cas.reshape(collision_covs[:,   k], 9, n_gaussians).T
 
-        # Obstacle quantities at sample k — reshape to (n_obstacles, 3/9)
+        # Obstacle quantities at sample k ? reshape to (n_obstacles, 3/9)
         obstacle_points = cas.reshape(obstacle_means_param[k, :].T, 3, n_obstacles).T
         obstacle_covs   = cas.reshape(obstacle_covs_param[k,  :].T, 9, n_obstacles).T
 
@@ -134,7 +134,11 @@ def _obstacle_cost(
         callbacks.append(convolution)
         cost += convolution(gaussian_points, gaussian_covs, obstacle_points, obstacle_covs)
 
-    return weight * cost / n_gaussians, callbacks
+    # The functor already averages over Gaussians and obstacles for each
+    # sample (num_points == n_gaussians here), so what is left to average over
+    # is the samples.  Dividing by n_gaussians again would divide it out twice
+    # and leave the cost scaling with num_samples.
+    return weight * cost / num_samples, callbacks
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +189,22 @@ def build_problem(
     bspline = BSpline(control_points)
     curve   = bspline.spline_eval(num_samples)
 
-    start_task         = robot.f_task(curve[0, :])
+    # f_task(start), NOT f_task(curve[0, :]).  The start equality constraint
+    # forces curve[0, :] == start at the solution, so the two agree there, but
+    # going through curve[0, :] makes `estimated_duration` -- and therefore
+    # `time_scale` -- a nonlinear function of the decision variables.  That
+    # turns every MINVO velocity/acceleration hull constraint nonlinear and the
+    # jerk cost non-quadratic for no gain.  Through the `start` parameter,
+    # time_scale is a constant of the solve and the hull constraints stay
+    # linear in the control points.
+    start_task         = robot.f_task(start)
     estimated_duration = estimate_duration(goal, start_task, vmax)
-    time_scale         = (num_control_points -3) / estimated_duration
+
+    # A uniform cubic B-spline with N control points spans N - 3 segments
+    # (see BSpline.max_parameter and minvo_hulls), so N - 3 is the number of
+    # segments traversed in `estimated_duration`.  Do not change to N - 4:
+    # that was an off-by-one from an older spline convention.
+    time_scale         = (num_control_points - 3) / estimated_duration
 
     dddcurve = time_scale ** 3 * bspline.spline_eval(num_samples, derivative_order=3)
 

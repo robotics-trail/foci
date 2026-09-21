@@ -69,7 +69,7 @@ def random_search_stomp(
     best_score = None
     history = []
 
-    print("\n" + "=" * 80)
+    #print("\n" + "=" * 80)
     print("STOMP RANDOM SEARCH")
     print("=" * 80)
 
@@ -268,7 +268,6 @@ def benchmark_bonsai():
         LinkGaussian("forearm_link",    0.5, np.eye(3) * 0.2**2),
         LinkGaussian("wrist_1_link",    0.5, np.eye(3) * 0.2**2),
         LinkGaussian("wrist_2_link",    0.5, np.eye(3) * 0.1**2),
-        LinkGaussian("wrist_3_link",    0.5, np.eye(3) * 0.1**2),
     ]
 
     theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
@@ -297,8 +296,8 @@ def benchmark_bonsai():
     )
 
     initializer = RRTStarInitializer(
-        voxel_size=0.0001,
-        goal_threshold=0.001,
+        voxel_size=0.02,
+        goal_threshold=1.0,
         random_seed=42,
         max_time=None,   
     ) 
@@ -312,7 +311,7 @@ def benchmark_bonsai():
         num_samples=25,
         weights={
             "goal": 10.0,
-            "obstacle": 1.0,
+            "obstacle": 10.0,
             "jerk": 0.001,
             "virtual_jerk": 0.01,
         },
@@ -321,34 +320,34 @@ def benchmark_bonsai():
     )
 
     
-    chomp_planner = CHOMPPlanner(
-        robot=robot, 
-        environment=environment, 
-        joint_groups=joint_groups, 
-        num_waypoints=25,
-        max_iter=1_000, 
-        learning_rate=0.01, 
-        weights={"obstacle": 1.0, "smoothness": 1.0},
-        convergence_tol=1e-3,            
-    )
+    #chomp_planner = CHOMPPlanner(
+     #   robot=robot, 
+      #  environment=environment, 
+       # joint_groups=joint_groups, 
+        #num_waypoints=25,
+    #    max_iter=1_000, 
+     #   learning_rate=0.01, 
+      #  weights={"obstacle": 1.0, "smoothness": 1.0},
+       # convergence_tol=1e-3,            
+    #)
     
-    stomp_planner = STOMPPlanner(
-        robot=robot,
-        environment=environment,
-        joint_groups=joint_groups,
-        num_waypoints=12,
-        n_samples=25,
-        max_iter=800,
-        temperature=5.19788696,
-        weights={
-            "obstacle": 127.98492000,
-            "jerk": 0.00476016,
-            "constraint": 4.05415357,
-        },
-        noise_scale=0.01096718,
-        convergence_tol=0.005,
-        total_time=8.0,
-    )
+    #stomp_planner = STOMPPlanner(
+     #   robot=robot,
+      #  environment=environment,
+       # joint_groups=joint_groups,
+    #    num_waypoints=12,
+     #   n_samples=25,
+      #  max_iter=800,
+       # temperature=5.19788696,
+        #weights={
+    #        "obstacle": 127.98492000,
+     #       "jerk": 0.00476016,
+      #      "constraint": 4.05415357,
+       # },
+        #noise_scale=0.01096718,
+    #    convergence_tol=0.005,
+     #   total_time=8.0,
+    #)
   
     foci_result = foci_planner.plan(
         start=theta_start,
@@ -361,19 +360,19 @@ def benchmark_bonsai():
 
     
 
-    chomp_result = chomp_planner.plan(
-        start=theta_start,
-        goal=theta_final,
-        initial_trajectory=init_trajectory,
-    )
-    stomp_result = stomp_planner.plan(
-    start=np.ascontiguousarray(theta_start, dtype=np.float32),
-    goal=theta_final,
-    initial_trajectory=init_trajectory.copy(),
-)
+    #chomp_result = chomp_planner.plan(
+     #   start=theta_start,
+      #  goal=theta_final,
+       # initial_trajectory=init_trajectory,
+    #)
+    #stomp_result = stomp_planner.plan(
+    #start=np.ascontiguousarray(theta_start, dtype=np.float32),
+    #goal=theta_final,
+    #initial_trajectory=init_trajectory.copy(),
+#)
     foci_min_dist, info = minimum_robot_environment_distance(robot,environment,foci_result.trajectory)
-    stomp_min_dist, info = minimum_robot_environment_distance(robot,environment,stomp_result.trajectory)
-    chomp_min_dist, info = minimum_robot_environment_distance(robot,environment,chomp_result.trajectory)
+    #stomp_min_dist, info = minimum_robot_environment_distance(robot,environment,stomp_result.trajectory)
+    #chomp_min_dist, info = minimum_robot_environment_distance(robot,environment,chomp_result.trajectory)
     
     print("\n--- Planning timings FOCI---")
     print(f"Build:       {foci_result.timings['build']:.6f} s")
@@ -382,23 +381,23 @@ def benchmark_bonsai():
     print(f"Success:     {foci_result.success}")
 
     print("\n--- Planning timings STOMP---")
-    print(f"Build:       {stomp_result.timings['build']:.6f} s")
-    print(f"Solver:      {stomp_result.timings['solve']:.6f} s")
-    print(f"Total:       {stomp_result.timings['total']:.6f} s")
-    print(f"Success:     {stomp_result.success}")
+    #print(f"Build:       {stomp_result.timings['build']:.6f} s")
+    #print(f"Solver:      {stomp_result.timings['solve']:.6f} s")
+    #print(f"Total:       {stomp_result.timings['total']:.6f} s")
+    #print(f"Success:     {stomp_result.success}")
 
-    print("\n--- Planning timings CHOMP---")
-    print(f"Build:       {chomp_result.timings['build']:.6f} s")
-    print(f"Solver:      {chomp_result.timings['solve']:.6f} s")
-    print(f"Total:       {chomp_result.timings['total']:.6f} s")
-    print(f"Success:     {chomp_result.success}")
+    #print("\n--- Planning timings CHOMP---")
+    #print(f"Build:       {chomp_result.timings['build']:.6f} s")
+    #print(f"Solver:      {chomp_result.timings['solve']:.6f} s")
+    #print(f"Total:       {chomp_result.timings['total']:.6f} s")
+    #print(f"Success:     {chomp_result.success}")
 
-    print("\n--- Benchmark metrics ---")
-    print(f"Number of environment gaussians: {len(obstacle_means)}")
-    print(f"Number of robot gaussians: {len(gaussian_specs)}")
-    print(f"Minimum robot-environment distance FOCI: {foci_min_dist:.3f} m")
-    print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
-    print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
+    #print("\n--- Benchmark metrics ---")
+    #print(f"Number of environment gaussians: {len(obstacle_means)}")
+    #print(f"Number of robot gaussians: {len(gaussian_specs)}")
+    #print(f"Minimum robot-environment distance FOCI: {foci_min_dist:.3f} m")
+    #print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
+    #print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
 
 
 
@@ -411,8 +410,9 @@ def benchmark_bonsai():
     vis.visualize_gaussian_splat("Bonsai", obstacle_means, obstacle_covs, colors, opacities)
     vis.visualize_robot_gaussians()
     vis.visualize_path(name="FOCI")
-    vis.visualize_initializer_path(stomp_result.trajectory, name="STOMP", color=(255, 0, 255))
-    vis.visualize_initializer_path(chomp_result.trajectory, name="CHOMP", color=(0, 0, 255))
+    vis.visualize_initializer_path(foci_result.initial_trajectory, name="FOCI Initial", color=(255, 0, 0))
+    #vis.visualize_initializer_path(stomp_result.trajectory, name="STOMP", color=(255, 0, 255))
+    #vis.visualize_initializer_path(chomp_result.trajectory, name="CHOMP", color=(0, 0, 255))
     vis.visualize_trajectory(loop=True)
 
             

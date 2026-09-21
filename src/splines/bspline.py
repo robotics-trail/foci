@@ -52,6 +52,45 @@ class BSpline:
             )
 
         return basis_matrix
+    
+    def sample_parameters(self, num_samples: int) -> np.ndarray:
+        """
+        Uniformly spaced parameters covering the full spline domain.
+
+        Returns
+        -------
+        np.ndarray
+            1D array of `num_samples` values spanning [0, max_parameter].
+        """
+        return np.linspace(0.0, self.max_parameter, num_samples)
+    
+    def basis_matrix(
+        self,
+        sample_parameters: np.ndarray,
+        derivative_order: int = 0,
+    ) -> np.ndarray:
+        """
+        Basis matrix evaluated at arbitrary parameter values.
+
+        Useful to fit control points to a given set of samples without going
+        through the control points stored in this instance.
+
+        Parameters
+        ----------
+        sample_parameters : array-like
+            Parameter values in [0, max_parameter].
+        derivative_order : int, default=0
+            Derivative order of the spline basis.
+
+        Returns
+        -------
+        np.ndarray
+            Basis matrix of shape (len(sample_parameters), num_control_points).
+        """
+        return self._build_basis_matrix(
+            np.atleast_1d(np.asarray(sample_parameters, dtype=float)),
+            derivative_order=derivative_order,
+        )
 
     def spline_eval(self, num_samples: int, derivative_order: int = 0) -> np.ndarray:
         """
