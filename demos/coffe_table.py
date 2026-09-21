@@ -18,9 +18,9 @@ def coffe_table_demo():
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
 
-    translation = np.array([0.71, 0.0, 0.6])
+    translation = np.array([2.5, 0.0, 0.6])
     scale_factor = 0.005
-    mesh_scale = 1.3
+    mesh_scale = 3.9
     
     floor_height_threshold = np.min(obstacle_means[:, 2]) + 0.1
     mask = obstacle_means[:, 2] > floor_height_threshold
@@ -34,28 +34,30 @@ def coffe_table_demo():
     obstacle_means = (obstacle_means - centroid) * mesh_scale + centroid + translation
     obstacle_covs = obstacle_covs * (scale_factor * mesh_scale)**2
      
-    gaussian_specs = [ 
-        LinkGaussian(0, 0.5, np.eye(3) * 0.01**2), 
-        LinkGaussian(1, 0.5, np.eye(3) * 0.01**2), 
-        LinkGaussian(2, 0.3, np.eye(3) * 0.04**2), 
-        LinkGaussian(2, 0.7, np.eye(3) * 0.04**2), 
-        LinkGaussian(3, 0.3, np.eye(3) * 0.03**2), 
-        LinkGaussian(3, 0.7, np.eye(3) * 0.03**2), 
-        LinkGaussian(4, 0.5, np.eye(3) * 0.03**2), 
-        LinkGaussian(5, 0.5, np.eye(3) * 0.01**2), 
-        LinkGaussian(6, 0.5, np.eye(3) * 0.01**2), 
-        LinkGaussian(7, 0.5, np.eye(3) * 0.01**2), 
+    gaussian_specs = [
+        LinkGaussian("base_link",          0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("base_link_inertia",  0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("shoulder_link",      0.3, np.eye(3) * 0.2**2),
+        LinkGaussian("shoulder_link",      0.7, np.eye(3) * 0.2**2),
+        LinkGaussian("upper_arm_link",     0.3, np.eye(3) * 0.2**2),
+        LinkGaussian("upper_arm_link",     0.7, np.eye(3) * 0.2**2),
+        LinkGaussian("forearm_link",       0.3, np.eye(3) * 0.2**2),
+        LinkGaussian("forearm_link",       0.7, np.eye(3) * 0.2**2),
+        LinkGaussian("wrist_1_link",       0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("wrist_2_link",       0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("wrist_3_link",       0.5, np.eye(3) * 0.1**2),
     ]
 
-    theta_start = np.array([-0.3, -1.2, 1.8, -2.1, -1.57, 0.0])
-    goal = np.array([0.55, 0.0, 0.75])
+    theta_start = np.array([np.pi, 0.0, 0.0, 0.0, 0.0, 0.0])
+    goal = np.array([1.4, 0.0, 0.75])
 
     robot = ManipulatorRobot(
-        urdf_path="urdfs/ur5.urdf",
+        urdf_path="urdfs/ur5/ur5.urdf",
         root_link="base_link",
-        tip_link="ee_link",
+        tip_link="wrist_3_link",
         gaussian_specs=gaussian_specs,
     )
+
 
     joint_groups = JointGroups(
         virtual_indices=[], 
@@ -71,30 +73,30 @@ def coffe_table_demo():
     )
 
     initializer = RRTStarInitializer(
-        voxel_size=0.01,
-        goal_threshold=0.01,
+        voxel_size=0.00001,
+        goal_threshold=0.001,
         random_seed=42,
         max_time=None,   
     )
 
-    planner = Planner(
+    foci_planner = Planner(
         robot=robot,
         environment=environment,
         joint_groups=joint_groups,
         initializer=initializer,
-        num_control_points=15,
-        num_samples=30,
+        num_control_points=12,
+        num_samples=25,
         weights={
-            "goal": 150.0,
-            "obstacle": 550.0,
-            "jerk": 0.004,
+            "goal": 10.0,
+            "obstacle": 50.0,
+            "jerk": 0.0005,
             "virtual_jerk": 0.01,
         },
-        vmax=1.0,
-        linear_solver="ma27"
+        vmax=8.0,
+        linear_solver="ma27",
     )
 
-    result = planner.plan(
+    result = foci_planner.plan(
         start=theta_start,
         goal=goal,
     )

@@ -10,7 +10,7 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
-from src.benchmark.utils import minimum_robot_environment_distance
+from benchmark.utils import minimum_robot_environment_distance
 
 def forest_demo():
     

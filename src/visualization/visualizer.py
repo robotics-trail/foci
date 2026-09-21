@@ -371,7 +371,8 @@ class RobotVisualizer:
 
             return
 
-        self.viser_urdf.update_cfg(q)
+        joint_names = getattr(self.robot, "actuated_joint_names", None)
+        self.viser_urdf.update_cfg(dict(zip(joint_names, q)))
 
     
 

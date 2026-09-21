@@ -21,29 +21,28 @@ def bonsai_demo():
 
     rotation = R.from_euler("x", -90, degrees=True).as_matrix()
     translation = np.array([0.0, 1.8, 1.0])
-    scale_factor = 3.5
+    scale_factor = 2.5
     
     obstacle_means = (obstacle_means * scale_factor) @ rotation.T + translation
     obstacle_covs = np.einsum("ij,njk,lk->nil", rotation, obstacle_covs, rotation) * scale_factor**2
 
-    gaussian_specs = [ 
-        LinkGaussian(0, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(1, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(2, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(3, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(4, 0.5, np.eye(3) * 0.2**2), 
-        LinkGaussian(5, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(6, 0.5, np.eye(3) * 0.1**2), 
-        LinkGaussian(7, 0.5, np.eye(3) * 0.1**2), 
+    gaussian_specs = [
+        LinkGaussian("shoulder_link",   0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("upper_arm_link",  0.3, np.eye(3) * 0.2**2),
+        LinkGaussian("upper_arm_link",  0.7, np.eye(3) * 0.2**2),  
+        LinkGaussian("forearm_link",    0.5, np.eye(3) * 0.2**2),
+        LinkGaussian("wrist_1_link",    0.5, np.eye(3) * 0.2**2),
+        LinkGaussian("wrist_2_link",    0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("wrist_3_link",    0.5, np.eye(3) * 0.1**2),
     ]
     
     theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
     goal = np.array([-1.5, 2.25, 0.5])
 
     robot = ManipulatorRobot(
-        urdf_path="urdfs/ur5_extended.urdf",
+        urdf_path="urdfs/ur5/ur5.urdf",
         root_link="base_link",
-        tip_link="ee_link",
+        tip_link="wrist_3_link",
         gaussian_specs=gaussian_specs,
     )
 

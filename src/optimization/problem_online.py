@@ -187,7 +187,7 @@ def build_problem(
 
     start_task         = robot.f_task(curve[0, :])
     estimated_duration = estimate_duration(goal, start_task, vmax)
-    time_scale         = (num_control_points - 4) / estimated_duration
+    time_scale         = (num_control_points -3) / estimated_duration
 
     dddcurve = time_scale ** 3 * bspline.spline_eval(num_samples, derivative_order=3)
 

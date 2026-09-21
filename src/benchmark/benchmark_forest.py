@@ -10,13 +10,13 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
-from src.benchmark.utils import minimum_robot_environment_distance
-from src.benchmark.stomp_planner import STOMPPlanner
-from src.benchmark.chomp_planner import CHOMPPlanner
+from benchmark.utils import minimum_robot_environment_distance
+from benchmark.stomp_planner import STOMPPlanner
+from benchmark.chomp_planner import CHOMPPlanner
 
 
 
-def bonsai_demo(): 
+def benchmark_forest(): 
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ply_file = os.path.join(PROJECT_ROOT, "data/Forest.ply")
 
@@ -35,10 +35,6 @@ def bonsai_demo():
 
     theta_start = np.array([0.0, -3.0, 1.0, 0.0])
     goal = np.array([14.0, 5.0, 3.5])
-
-
-    theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
-    goal = np.array([-1.5, 2.25, 0.5])
 
     robot = DroneRobot(
         urdf_path="urdfs/drone_example.urdf",
@@ -149,32 +145,20 @@ def bonsai_demo():
     print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
     print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
 
-    visualize_stomp = True
 
-    if visualize_stomp: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=stomp_result.trajectory
-        )
+    vis = RobotVisualizer(
+        robot=robot,
+        trajectory=foci_result.trajectory
+    )
 
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="STOMP")
-        vis.visualize_initializer_path(stomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+    vis.visualize_goal(goal)
+    vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs, colors, opacities)
+    vis.visualize_robot_gaussians()
+    vis.visualize_path(name="FOCI")
+    vis.visualize_initializer_path(stomp_result.initial_trajectory, name="STOMP", color=(255, 0, 255))
+    vis.visualize_initializer_path(chomp_result.trajectory, name="CHOMP", color=(0, 0, 255))
+    vis.visualize_trajectory(loop=True)
 
-    else: 
-        vis = RobotVisualizer(
-            robot=robot,
-            trajectory=chomp_result.trajectory
-        )
-
-        vis.visualize_goal(goal)
-        vis.visualize_gaussian_splat("Forest", obstacle_means, obstacle_covs, colors, opacities)
-        vis.visualize_robot_gaussians()
-        vis.visualize_path(name="CHOMP")
-        vis.visualize_initializer_path(chomp_result.initial_trajectory)
-        vis.visualize_initializer_path(foci_result.trajectory, name="FOCI", color=(0, 0, 255))
-        vis.visualize_trajectory(loop=True)
+    
+if __name__ == "__main__":
+    benchmark_forest()
