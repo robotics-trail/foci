@@ -47,9 +47,23 @@ def jerk_cost(
     real_weight: float,
     virtual_weight: float,
 ):
-    """Integrated squared jerk cost, split by real and virtual joints."""
+    """Integrated squared jerk, per joint, split by real and virtual joints.
+
+        cost = weight * mean_over_joints( integral ||d3q/dt3||^2 dt )
+
+    The quadrature weight is dt = duration / (num_samples - 1).  It must NOT
+    be duration**6: `dddcurve` already carries time_scale**3, whose square is
+    ((num_control_points - 3) / duration)**6, so a duration**6 factor cancels
+    the duration exactly and leaves a bare sum of squared parameter-space
+    jerks -- a quantity with no physical units, independent of how long the
+    motion takes and proportional to num_samples.
+
+    Because of that, `weights["jerk"]` and `weights["virtual_jerk"]` are in
+    different units from before this fix and have to be re-tuned.
+    """
     cost = 0.0
-    duration_factor = duration ** 6
+    num_samples = dddcurve.shape[0]
+    duration_factor = duration / num_samples
 
     if real_indices:
         real_jerk = dddcurve[:, real_indices]
@@ -165,31 +179,6 @@ def build_constraints(
 # ---------------------------------------------------------------------------
 # Spline / symbolic scaffolding
 # ---------------------------------------------------------------------------
-
-
-def build_spline_quantities(bspline, num_samples: int, time_scale, num_control_points: int):
-    """Return the curve and its first three time-scaled derivatives.
-
-    Parameters
-    ----------
-    bspline:
-        A BSpline instance constructed from the control-point symbolic variable.
-    num_samples:
-        Number of evaluation points along the spline.
-    time_scale:
-        Symbolic or numeric scalar that converts normalised time to real time.
-    num_control_points:
-        Used only to compute num_segments (= num_control_points - 4).
-
-    Returns
-    -------
-    curve, dcurve, ddcurve, dddcurve
-    """
-    curve = bspline.spline_eval(num_samples)
-    dcurve   = time_scale       * bspline.spline_eval(num_samples, derivative_order=1)
-    ddcurve  = time_scale ** 2  * bspline.spline_eval(num_samples, derivative_order=2)
-    dddcurve = time_scale ** 3  * bspline.spline_eval(num_samples, derivative_order=3)
-    return curve, dcurve, ddcurve, dddcurve
 
 
 def estimate_duration(goal, start_task, vmax: float):

@@ -10,7 +10,7 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
-from src.benchmark.utils import minimum_robot_environment_distance
+from src.benchmark.utils import minimum_robot_environment_distance, path_length
 from src.benchmark.stomp_planner import STOMPPlanner
 from src.benchmark.chomp_planner import CHOMPPlanner
 
@@ -21,9 +21,9 @@ def benchmark_coffee():
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data(ply_file)
 
-    translation = np.array([1.2, 0.0, 0.6])
+    translation = np.array([0.0, -3.2, 2.0])
     scale_factor = 0.01
-    mesh_scale = 1.3
+    mesh_scale = 4.0
 
     floor_height_threshold = np.min(obstacle_means[:, 2]) + 0.1
     mask = obstacle_means[:, 2] > floor_height_threshold
@@ -41,20 +41,21 @@ def benchmark_coffee():
     obstacle_covs = np.ascontiguousarray(obstacle_covs, dtype=np.float32)
 
     gaussian_specs = [
-        LinkGaussian("base_link",          0.5, np.eye(3) * 0.01**2),
-        LinkGaussian("base_link_inertia",  0.5, np.eye(3) * 0.01**2),
-        LinkGaussian("shoulder_link",      0.3, np.eye(3) * 0.04**2),
-        LinkGaussian("shoulder_link",      0.7, np.eye(3) * 0.04**2),
-        LinkGaussian("upper_arm_link",     0.3, np.eye(3) * 0.03**2),
-        LinkGaussian("upper_arm_link",     0.7, np.eye(3) * 0.03**2),
-        LinkGaussian("forearm_link",       0.5, np.eye(3) * 0.03**2),
-        LinkGaussian("wrist_1_link",       0.5, np.eye(3) * 0.01**2),
-        LinkGaussian("wrist_2_link",       0.5, np.eye(3) * 0.01**2),
-        LinkGaussian("wrist_3_link",       0.5, np.eye(3) * 0.01**2),
+        LinkGaussian("base_link",          0.5, np.eye(3) * 0.05**2),
+        LinkGaussian("base_link_inertia",  0.5, np.eye(3) * 0.05**2),
+        LinkGaussian("shoulder_link",      0.3, np.eye(3) * 0.1**2),
+        LinkGaussian("shoulder_link",      0.7, np.eye(3) * 0.1**2),
+        LinkGaussian("upper_arm_link",     0.3, np.eye(3) * 0.2**2),
+        LinkGaussian("upper_arm_link",     0.7, np.eye(3) * 0.2**2),
+        LinkGaussian("forearm_link",       0.5, np.eye(3) * 0.2**2),
+        LinkGaussian("wrist_1_link",       0.5, np.eye(3) * 0.1**2),
+        LinkGaussian("wrist_2_link",       0.5, np.eye(3) * 0.1**2),
     ]
+    
 
-    theta_start = np.array([-0.3, -1.2, 1.8, -2.1, -1.57, 0.0])
-    goal = np.array([0.55, 0.0, 0.75])
+
+    theta_start = np.array([np.pi/2, -np.pi/4, -4*np.pi/5, 0.0, 0.0, 0.0])
+    goal = np.array([0.0, -2.5, 2.1])
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5/ur5.urdf",
@@ -67,8 +68,8 @@ def benchmark_coffee():
         virtual_indices=[],
         virtual_wmax=4.0,
         virtual_amax=3.5,
-        real_wmax=3.5,
-        real_amax=3.0,
+        real_wmax=6.5,
+        real_amax=4.5,
     )
 
     environment = GaussianEnvironment(
@@ -77,8 +78,8 @@ def benchmark_coffee():
     )
 
     initializer = RRTStarInitializer(
-        voxel_size=0.0001,
-        goal_threshold=0.001,
+        voxel_size=0.01,
+        goal_threshold=0.01,
         random_seed=42,
         max_time=None,
     )
@@ -92,7 +93,7 @@ def benchmark_coffee():
         num_samples=25,
         weights={
             "goal": 10.0,
-            "obstacle": 1.0,
+            "obstacle": 10.0,
             "jerk": 0.001,
             "virtual_jerk": 0.01,
         },
@@ -111,23 +112,6 @@ def benchmark_coffee():
         convergence_tol=1e-3,
     )
 
-    stomp_planner = STOMPPlanner(
-        robot=robot,
-        environment=environment,
-        joint_groups=joint_groups,
-        num_waypoints=12,
-        n_samples=25,
-        max_iter=800,
-        temperature=5.19788696,
-        weights={
-            "obstacle": 127.98492000,
-            "jerk": 0.00476016,
-            "constraint": 4.05415357,
-        },
-        noise_scale=0.01096718,
-        convergence_tol=0.005,
-        total_time=8.0,
-    )
 
     foci_result = foci_planner.plan(
         start=theta_start,
@@ -144,27 +128,18 @@ def benchmark_coffee():
         initial_trajectory=init_trajectory,
     )
 
-    stomp_result = stomp_planner.plan(
-        start=np.ascontiguousarray(theta_start, dtype=np.float32),
-        goal=theta_final,
-        initial_trajectory=init_trajectory.copy(),
-    )
 
     foci_min_dist, info = minimum_robot_environment_distance(robot, environment, foci_result.trajectory)
-    stomp_min_dist, info = minimum_robot_environment_distance(robot, environment, stomp_result.trajectory)
     chomp_min_dist, info = minimum_robot_environment_distance(robot, environment, chomp_result.trajectory)
+    
+    foci_path_length = path_length(foci_result.trajectory)
+    chomp_path_length = path_length(chomp_result.trajectory)
 
     print("\n--- Planning timings FOCI---")
     print(f"Build:       {foci_result.timings['build']:.6f} s")
     print(f"Solver:      {foci_result.timings['solve']:.6f} s")
     print(f"Total:       {foci_result.timings['total']:.6f} s")
     print(f"Success:     {foci_result.success}")
-
-    print("\n--- Planning timings STOMP---")
-    print(f"Build:       {stomp_result.timings['build']:.6f} s")
-    print(f"Solver:      {stomp_result.timings['solve']:.6f} s")
-    print(f"Total:       {stomp_result.timings['total']:.6f} s")
-    print(f"Success:     {stomp_result.success}")
 
     print("\n--- Planning timings CHOMP---")
     print(f"Build:       {chomp_result.timings['build']:.6f} s")
@@ -176,8 +151,9 @@ def benchmark_coffee():
     print(f"Number of environment gaussians: {len(obstacle_means)}")
     print(f"Number of robot gaussians: {len(gaussian_specs)}")
     print(f"Minimum robot-environment distance FOCI: {foci_min_dist:.3f} m")
-    print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
     print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
+    print(f"Path length FOCI: {foci_path_length:.3f} m")
+    print(f"Path length CHOMP: {chomp_path_length:.3f} m")
 
     vis = RobotVisualizer(
         robot=robot,
@@ -188,8 +164,8 @@ def benchmark_coffee():
     vis.visualize_gaussian_splat("Coffee Table", obstacle_means, obstacle_covs, colors, opacities)
     vis.visualize_robot_gaussians()
     vis.visualize_path(name="FOCI")
-    vis.visualize_initializer_path(stomp_result.trajectory, name="STOMP", color=(255, 0, 255))
     vis.visualize_initializer_path(chomp_result.trajectory, name="CHOMP", color=(0, 0, 255))
+    vis.visualize_initializer_path(foci_result.initial_trajectory, name="Initializer", color=(255, 0, 0))
     vis.visualize_trajectory(loop=True)
 
 

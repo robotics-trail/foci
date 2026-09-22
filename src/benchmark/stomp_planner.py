@@ -10,11 +10,11 @@ as a drop-in replacement anywhere a PlanningResult is expected.
 Algorithm summary
 -----------------
 STOMP does NOT use gradients. Instead, at each iteration it:
-  1. Samples K noisy trajectory perturbations  ??_k ~ N(0, R^{-1})
+  1. Samples K noisy trajectory perturbations  δξ_k ~ N(0, R^{-1})
      where R is the smoothness precision matrix.
-  2. Evaluates the total cost Q_k for each noisy trajectory ? + ??_k.
-  3. Computes per-waypoint probability weights w_k ? exp(-h � Q_k).
-  4. Updates the mean trajectory:  ?? = R^{-1} ?_k w_k ??_k
+  2. Evaluates the total cost Q_k for each noisy trajectory ξ + δξ_k.
+  3. Computes per-waypoint probability weights w_k ∝ exp(-h · Q_k).
+  4. Updates the mean trajectory:  Δξ = R^{-1} Σ_k w_k δξ_k
      (the update is automatically smooth because R^{-1} filters it).
   5. Re-pins the endpoints.
 
@@ -39,6 +39,7 @@ from typing import Any
 import casadi as cas
 import numpy as np
 
+from src.benchmark.utils import limit_scaling_factor
 from src.environment.convolution import ConvolutionFunctor
 from src.planning.joints import JointGroups
 from src.planning.result import PlanningResult
@@ -52,15 +53,67 @@ _EPS = 1e-10
 # =============================================================================
 
 def _build_smoothness_matrix(num_waypoints, dt):
+    """
+    Build the finite-difference precision matrix R = A^T A / dt^2.
+
+    A is the (T+2, T) second-difference operator of Kalakrishnan et al., i.e.
+    it INCLUDES the two boundary rows at each end, which reference waypoints
+    outside the trajectory and are therefore truncated.  Those rows are what
+    makes A full column rank.
+
+    Dropping them (a (T-2, T) operator with interior rows only) leaves A^T A
+    with a 2-dimensional nullspace -- constants and ramps -- so any ridge
+    added to invert it becomes the dominant term of R^{-1}, and the sampled
+    noise degenerates into a rigid affine shift of the whole trajectory whose
+    per-waypoint sigma is LARGEST at the pinned endpoints.  With the boundary
+    rows, cond(R) drops from ~5e8 to ~1e3 and the noise recovers the
+    bell-shaped profile that lets STOMP deform one part of the path.
+    """
     T = num_waypoints
-    A = np.zeros((T - 2, T))
-    for i in range(T - 2):
-        A[i, i]     = 1.0
-        A[i, i + 1] = -2.0
-        A[i, i + 2] = 1.0
-    R = (A.T @ A) / max(dt ** 2, _EPS)
-    R += 1e-6 * np.eye(T)
-    return R
+    A = np.zeros((T + 2, T))
+
+    for i in range(T + 2):
+        for offset, value in ((0, 1.0), (1, -2.0), (2, 1.0)):
+            j = i - 2 + offset
+            if 0 <= j < T:
+                A[i, j] = value
+
+    # No ridge needed: A has full column rank, so A^T A is already invertible.
+    return (A.T @ A) / max(dt ** 2, _EPS)
+
+def _build_update_matrix(R_inv: np.ndarray) -> np.ndarray:
+    """
+    STOMP's update projection M (Kalakrishnan et al. 2011, sec. III):
+
+        M = R^-1, with each column scaled so its largest element is 1/N
+
+    and the update is  delta_xi = M @ sum_k w_k * eps_k, not the bare sum.
+
+    Why it is needed: each eps_k is drawn from N(0, R^-1) and so is smooth on
+    its own, but the probability-weighted SUM is not -- the weights depend on
+    the sampled costs, so the average leaves the smooth subspace the samples
+    came from.  M is the low-pass filter that puts it back, and it is the
+    reason the paper's updates keep a trajectory smooth.  Without it nothing
+    constrains the high-frequency content of the step, and the result shows
+    visible kinks (worst at the endpoints, where the finite-difference jerk
+    term is blind).
+
+    Why the column normalisation matters, and why dropping M was a misdiagnosis:
+    a previous version removed the projection because `R_inv @ delta` exploded
+    the step ("row sums ~1,000,000").  Measured, that gain belonged to the
+    SINGULAR (T-2, T) smoothness matrix plus its 1e-6 ridge -- ||R_old^-1||_inf
+    is 1.6e6 for every T -- which commit 26b73fe already fixed.  With the
+    full-rank (T+2, T) operator, ||R^-1||_inf is 3.2 (T=12), 27.6 (T=15),
+    5.3 (T=40), and the paper's normalisation bounds the row sums by 1, giving
+    ||M||_inf <= 0.94.  So the step stays the size of the noise that produced
+    it, and the update comes out ~260x smoother (normalised second differences
+    5.00 -> 0.019 at T=12).
+    """
+    n = R_inv.shape[0]
+    M = np.array(R_inv, dtype=float, copy=True)
+    column_max = M.max(axis=0)
+    return M / np.maximum(column_max, _EPS) / float(n)
+
 
 def _build_precision_inverse(R: np.ndarray) -> np.ndarray:
     """
@@ -90,26 +143,26 @@ def _sample_noise(
     Returns
     -------
     noise : (K, T, n_dof)
-        Each noise[k] is a smooth perturbation. std ? 1 per waypoint so
+        Each noise[k] is a smooth perturbation. std ≈ 1 per waypoint so
         that noise_scale has direct physical meaning (metres, radians, etc).
 
     Why normalize L?
     ----------------
     The raw Cholesky factor L = chol(R^{-1}) amplifies white noise z by
     sqrt(diag(R^{-1})).  For typical STOMP parameters (T=40, dt=1/39),
-    diag(R^{-1}) ? 25,000, so L amplifies by ~158x.  Without normalization,
-    noise_scale=0.1 produces noise with std?15.8 ? catastrophically large
+    diag(R^{-1}) ≈ 25,000, so L amplifies by ~158x.  Without normalization,
+    noise_scale=0.1 produces noise with std≈15.8 — catastrophically large
     for a drone flying over a few metres.
 
     Dividing L by L_scale = sqrt(max diag(R^{-1})) makes the resulting
-    noise have std?1 regardless of T and dt, so noise_scale directly
+    noise have std≈1 regardless of T and dt, so noise_scale directly
     controls the perturbation magnitude in the robot's configuration units.
     The smoothness shape of the noise (low-frequency bias) is preserved
     because we scale the whole matrix uniformly.
     """
     T = R_inv.shape[0]
     L = np.linalg.cholesky(R_inv)                        # (T, T)
-    L_scale = np.sqrt(np.diag(R_inv).max())              # scalar ? 158 for T=40
+    L_scale = np.sqrt(np.diag(R_inv).max())              # scalar ≈ 158 for T=40
     L_norm  = L / max(float(L_scale), _EPS)              # unit-scale Cholesky
 
     z     = rng.standard_normal(size=(n_samples, T, n_dof))  # (K, T, n_dof)
@@ -152,11 +205,11 @@ def _fd_jerk(xi: np.ndarray, dt: float) -> np.ndarray:
     ---------------------------
     STOMP's original paper uses torque as the smoothness cost because it
     has a physical meaning for manipulators.  Here we substitute jerk
-    (third derivative of position) as a proxy ? it is model-free, applies
+    (third derivative of position) as a proxy — it is model-free, applies
     to any robot type, and matches the _jerk_cost() logic in problem.py.
 
     Central difference for the third derivative:
-        d�q/dt� ? (-q_{t-2} + 2q_{t-1} - 2q_{t+1} + q_{t+2}) / (2 dt�)
+        d³q/dt³ ≈ (-q_{t-2} + 2q_{t-1} - 2q_{t+1} + q_{t+2}) / (2 dt³)
     Endpoints are extrapolated from their nearest computed value.
     """
     T   = xi.shape[0]
@@ -191,14 +244,18 @@ def _jerk_cost_numpy(
     virtual_weight: float,
 ) -> float:
     """
-    Jerk cost matching the _jerk_cost() formula in problem.py.
+    STOMP's internal jerk cost.
 
-    problem.py scales by duration^6 to make the cost dimensionless with
-    respect to the trajectory duration.  We replicate that here so that
-    the obstacle and jerk weights have the same order of magnitude across
-    different trajectory lengths.
+    This is NOT comparable with problem.py's jerk cost and must not be used
+    to compare planners: FOCI sums over samples while this averages over
+    waypoints (a factor of T), and a 4-point stencil on a handful of
+    waypoints recovers only a fraction of the true jerk of the same curve.
+    Use benchmark.utils.jerk_metric for anything cross-planner.
 
-        cost = weight * duration^6 * mean( jerk� ) over real/virtual joints
+    The duration^6 factor is kept only so that the obstacle and jerk weights
+    keep the same order of magnitude across different trajectory lengths.
+
+        cost = weight * duration^6 * mean( jerk² ) over real/virtual joints
     """
     jrk            = _fd_jerk(xi, dt)                # (T, n_dof)
     duration_factor = max(duration, _EPS) ** 6
@@ -228,22 +285,22 @@ def _constraint_violation_cost(
     Unlike FOCI/CHOMP (which enforce hard bounds via NLP constraints or
     clipping), STOMP adds the *magnitude of the violation* to the cost.
     Noisy samples that violate constraints are thus assigned high cost and
-    receive low weight in the update ? they are naturally suppressed
+    receive low weight in the update — they are naturally suppressed
     without disrupting the sampling process.
 
     Three violation types are penalised:
 
     1. Velocity:
-         For real joints:    max(0, |dq/dt| ? wmax)
-         For virtual joints: max(0, ||dq_virtual/dt||� ? virt_wmax�)
+         For real joints:    max(0, |dq/dt| − wmax)
+         For virtual joints: max(0, ||dq_virtual/dt||² − virt_wmax²)
          (mirrors the quadratic virtual-joint constraint in problem.py)
 
     2. Acceleration:
-         For real joints:    max(0, |d�q/dt�| ? amax)
-         For virtual joints: max(0, ||d�q_virtual/dt�||� ? virt_amax�)
+         For real joints:    max(0, |d²q/dt²| − amax)
+         For virtual joints: max(0, ||d²q_virtual/dt²||² − virt_amax²)
 
     3. Joint limits:
-         max(0, lower ? q)  +  max(0, q ? upper)  for each DOF and waypoint.
+         max(0, lower − q)  +  max(0, q − upper)  for each DOF and waypoint.
     """
     vel = _fd_velocity(xi, dt)       # (T, n_dof)
     acc = _fd_acceleration(xi, dt)   # (T, n_dof)
@@ -303,7 +360,7 @@ def _constraint_violation_cost(
 def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
     """
     Compile one CasADi function per robot Gaussian:
-        collision_fn_g(x: R�) ? (cost: R, grad: R�)
+        collision_fn_g(x: R³) → (cost: R, grad: R³)
 
     Why per-Gaussian instead of one joint function?
     -----------------------------------------------
@@ -325,7 +382,7 @@ def _build_collision_fn(robot, environment) -> tuple[cas.Function, list]:
 
     for g in range(n_gaussians):
         x_sym = cas.MX.sym(f"x_stomp_g{g}", 3)
-        pt    = x_sym.T                             # (1, 3) ? ConvolutionFunctor expects (num_points, 3)
+        pt    = x_sym.T                             # (1, 3) — ConvolutionFunctor expects (num_points, 3)
 
         combined_cov     = environment.obstacle_covariances + robot_covariances[g]
         combined_cov_det = np.linalg.det(combined_cov)
@@ -367,8 +424,15 @@ def _obstacle_cost_trajectory(
     For each waypoint t and each robot Gaussian g, we:
       1. Compute the Gaussian's 3-D position via FK (collision_geometry_fn).
       2. Evaluate the convolution cost at that position.
-      3. Sum over waypoints and Gaussians, normalise by n_gaussians
-         (matching the `/ n_gaussians` in _obstacle_cost() of problem.py).
+      3. Average over waypoints, Gaussians and obstacles.
+
+    The average over obstacles comes from the functor itself: it is built with
+    num_points=1, so its normaliser is 1 / n_obstacles.  What is left is the
+    division by n_gaussians AND by T.  Dividing only by n_gaussians -- as this
+    did -- leaves a cost T times larger than problem.py's for the same
+    geometry, which silently made `weights["obstacle"]` mean something T times
+    heavier here than in FOCI and broke the very comparison this planner
+    exists for.  With both divisions, weights["obstacle"] is in FOCI's units.
     """
     T    = xi.shape[0]
     cost = 0.0
@@ -382,7 +446,7 @@ def _obstacle_cost_trajectory(
             c = float(collision_cost_fns[g](pts_np[g]))
             cost += c
 
-    return cost / max(float(n_g), _EPS)
+    return cost / max(float(n_g) * float(T), _EPS)
 
 
 # =============================================================================
@@ -393,13 +457,18 @@ def _compute_sample_weights(costs: np.ndarray, temperature: float) -> np.ndarray
     """
     Convert per-sample costs to probability weights using the softmin.
 
-        w_k = exp(-h * (Q_k - min Q)) / ? exp(-h * (Q_k - min Q))
+        w_k = exp(-h * (Q_k - min Q) / (max Q - min Q)) / Σ (...)
 
-    Subtracting min Q before exponentiating prevents numerical underflow
-    when costs are large.  The temperature h controls how sharply the
-    distribution concentrates on the best samples:
-      - Large h  ? winner-takes-all (only the best sample matters).
-      - Small h  ? uniform averaging (all samples contribute equally).
+    Costs are shifted by their minimum AND divided by their range, as in
+    Kalakrishnan et al.  The range normalisation is what makes h dimensionless:
+    without it, h carries units of 1/cost, and since these costs are dominated
+    by a jerk term of order 1e4-1e5, any h around 10 collapses the weights onto
+    a single sample and STOMP degenerates into greedy 1-sample random search.
+
+    The temperature h controls how sharply the distribution concentrates on
+    the best samples:
+      - Large h  → winner-takes-all (only the best sample matters).
+      - Small h  → uniform averaging (all samples contribute equally).
 
     Parameters
     ----------
@@ -410,9 +479,9 @@ def _compute_sample_weights(costs: np.ndarray, temperature: float) -> np.ndarray
     -------
     weights : (K,)  normalised, sum to 1
     """
-    shifted   = costs - costs.min()
-    log_w     = -temperature * shifted
-    log_w    -= log_w.max()             # numerical stability
+    spread    = float(costs.max() - costs.min())
+    shifted   = (costs - costs.min()) / max(spread, _EPS)
+    log_w     = -temperature * shifted  # already <= 0, so exp cannot overflow
     weights   = np.exp(log_w)
     total     = weights.sum()
     if total < _EPS:
@@ -433,7 +502,7 @@ class STOMPPlanner:
     Drop-in replacement for ``Planner`` and ``CHOMPPlanner``:
 
         planner = STOMPPlanner(robot, env, joint_groups, ...)
-        result  = planner.plan(start, goal)   # ? PlanningResult
+        result  = planner.plan(start, goal)   # → PlanningResult
 
     Key difference from CHOMP
     -------------------------
@@ -456,20 +525,31 @@ class STOMPPlanner:
     num_waypoints : int
         Number of trajectory waypoints T.
     n_samples : int
-        K ? number of noisy trajectories sampled per iteration.
-        More samples ? more stable update but higher cost per iteration.
+        K — number of noisy trajectories sampled per iteration.
+        More samples → more stable update but higher cost per iteration.
     max_iter : int
         Maximum number of update iterations.
     temperature : float
-        h ? controls sharpness of the softmin weight distribution.
+        h — controls sharpness of the softmin weight distribution.
         Higher values make the update concentrate on the best sample.
     weights : dict[str, float] | None
         Per-term cost weights: 'obstacle', 'jerk', 'constraint'.
     convergence_tol : float
-        Stop early if ||??|| < tol.
+        Stop early when the total cost fails to improve by more than this
+        much for `patience` consecutive iterations.  It is measured on the
+        cost and not on ||Δξ||, because the step size has a floor set by
+        noise_scale and can never reach a small tolerance however good the
+        trajectory already is.
     noise_scale : float
         Global scaling applied to all sampled noise perturbations.
         Increase if the optimizer is stuck; decrease for fine-tuning.
+    noise_decay : float
+        Per-iteration multiplicative decay of noise_scale.  Without it the
+        exploration never narrows and the trajectory keeps random-walking
+        around the optimum.
+    patience : int
+        Number of consecutive non-improving iterations tolerated before
+        declaring convergence.
     seed : int | None
         Random seed for reproducibility.
     total_time : float
@@ -489,6 +569,8 @@ class STOMPPlanner:
         weights:         dict[str, float] | None = None,
         convergence_tol: float = 1e-4,
         noise_scale:     float = 0.1,
+        noise_decay:     float = 0.99,
+        patience:        int   = 20,
         seed:            int | None = None,
         total_time:      float = 1.0,
     ):
@@ -501,7 +583,22 @@ class STOMPPlanner:
         self.temperature     = float(temperature)
         self.convergence_tol = float(convergence_tol)
         self.noise_scale     = float(noise_scale)
+        self.noise_decay     = float(noise_decay)
+        self.patience        = int(patience)
         self.total_time      = float(total_time)
+
+        # max_iter >= 1 so the optimisation loop runs at least once: the
+        # post-loop cost breakdown reads values the loop body defines.
+        # num_waypoints >= 3 so the finite-difference derivatives and the
+        # (T+2, T) smoothness operator are well defined.
+        if self.max_iter < 1:
+            raise ValueError(f"max_iter must be at least 1, got {self.max_iter}.")
+        if self.num_waypoints < 3:
+            raise ValueError(
+                f"num_waypoints must be at least 3, got {self.num_waypoints}."
+            )
+        if self.n_samples < 1:
+            raise ValueError(f"n_samples must be at least 1, got {self.n_samples}.")
 
         self.weights = {
             "obstacle":   1.0,
@@ -539,8 +636,8 @@ class STOMPPlanner:
         # not inside plan(), to amortise compilation cost over repeated calls)
         # ------------------------------------------------------------------
 
-        # FK + Jacobian for each collision point ? needed to map
-        # q ? 3-D position of each robot Gaussian.
+        # FK + Jacobian for each collision point — needed to map
+        # q → 3-D position of each robot Gaussian.
         self._collision_geometry_fn = self._build_collision_geometry_fn()
 
         # Per-Gaussian convolution cost evaluated at a single 3-D point.
@@ -550,10 +647,11 @@ class STOMPPlanner:
 
         # Build the smoothness precision matrix R once.
         # R^{-1} (its Cholesky factor L) is used only for noise sampling.
-        # It is NOT applied to the update step ? see plan() block 3e.
+        # It is NOT applied to the update step — see plan() block 3e.
         R           = _build_smoothness_matrix(self.num_waypoints, self.dt)
         self._R     = R
-        self._R_inv = _build_precision_inverse(R)   # kept for noise sampling via cholesky(R_inv)
+        self._R_inv = _build_precision_inverse(R)   # noise sampling via cholesky(R_inv)
+        self._M     = _build_update_matrix(self._R_inv)  # update projection
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -561,7 +659,7 @@ class STOMPPlanner:
 
     def _build_collision_geometry_fn(self) -> cas.Function:
         """
-        CasADi function:  q (n_dof,) ? points (n_g, 3), J_stack (3*n_g, n_dof)
+        CasADi function:  q (n_dof,) → points (n_g, 3), J_stack (3*n_g, n_dof)
 
         Identical to CHOMPPlanner._build_collision_geometry_function().
         Compiled once; evaluated numerically for every (sample, waypoint).
@@ -586,7 +684,7 @@ class STOMPPlanner:
         """
         Evaluate the total scalar cost of a trajectory xi (T, n_dof).
 
-        Three additive terms ? all weighted by self.weights:
+        Three additive terms — all weighted by self.weights:
 
         1. Obstacle cost
            Gaussian convolution summed over waypoints and body points,
@@ -645,7 +743,7 @@ class STOMPPlanner:
         Hard-clip a trajectory to the robot's joint limits.
 
         In STOMP this is applied only to the *mean* trajectory after the
-        update step ? not to the noisy samples.  Clipping the samples would
+        update step — not to the noisy samples.  Clipping the samples would
         bias the noise distribution and corrupt the probability weights.
         The joint-limit *cost* on the samples already discourages violations
         without distorting the distribution.
@@ -702,7 +800,7 @@ class STOMPPlanner:
             )
 
         # ==============================================================
-        # Block 1 ? Initialiser
+        # Block 1 – Initialiser
         # ==============================================================
         init_start = perf_counter()
 
@@ -730,7 +828,7 @@ class STOMPPlanner:
         init_time = perf_counter() - init_start
 
         # ==============================================================
-        # Block 2 ? Build  (matrices already prepared in __init__)
+        # Block 2 – Build  (matrices already prepared in __init__)
         # ==============================================================
         build_start = perf_counter()
         # R and R_inv were built in __init__ to amortise compilation.
@@ -738,17 +836,22 @@ class STOMPPlanner:
         build_time = perf_counter() - build_start
 
         # ==============================================================
-        # Block 3 ? STOMP optimisation loop
+        # Block 3 – STOMP optimisation loop
         # ==============================================================
         solve_start = perf_counter()
 
         converged              = False
+        best_cost              = np.inf
+        stalled_iters          = 0
         iterations_run         = 0
         final_cost             = np.inf
         final_obstacle_cost    = np.inf
         final_jerk_cost        = np.inf
         final_constraint_cost  = np.inf
         final_update_norm      = np.inf
+        # Defined before the loop: the post-loop breakdown reads it, and it
+        # would be an unbound local if the loop body never ran.
+        update_norm            = np.inf
 
         for iteration in range(self.max_iter):
             iterations_run = iteration + 1
@@ -759,8 +862,10 @@ class STOMPPlanner:
             # noise shape: (K, T, n_dof)
             # Each noise[k] is drawn from N(0, R^{-1}) so it is smooth
             # by construction and has zero mean across samples.
+            decay = self.noise_decay ** iteration
             noise = (
                 self.noise_scale
+                * decay
                 * _sample_noise(self._R_inv, n_dof, self.n_samples, self._rng)
             )
 
@@ -778,34 +883,27 @@ class STOMPPlanner:
                 costs[k]      = self._total_cost(xi_k)
 
             # ----------------------------------------------------------
-            # 3c. Compute sample weights  w_k ? exp(-h � Q_k)
+            # 3c. Compute sample weights  w_k ∝ exp(-h · Q_k)
             # ----------------------------------------------------------
             weights = _compute_sample_weights(costs, self.temperature)  # (K,)
 
             # ----------------------------------------------------------
             # 3d. Compute the probability-weighted noise sum
             # ----------------------------------------------------------
-            # delta_xi[t, d] = ?_k w_k * noise[k, t, d]
+            # delta_xi[t, d] = Σ_k w_k * noise[k, t, d]
             # Shape: (T, n_dof)
             delta_xi = np.einsum("k,ktd->td", weights, noise)           # (T, n_dof)
 
             # ----------------------------------------------------------
-            # 3e. Apply the update  ?? = ?_k w_k ??_k
+            # 3e. Apply the update  Δξ = M · Σ_k w_k δξ_k
             # ----------------------------------------------------------
-            # delta_xi is already smooth because every noise[k] was sampled
-            # from N(0, R^{-1}): low-frequency modes dominate, high-frequency
-            # modes are suppressed by construction.
-            #
-            # We do NOT multiply by R^{-1} here.  R^{-1} has diagonal
-            # values ~25,000 and row sums ~1,000,000 (for T=40, dt=1/39).
-            # Applying it to delta_xi (magnitude ~0.03-0.1 units) would
-            # produce updates of ~100,000 units ? exactly the teleportation
-            # bug observed with DroneRobot (DOFs are metres, not radians).
-            #
-            # The noise sampling step (3a) already encodes the smoothness
-            # prior via cholesky(R^{-1}); applying R^{-1} again in the
-            # update would double-count it and explode the step size.
-            xi_new = xi + delta_xi
+            # M is the paper's update projection (see _build_update_matrix).
+            # The probability-weighted noise sum is not smooth by itself --
+            # the weights depend on the costs -- so M is what keeps the
+            # trajectory smooth.  Its column normalisation bounds the step,
+            # which is what an earlier version was missing when it dropped
+            # the projection to stop the update exploding.
+            xi_new = xi + self._M @ delta_xi
 
             # ----------------------------------------------------------
             # 3f. Re-pin endpoints and clip to joint limits
@@ -822,9 +920,19 @@ class STOMPPlanner:
             update_norm = float(np.linalg.norm(xi_new - xi))
             xi          = xi_new
 
-            if update_norm < self.convergence_tol:
-                converged = True
-                break
+            # Convergence on the cost, not on the step: ||Δξ|| is bounded
+            # below by the sampled noise, so testing it against a tolerance
+            # like 1e-3 can never succeed.
+            current_cost = self._total_cost(xi)
+
+            if best_cost - current_cost < self.convergence_tol:
+                stalled_iters += 1
+                if stalled_iters >= self.patience:
+                    converged = True
+                    break
+            else:
+                best_cost     = current_cost
+                stalled_iters = 0
 
         # ----------------------------------------------------------
         # Final cost breakdown on the converged mean trajectory
@@ -858,11 +966,28 @@ class STOMPPlanner:
         final_cost     = final_obstacle_cost + final_jerk_cost + final_constraint_cost
         final_update_norm = update_norm
 
+        # The constraint term above is a soft penalty whose weight relative to
+        # the jerk term is arbitrary, so the returned trajectory may well
+        # violate the limits.  Report the uniform time scaling that would make
+        # it feasible, which is comparable across planners.
+        # num_samples=self.num_waypoints, NOT the default 200: the metric is
+        # resolution dependent (see src/benchmark/utils.py) and leaving the
+        # default inflates the scale by ~3x on a 12-waypoint trajectory, so
+        # this metadata would contradict the benchmark table, which passes
+        # num_waypoints.
+        limit_scale, feasible_duration = limit_scaling_factor(
+            xi,
+            duration=self.total_time,
+            joint_groups=self.joint_groups,
+            n_dof=n_dof_final,
+            num_samples=self.num_waypoints,
+        )
+
         solve_time = perf_counter() - solve_start
         total_time = perf_counter() - total_start
 
         # ==============================================================
-        # Block 4 ? Pack PlanningResult
+        # Block 4 – Pack PlanningResult
         # ==============================================================
         return PlanningResult(
             trajectory         = xi,
@@ -888,8 +1013,12 @@ class STOMPPlanner:
                 "n_samples":             self.n_samples,
                 "temperature":           self.temperature,
                 "noise_scale":           self.noise_scale,
+                "noise_decay":           self.noise_decay,
+                "patience":              self.patience,
                 "weights":               self.weights,
                 "dt":                    self.dt,
                 "total_time":            self.total_time,
+                "limit_scale":           limit_scale,
+                "feasible_duration":     feasible_duration,
             },
         )

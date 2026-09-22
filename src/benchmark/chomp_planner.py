@@ -21,6 +21,7 @@ from typing import Any
 import casadi as cas
 import numpy as np
 
+from src.benchmark.utils import limit_scaling_factor
 from src.environment.convolution import ConvolutionFunctor
 from src.planning.joints import JointGroups
 from src.planning.result import PlanningResult
@@ -43,6 +44,23 @@ def _build_chomp_metric_matrix(
     dt: float,
     ridge: float = 1e-8,
 ) -> np.ndarray:
+    """
+    Build the finite-dimensional CHOMP metric A for the interior waypoints.
+
+    The full trajectory has T waypoints, but the endpoints are fixed. Therefore
+    the optimization variable contains only T - 2 interior waypoints.
+
+    For the basic squared-velocity smoothness functional,
+
+        F_smooth = 0.5 * integral ||dq/dt||^2 dt,
+
+    the finite-difference gradient on interior waypoints is proportional to
+
+        2 q_t - q_{t-1} - q_{t+1}.
+
+    Hence A is the tridiagonal matrix with 2 on the diagonal and -1 on the
+    first off-diagonals, scaled by 1 / dt.
+    """
     if num_waypoints < 3:
         raise ValueError("num_waypoints must be at least 3.")
 
@@ -60,6 +78,11 @@ def _build_chomp_metric_matrix(
 
 
 def _smoothness_gradient_full(xi: np.ndarray, dt: float) -> np.ndarray:
+    """
+    Gradient of the squared-velocity smoothness cost w.r.t. all waypoints.
+
+    Endpoints are filled with zero because they are fixed and are not optimized.
+    """
     grad = np.zeros_like(xi)
     grad[1:-1] = (2.0 * xi[1:-1] - xi[:-2] - xi[2:]) / max(float(dt), _EPS)
     return grad
@@ -82,6 +105,7 @@ class CHOMPPlanner:
         weights: dict[str, float] | None = None,
         convergence_tol: float = 1e-4,
         joint_limit_margin: float = 1e-6,
+        total_time: float = 1.0,
     ):
         self.robot = robot
         self.environment = environment
@@ -98,7 +122,13 @@ class CHOMPPlanner:
             **(weights or {}),
         }
 
-        self.dt = 1.0 / max(self.num_waypoints - 1, 1)
+        # Horizon of the trajectory.  It must be settable: the covariant step
+        # balances the obstacle gradient (dt-invariant) against the smoothness
+        # gradient (scales as 1/dt), so a hardcoded 1.0 makes the same nominal
+        # weights mean something 2-5x different from STOMP's, which is given
+        # total_time=2.0 or 5.0 by the benchmarks.
+        self.total_time = float(total_time)
+        self.dt = self.total_time / max(self.num_waypoints - 1, 1)
 
         self._robot_covariances = self._load_robot_collision_covariances()
         self._n_collision_points = int(self._robot_covariances.shape[0])
@@ -127,6 +157,14 @@ class CHOMPPlanner:
         return cas.Function("chomp_ee", [q], [self.robot.f_task(q)])
 
     def _build_collision_geometry_function(self) -> cas.Function:
+        """
+        Return body-point positions and their kinematic Jacobians.
+
+        Output:
+            points:  shape (n_collision_points, 3)
+            J_stack: shape (3 * n_collision_points, n_dof)
+                     rows 3*i:3*i+3 are the Jacobian of point i.
+        """
         q = cas.MX.sym("q_chomp_geom", self.robot.n_dof)
         points = self.robot.collision_points(q)
 
@@ -144,6 +182,12 @@ class CHOMPPlanner:
         )
 
     def _build_workspace_cost_gradient_functions(self) -> list[cas.Function]:
+        """
+        Build one workspace cost/gradient function per robot body point.
+
+        The cost for each robot Gaussian uses the convolution between the
+        environment Gaussian obstacles and that robot Gaussian.
+        """
         funs: list[cas.Function] = []
 
         for point_idx in range(self._n_collision_points):
@@ -156,7 +200,7 @@ class CHOMPPlanner:
 
             convolution = ConvolutionFunctor(
                 f"chomp_workspace_obs_{point_idx}",
-                1,                                      # num_points = 1 (one body point at a time)
+                1,                       # num_points = 1 (one waypoint at a time)
                 self.environment.obstacle_means,
                 covs_det,
                 covs_inv,
@@ -253,17 +297,31 @@ class CHOMPPlanner:
 
             xi = self._resample_trajectory(xi)
 
+        # The endpoints are hard constraints.
         xi[0] = start
         xi[-1] = goal
 
         xi = self._clip_to_joint_limits(xi)
 
+        # Re-impose endpoints after clipping. If the external planner gives a
+        # valid final configuration, this preserves it exactly.
         xi[0] = start
         xi[-1] = goal
 
         return xi
 
     def _obstacle_cost_and_gradient_full(self, xi: np.ndarray) -> tuple[float, np.ndarray]:
+        """
+        Approximate the CHOMP obstacle functional gradient.
+
+        For each robot body point x(q, u), CHOMP uses the arc-length weighted
+        workspace obstacle functional and maps its workspace gradient back to
+        configuration space through the body-point Jacobian:
+
+            J^T ||x_dot|| [ (I - x_hat x_hat^T) grad c - c kappa ].
+
+        The endpoints are not assigned obstacle gradients because they are fixed.
+        """
         T = xi.shape[0]
         grad = np.zeros_like(xi)
         obstacle_cost = 0.0
@@ -298,6 +356,9 @@ class CHOMPPlanner:
                     projection = eye3 - np.outer(tangent, tangent)
                     curvature = (projection @ acceleration) / max(speed * speed, _EPS)
                 else:
+                    # Degenerate local motion: the orthogonal direction is
+                    # undefined. Use the full workspace gradient and zero
+                    # curvature as a stable fallback.
                     projection = eye3
                     curvature = np.zeros(3, dtype=float)
                     speed = _EPS
@@ -353,8 +414,11 @@ class CHOMPPlanner:
                 + self.weights["obstacle"] * obstacle_grad
             )
 
+            # Fixed endpoint constraints: only interior waypoints are optimized.
             grad_inner = grad[1:-1]
 
+            # Covariant CHOMP step: xi <- xi - alpha * A^{-1} grad.
+            # np.linalg.solve avoids forming A^{-1} explicitly.
             covariant_step = np.linalg.solve(A, grad_inner)
 
             xi_new = xi.copy()
@@ -362,6 +426,7 @@ class CHOMPPlanner:
 
             xi_new = self._clip_to_joint_limits(xi_new)
 
+            # Hard constraints: endpoints stay exactly fixed.
             xi_new[0] = start
             xi_new[-1] = goal
 
@@ -385,6 +450,23 @@ class CHOMPPlanner:
 
         final_ee = self._ee_position(xi[-1])
         goal_error = float(np.linalg.norm(xi[-1] - goal))
+
+        # CHOMP's objective has no velocity/acceleration term at all, so the
+        # trajectory it returns is not dynamically feasible in general.
+        # Report the uniform time scaling that would make it feasible, so it
+        # can be compared against a planner that enforces the limits.
+        # num_samples=self.num_waypoints, NOT the default 200: the metric is
+        # resolution dependent (see src/benchmark/utils.py) and leaving the
+        # default inflates the scale by ~3x on a 12-waypoint trajectory, so
+        # this metadata would contradict the benchmark table, which passes
+        # num_waypoints.
+        limit_scale, feasible_duration = limit_scaling_factor(
+            xi,
+            duration=self.total_time,
+            joint_groups=self.joint_groups,
+            n_dof=int(xi.shape[1]),
+            num_samples=self.num_waypoints,
+        )
 
         return PlanningResult(
             trajectory=xi,
@@ -412,6 +494,9 @@ class CHOMPPlanner:
                 "learning_rate": self.learning_rate,
                 "weights": self.weights,
                 "dt": self.dt,
+                "total_time": self.total_time,
+                "limit_scale": limit_scale,
+                "feasible_duration": feasible_duration,
                 "endpoint_mode": "fixed_start_and_fixed_configuration_goal",
                 "optimized_waypoints": "interior_only",
             },

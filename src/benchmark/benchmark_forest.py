@@ -10,14 +10,14 @@ from src.initialize.rrtstar_initializer import RRTStarInitializer
 from src.planning.planner import Planner
 from src.planning.joints import JointGroups
 from src.visualization.visualizer import RobotVisualizer
-from benchmark.utils import minimum_robot_environment_distance
-from benchmark.stomp_planner import STOMPPlanner
-from benchmark.chomp_planner import CHOMPPlanner
+from src.benchmark.utils import minimum_robot_environment_distance, path_length
+from src.benchmark.stomp_planner import STOMPPlanner
+from src.benchmark.chomp_planner import CHOMPPlanner
 
 
 
 def benchmark_forest(): 
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     ply_file = os.path.join(PROJECT_ROOT, "data/Forest.ply")
 
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
@@ -123,9 +123,21 @@ def benchmark_forest():
         initial_trajectory=foci_result.initial_trajectory,
     )
 
-
+    foci_min_dist, info = minimum_robot_environment_distance(robot,environment,foci_result.trajectory)
     stomp_min_dist, info = minimum_robot_environment_distance(robot,environment,stomp_result.trajectory)
     chomp_min_dist, info = minimum_robot_environment_distance(robot,environment,chomp_result.trajectory)
+    
+    
+    foci_path_length = path_length(foci_result.trajectory)
+    stomp_path_length = path_length(stomp_result.trajectory)    
+    chomp_path_length = path_length(chomp_result.trajectory)    
+    
+    
+    print("\n--- Planning timings FOCI---")
+    print(f"Build:       {foci_result.timings['build']:.6f} s")
+    print(f"Solver:      {foci_result.timings['solve']:.6f} s")
+    print(f"Total:       {foci_result.timings['total']:.6f} s")
+    print(f"Success:     {foci_result.success}")
 
     print("\n--- Planning timings STOMP---")
     print(f"Build:       {stomp_result.timings['build']:.6f} s")
@@ -142,8 +154,12 @@ def benchmark_forest():
     print("\n--- Benchmark metrics ---")
     print(f"Number of environment gaussians: {len(obstacle_means)}")
     print(f"Number of robot gaussians: {len(gaussian_specs)}")
+    print(f"Minimum robot-environment distance FOCI: {foci_min_dist:.3f} m")
     print(f"Minimum robot-environment distance STOMP: {stomp_min_dist:.3f} m")
     print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
+    print(f"Path length FOCI: {foci_path_length:.3f} m")
+    print(f"Path length STOMP: {stomp_path_length:.3f} m")
+    print(f"Path length CHOMP: {chomp_path_length:.3f} m")
 
 
     vis = RobotVisualizer(
