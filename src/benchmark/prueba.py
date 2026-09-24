@@ -32,11 +32,12 @@ def benchmark_coffee():
     
 
 
-    theta_start = np.array([np.pi/2, -np.pi/2, -np.pi/6, 0.0, 0.0, 0.0])
-    trajectory = np.array([theta_start, theta_start])
+    theta_start = np.array([-np.pi, -2.4627256,  -1.0218003,  -2.5943978,   0.8556023,   0.41983527])
+    theta_final = np.array([-0.76668125, -2.4627256,  -1.0218003,  -2.5943978,   0.8556023,   0.41983527])
+    trajectory = np.array([theta_start, theta_start, theta_final])
 # shoulder_pan=90°, shoulder_lift=-90° (vertical), elbow=-30° (mild fold), wrist_1..3=0
 
-    goal = np.array([0.0, -0.5, 1.5])
+    goal = np.array([-1.5, 2.25, 0.5])
 
     robot = ManipulatorRobot(
         urdf_path="urdfs/ur5/ur5.urdf",

@@ -1,4 +1,5 @@
 import os
+import sys
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -23,7 +24,7 @@ def benchmark_bonsai():
     obstacle_means, obstacle_covs, colors, opacities = extract_splat_data_2(ply_file)
 
     rotation = R.from_euler("x", -90, degrees=True).as_matrix()
-    translation = np.array([0.0, 2.5, 1.0])
+    translation = np.array([0.0, 2.2, 1.0])
     scale_factor = 3.0
     
     obstacle_means = (obstacle_means * scale_factor) @ rotation.T + translation
@@ -43,7 +44,7 @@ def benchmark_bonsai():
     ]
 
     #theta_start = np.array([1.05, -0.23, -1.6, 1.21, -0.85, 0.02])
-    theta_start = np.array([0.0, -np.pi/2.0, 0.0, -np.pi/2.0, np.pi/2.0, 0.0])
+    theta_start = np.array([-3*np.pi/4,-1.8,  -1.0218003,  -2.5943978,   0.8556023,   0.41983527])
     
     goal = np.array([-1.5, 2.25, 0.5])
 
@@ -58,8 +59,8 @@ def benchmark_bonsai():
         virtual_indices=[], 
         virtual_wmax=4.0, 
         virtual_amax=3.5, 
-        real_wmax=4.0, 
-        real_amax=3.0,
+        real_wmax=5.5, 
+        real_amax=4.0,
     )
 
     environment = GaussianEnvironment(
@@ -68,7 +69,7 @@ def benchmark_bonsai():
     )
 
     initializer = RRTStarInitializer(
-        voxel_size=0.02,
+        voxel_size=0.01,
         goal_threshold=0.5,
         random_seed=42,
         max_time=None,   
@@ -83,11 +84,11 @@ def benchmark_bonsai():
         num_samples=25,
         weights={
             "goal": 2.0,
-            "obstacle": 10.0,
-            "jerk":0.1,
+            "obstacle": 16.0,
+            "jerk":0.05,
             "virtual_jerk": 0.01,
         },
-        vmax=3.5,
+        vmax=1.5,
         linear_solver="ma27",
     )
 
@@ -114,7 +115,7 @@ def benchmark_bonsai():
 
     theta_final = np.array(foci_result.trajectory[-1], dtype=np.float32, copy=True)
 
-    
+    print(theta_final)
 
     chomp_result = chomp_planner.plan(
         start=theta_start,
@@ -140,7 +141,7 @@ def benchmark_bonsai():
     print(f"Build:       {chomp_result.timings['build']:.6f} s")
     print(f"Solver:      {chomp_result.timings['solve']:.6f} s")
     print(f"Total:       {chomp_result.timings['total']:.6f} s")
-    print(f"Success:     {chomp_result.success}")
+    print(f"Success:     {chomp_result.success}")#
 
     print("\n--- Benchmark metrics ---")
     print(f"Number of environment gaussians: {len(obstacle_means)}")
@@ -149,6 +150,9 @@ def benchmark_bonsai():
     print(f"Minimum robot-environment distance CHOMP: {chomp_min_dist:.3f} m")
     print(f"Path length FOCI: {foci_path_length:.3f} m")
     print(f"Path length CHOMP: {chomp_path_length:.3f} m")
+
+
+
 
 
 
@@ -162,7 +166,6 @@ def benchmark_bonsai():
     vis.visualize_robot_gaussians()
     vis.visualize_path(name="FOCI")
     vis.visualize_initializer_path(foci_result.initial_trajectory, name="RRT*", color=(255, 0, 0))
-
     vis.visualize_initializer_path(chomp_result.trajectory, name="CHOMP", color=(0, 0, 255))
     vis.visualize_trajectory(loop=True)
 

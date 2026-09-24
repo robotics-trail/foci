@@ -146,14 +146,26 @@ def kernel_jacobian_static(
     obstacle_means: wp.array(dtype=wp.vec3),
     covs_det: wp.array(dtype=wp.float32),
     covs_inv: wp.array(dtype=wp.mat33),
-    grad_means: wp.array(dtype=wp.vec3d),
+    grad_means: wp.array2d(dtype=wp.vec3),
     pi_cubic: wp.float32,
 ):
     """Jacobian of the forward cost w.r.t. robot_means for the static functor.
- 
-    Thread grid: (num_points, num_obstacles).
-    Reduces the per-obstacle contributions into `grad_means[m]` with
-    atomic_add, so the caller gets a (num_points,) buffer directly.
+
+    Thread grid: (num_points, num_obstacles). Each thread owns a unique
+    (m, n) slot in `grad_means` -- no atomics, no contention. The caller
+    reduces over n (see _JacobianStatic.eval).
+
+    This used to accumulate directly into a (num_points,) buffer with
+    atomic_add to save memory, but for small num_points (CHOMP/STOMP always
+    call this functor with num_points=1) that means every one of the
+    num_obstacles threads races to add into the SAME memory location --
+    measured ~19x slower than materialising the full (num_points,
+    num_obstacles) buffer and reducing it with wp.utils.array_sum(axis=1).
+    At float32, that buffer is num_points * num_obstacles * 12 bytes (~6.5 MB
+    for num_points=1 and Bonsai's ~570k obstacles; ~160 MB at num_points=25),
+    which is not a concern on this hardware. If num_points or num_obstacles
+    grows enough for that to matter, prefer capping this buffer's size
+    (e.g. chunking obstacles) over reintroducing the atomic accumulator.
     """
     m, n = wp.tid()
     diff = robot_means[m] - obstacle_means[n]
@@ -162,12 +174,7 @@ def kernel_jacobian_static(
         wp.exp(-0.5 * wp.dot(diff, inv @ diff))
         / (wp.sqrt(covs_det[n]) * pi_cubic)
     )
-    grad = -pdf * inv @ diff
-    wp.atomic_add(
-        grad_means,
-        m,
-        wp.vec3d(wp.float64(grad[0]), wp.float64(grad[1]), wp.float64(grad[2])),
-    )
+    grad_means[m, n] = -pdf * inv @ diff
  
  
 @wp.kernel
@@ -303,12 +310,14 @@ class _JacobianStatic(cas.Callback):
         self._normalizer = normalizer
         self.pi_cubic = float(PI_CUBIC)
  
-        # One slot per body point; obstacle contributions are accumulated in the
-        # kernel with atomic_add.  Materialising a (num_points, num_obstacles)
-        # buffer instead would cost ~30 MB per robot Gaussian for a 1e5-splat
-        # scene and run out of device memory at 1e6.  float64 accumulator: see
-        # the note at the top of this module.
-        self._grad_means = wp.zeros(num_points, dtype=wp.vec3d)
+        # (num_points, num_obstacles) buffer: one unique slot per thread, no
+        # atomics. See the note on kernel_jacobian_static for why -- shrinking
+        # this to (num_points,) with an atomic accumulator (the previous
+        # approach) turns every one of the num_obstacles threads into a
+        # contender on the same memory location whenever num_points is small,
+        # which is CHOMP/STOMP's normal case (num_points=1) and measured
+        # ~19x slower than this.
+        self._grad_means = wp.zeros((num_points, self.num_obstacles), dtype=wp.vec3)
  
         self.construct(name, opts)
  
@@ -329,8 +338,9 @@ class _JacobianStatic(cas.Callback):
     def eval(self, arg):
         robot_means = np.asarray(arg[0], dtype=np.float32).reshape(self.num_points, 3)
         robot_means_wp = wp.from_numpy(robot_means, dtype=wp.vec3)
- 
-        self._grad_means.zero_()
+
+        # Every (m, n) slot is overwritten (not accumulated into) by exactly
+        # one thread, so no zero_() is needed before the launch.
         wp.launch(
             kernel=kernel_jacobian_static,
             dim=(self.num_points, self.num_obstacles),
@@ -344,10 +354,12 @@ class _JacobianStatic(cas.Callback):
             ],
         )
  
-        # Already reduced over obstacles by the kernel.  CasADi indexes a
-        # Jacobian row by vec(input), which is column-major, hence the
-        # transpose of the (num_points, 3) buffer.
-        out = self._grad_means.numpy().T.reshape(1, self.num_points * 3)
+        # GPU-side reduction over obstacles (axis=1), deterministic for a
+        # fixed input buffer (see the note in ConvolutionFunctor.eval).
+        # CasADi indexes a Jacobian row by vec(input), which is column-major,
+        # hence the transpose of the (num_points, 3) buffer.
+        grad = wp.utils.array_sum(self._grad_means, axis=1)  # (num_points,) vec3
+        out = grad.numpy().T.reshape(1, self.num_points * 3)
         return [(out * self._normalizer).astype(np.float64)]
  
  
@@ -437,10 +449,18 @@ class ConvolutionFunctor(BaseConvolutionFunctor):
             ],
         )
  
-        # numpy's pairwise sum over the (num_obstacles,) float64 buffer: the
-        # kernel's atomic_add order is already irreproducible, this final
-        # reduction must not add any further variability on top of it.
-        total = float(self._intermediate.numpy().sum(dtype=np.float64))
+        # GPU-side reduction: pulling the full (num_obstacles,) buffer to the
+        # host before summing (self._intermediate.numpy().sum()) measured 22x
+        # slower here for Bonsai's ~570k obstacles -- it is what made CHOMP's
+        # per-waypoint, per-body-point obstacle evaluation (called far more
+        # often than FOCI's, since it has no batching across waypoints) ~6x
+        # slower after the float32->float64 accumulator change below.
+        # wp.utils.array_sum is deterministic given a fixed input buffer
+        # (verified bit-identical over 30 repeated calls); the atomic_add
+        # order inside the kernel above is the actual source of run-to-run
+        # jitter the float64 accumulator fixes, and this reduction step runs
+        # after that buffer is already finalized, so it adds none of its own.
+        total = float(wp.utils.array_sum(self._intermediate))
         return [np.array([[total * self._normalizer]], dtype=np.float64)]
  
     def get_jacobian(self, name, inames, onames, opts):
@@ -684,8 +704,9 @@ class ConvolutionFunctorOnline(BaseConvolutionFunctor):
             ],
         )
 
-        # See the note in ConvolutionFunctor.eval: deterministic final sum.
-        total = float(self._intermediate.numpy().sum(dtype=np.float64))
+        # See the note in ConvolutionFunctor.eval: GPU-side reduction, not a
+        # full host copy of the (num_obstacles,) buffer.
+        total = float(wp.utils.array_sum(self._intermediate))
         return [np.array([[total * self._normalizer]], dtype=np.float64)]
 
     def get_jacobian(self, name, inames, onames, opts):
