@@ -21,10 +21,57 @@ Every planner in a comparison must therefore be measured at the SAME
 `num_waypoints` explicitly -- never rely on the default.
 """
 
+from time import perf_counter
+
 import numpy as np
 
 
 _EPS = 1e-12
+
+
+def median_solve_time(fn, repeats: int = 3):
+    """
+    Call `fn()` `repeats` times and return (last result, median wall time).
+
+    Ported from the FOCI paper's eval/baselines.py (`_median_time`). A single
+    timed call conflates the planner's steady-state solve time with one-off
+    costs that are not representative of it: IPOPT/CasADi codegen on the
+    first build, and the warp/CUDA kernels behind the obstacle-cost
+    convolution (ConvolutionFunctor) being JIT-compiled on their first
+    launch in the process. A planner must therefore be called once as an
+    untimed warmup before any of these repeats -- the paper eval does this
+    explicitly ("warmup: warp kernel compile must not count as solve time").
+
+    This does mean the planner's `.plan()` runs `repeats + 1` times instead
+    of once, so a benchmark script using this is correspondingly slower.
+    """
+    fn()  # warmup, not timed
+
+    times = []
+    result = None
+
+    for _ in range(repeats):
+        t0 = perf_counter()
+        result = fn()
+        times.append(perf_counter() - t0)
+
+    return result, float(np.median(times))
+
+
+def scene_size(obstacle_means) -> float:
+    """
+    XY diagonal of the obstacle point cloud's bounding box.
+
+    Used to report path length as a dimensionless ratio (length / scene_size)
+    comparable across scenes of different physical size, matching the FOCI
+    paper's eval/baselines.py `_score()` (`lengths.append(s[-1] / scene_size)`).
+    The current benchmarks only ever reported the raw, scene-size-dependent
+    length.
+    """
+    means = np.asarray(obstacle_means, dtype=float)
+    extent = means.max(axis=0) - means.min(axis=0)
+
+    return float(np.hypot(extent[0], extent[1]))
 
 
 def resample_trajectory(trajectory, num_samples: int) -> np.ndarray:
@@ -248,20 +295,76 @@ def path_lengths(trajectories: dict) -> dict:
     return {name: path_length(trajectory) for name, trajectory in trajectories.items()}
 
 
-def minimum_robot_environment_distance(robot, environment, trajectory):
+def minimum_robot_environment_distance(
+    robot,
+    environment,
+    trajectory,
+    opacities: np.ndarray | None = None,
+    opacity_min: float = 0.5,
+    sigma: float = 1.0,
+    n_neighbours: int = 96,
+):
     """
-    Smallest centre-to-centre distance between any robot Gaussian and any
-    obstacle Gaussian along the trajectory.
+    Smallest surface-to-surface clearance between any robot Gaussian and any
+    obstacle Gaussian along the trajectory, at the `sigma` level.
 
-    Note this ignores the Gaussians' extents: it is a distance between
-    centres, not a clearance to the surfaces.  It is the same quantity for
-    every planner, so it compares fine.
+    This used to report plain centre-to-centre distance between Gaussian
+    means, which is not a clearance at all -- a robot Gaussian sitting right
+    at an obstacle's 1-sigma boundary and one still a metre away could report
+    the same number, since neither Gaussian's extent was taken into account.
 
-    Vectorised over obstacles: the previous triple Python loop made the metric
-    unusable on splat-sized environments (10^5 obstacles), which is why it was
-    only ever evaluated at a dozen samples.
+    The two Gaussians are combined via a Minkowski sum
+    (combined_cov = robot_cov + obstacle_cov), exactly matching the
+    obstacle-avoidance cost every planner in this repo already optimises
+    against (see ConvolutionFunctor's callers: problem.py, chomp_planner.py,
+    stomp_planner.py all build `obstacle_covariances + robot_covariances[g]`).
+    The reported distance is from the robot Gaussian's centre to the
+    `sigma`-level surface of that combined ellipsoid centred at the
+    obstacle's mean, found by bisection on the ellipsoid's principal axes
+    (ported from the FOCI paper's eval/baselines.py Environment class, which
+    only accounted for the obstacle's own extent since its baselines used a
+    fixed-radius sphere robot -- this generalises it to a robot Gaussian with
+    its own covariance).  A negative value means the robot centre is already
+    inside the combined ellipsoid (penetration estimate, not exact).
+
+    `opacities`, when given (shape (n_obstacles,) or (n_obstacles, 1)),
+    drops obstacles with opacity <= `opacity_min` before measuring, matching
+    the paper eval's OPACITY_MIN=0.5 -- a hallucinated near-transparent splat
+    should not count as a safety violation.
+
+    Nearest-neighbour candidates per (sample, robot Gaussian) are found with
+    a KD-tree (`n_neighbours`, matching the paper eval's 96) instead of
+    testing every obstacle: the previous centre-distance version vectorised
+    over all obstacles at once, which does not extend to a per-obstacle
+    bisection (60 iterations each) without becoming the triple Python loop
+    this function was rewritten to avoid in the first place.
     """
+    from scipy.spatial import cKDTree
+
     obstacle_means = np.asarray(environment.obstacle_means, dtype=float)
+    obstacle_covs = np.asarray(environment.obstacle_covariances, dtype=float)
+
+    if opacities is not None:
+        keep = np.asarray(opacities, dtype=float).reshape(-1) > opacity_min
+        kept_indices = np.flatnonzero(keep)
+        obstacle_means = obstacle_means[keep]
+        obstacle_covs = obstacle_covs[keep]
+    else:
+        kept_indices = None
+
+    if obstacle_means.shape[0] == 0:
+        return np.inf, None
+
+    tree = cKDTree(obstacle_means)
+    robot_covs = np.asarray(robot.collision_covariances(), dtype=float)  # (G, 3, 3)
+
+    # Conservative candidate radius per robot Gaussian: sqrt(max eigenvalue)
+    # of the obstacle covariances (computed once, not per query) plus this
+    # robot Gaussian's own, so the KD-tree ball cannot miss the true nearest
+    # surface -- it may include extra, harmless candidates instead.
+    obstacle_max_eig = float(np.linalg.eigvalsh(obstacle_covs).max())
+    robot_max_eig = np.linalg.eigvalsh(robot_covs).max(axis=1)  # (G,)
+    k = min(n_neighbours, obstacle_means.shape[0])
 
     min_dist = np.inf
     argmin = None
@@ -269,23 +372,55 @@ def minimum_robot_environment_distance(robot, environment, trajectory):
     for t, q in enumerate(trajectory):
         robot_points = np.asarray(robot.collision_points(q), dtype=float).reshape(-1, 3)
 
-        # (n_robot_gaussians, n_obstacles)
-        distances = np.linalg.norm(
-            robot_points[:, None, :] - obstacle_means[None, :, :], axis=2
-        )
+        for g, p in enumerate(robot_points):
+            radius = sigma * (np.sqrt(obstacle_max_eig) + np.sqrt(robot_max_eig[g])) + 1e-3
+            idx = tree.query_ball_point(p, radius)
 
-        flat = int(np.argmin(distances))
-        i, j = np.unravel_index(flat, distances.shape)
-        d = float(distances[i, j])
+            if not idx:
+                _, nearest = tree.query(p, k=1)
+                idx = [int(nearest)]
+            elif len(idx) > k:
+                dists, order = tree.query(p, k=k)
+                idx = np.asarray(idx)[np.argsort(
+                    np.linalg.norm(obstacle_means[idx] - p, axis=1)
+                )[:k]].tolist()
 
-        if d < min_dist:
-            min_dist = d
-            argmin = {
-                "sample": t,
-                "robot_gaussian": int(i),
-                "obstacle": int(j),
-                "robot_point": robot_points[i],
-                "obstacle_point": obstacle_means[j],
-            }
+            idx = np.asarray(idx)
+            combined = obstacle_covs[idx] + robot_covs[g]  # (K, 3, 3)
+            eigvals, rots = np.linalg.eigh(combined)  # (K, 3), (K, 3, 3)
+            stds = np.sqrt(np.maximum(eigvals, 1e-12))
+
+            diff = p - obstacle_means[idx]  # (K, 3)
+            z = np.abs(np.einsum("kji,kj->ki", rots, diff))  # coords in principal axes
+            a = sigma * stds  # semi-axes of the combined ellipsoid
+
+            m = np.sqrt(((z / a) ** 2).sum(-1))
+            z_c, a2 = np.maximum(z, 1e-12), a ** 2
+            # Bracket of the root of f(s) = sum (a*z / (s + a^2))^2 - 1,
+            # decreasing in s (same construction as the paper eval).
+            lo = -a2.min(-1) + np.sqrt(a2.min(-1)) * np.take_along_axis(
+                z_c, a2.argmin(-1)[..., None], -1
+            )[..., 0]
+            hi = np.linalg.norm(a * z_c, axis=-1)
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                pos = (((a * z_c) / (mid[..., None] + a2)) ** 2).sum(-1) > 1.0
+                lo, hi = np.where(pos, mid, lo), np.where(pos, hi, mid)
+            dist = np.linalg.norm(z_c - a2 * z_c / (0.5 * (lo + hi)[..., None] + a2), axis=-1)
+            dist = np.where(m < 1.0, -(1.0 - m) * a.min(-1), dist)  # inside: penetration estimate
+
+            j_local = int(np.argmin(dist))
+            d = float(dist[j_local])
+
+            if d < min_dist:
+                obstacle_idx = int(idx[j_local])
+                min_dist = d
+                argmin = {
+                    "sample": t,
+                    "robot_gaussian": g,
+                    "obstacle": int(kept_indices[obstacle_idx]) if kept_indices is not None else obstacle_idx,
+                    "robot_point": p,
+                    "obstacle_point": obstacle_means[obstacle_idx],
+                }
 
     return min_dist, argmin

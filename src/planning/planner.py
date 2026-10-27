@@ -21,6 +21,12 @@ class Planner(BasePlanner):
     See BasePlanner for parameter documentation.
     """
 
+    # Safe here: unlike OnlinePlanner, obstacle means/covariances are fixed
+    # at construction and never baked per-call into the symbolic graph, so
+    # the built NLP and IPOPT solver can be reused across plan() calls --
+    # see BasePlanner._cache_built_problem.
+    _cache_built_problem = True
+
     def _build_problem(self) -> tuple:
         return build_problem(
             robot=self.robot,

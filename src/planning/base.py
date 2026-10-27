@@ -82,6 +82,21 @@ class BasePlanner(ABC):
         (nlp, lbg, ubg, callbacks).
         """
 
+    # Subclasses whose NLP structure never depends on call-time state can
+    # set this to True to build the NLP and IPOPT solver ONCE (on the first
+    # plan() call) and reuse them on every subsequent call instead of
+    # rebuilding from scratch each time -- start/goal only ever enter
+    # through the parameter vector `p` and the initial guess `x0`, both
+    # resolved at solve time, so the symbolic problem itself is identical
+    # across calls and reusing it changes nothing about the result.
+    #
+    # OnlinePlanner must NOT opt in: its _build_problem() re-queries
+    # environment.obstacle_means_at(k) and bakes those obstacle positions
+    # directly into the symbolic graph rather than passing them as a
+    # parameter, so a stale cached build would silently keep using
+    # wherever the obstacles were on the first call.
+    _cache_built_problem: bool = False
+
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
@@ -174,12 +189,20 @@ class BasePlanner(ABC):
         # --- Build optimisation problem -------------------------------
         build_start = perf_counter()
 
-        nlp, lbg, ubg, callbacks = self._build_problem()
-        self._casadi_callbacks = callbacks
+        cached = getattr(self, "_cached_problem", None)
 
-        solver = create_solver(
-            nlp, options={"ipopt.linear_solver": self.linear_solver}
-        )
+        if self._cache_built_problem and cached is not None:
+            nlp, lbg, ubg, callbacks, solver = cached
+        else:
+            nlp, lbg, ubg, callbacks = self._build_problem()
+            solver = create_solver(
+                nlp, options={"ipopt.linear_solver": self.linear_solver}
+            )
+
+            if self._cache_built_problem:
+                self._cached_problem = (nlp, lbg, ubg, callbacks, solver)
+
+        self._casadi_callbacks = callbacks
 
         build_time = perf_counter() - build_start
 
