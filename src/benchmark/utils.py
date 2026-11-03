@@ -295,6 +295,38 @@ def path_lengths(trajectories: dict) -> dict:
     return {name: path_length(trajectory) for name, trajectory in trajectories.items()}
 
 
+def _resample_by_arc_length(trajectory: np.ndarray, num_samples: int) -> np.ndarray:
+    """
+    Resample a polyline to `num_samples` points equally spaced BY ARC
+    LENGTH (not by index/parameter), matching the FOCI paper's
+    eval/baselines.py resampling before measuring clearance:
+
+        s = cumsum of consecutive-point distances
+        xyz = interp over linspace(0, s[-1], N_DENSE)
+
+    Unlike `resample_trajectory` (uniform in the parameter index -- fine
+    for a B-spline's own parameter, but not a substitute for this), this
+    makes the clearance check density-independent of how many points the
+    planner's native output happens to have.  The paper's curves are
+    task-space xyz; here `trajectory` is joint-space, so this resamples by
+    arc length in CONFIGURATION space -- the direct analogue, and correct
+    for the thing it feeds (robot.collision_points(q) is per-configuration
+    anyway, so there is no task-space curve to resample before that).
+    """
+    trajectory = np.asarray(trajectory, dtype=float)
+    seg_lengths = np.linalg.norm(np.diff(trajectory, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+
+    if s[-1] == 0.0:
+        return np.tile(trajectory[0], (num_samples, 1))
+
+    new_s = np.linspace(0.0, s[-1], num_samples)
+
+    return np.vstack(
+        [np.interp(new_s, s, trajectory[:, d]) for d in range(trajectory.shape[1])]
+    ).T
+
+
 def minimum_robot_environment_distance(
     robot,
     environment,
@@ -303,6 +335,8 @@ def minimum_robot_environment_distance(
     opacity_min: float = 0.5,
     sigma: float = 1.0,
     n_neighbours: int = 96,
+    num_dense_samples: int = 400,
+    include_robot_covariance: bool = True,
 ):
     """
     Smallest surface-to-surface clearance between any robot Gaussian and any
@@ -313,19 +347,28 @@ def minimum_robot_environment_distance(
     at an obstacle's 1-sigma boundary and one still a metre away could report
     the same number, since neither Gaussian's extent was taken into account.
 
-    The two Gaussians are combined via a Minkowski sum
-    (combined_cov = robot_cov + obstacle_cov), exactly matching the
-    obstacle-avoidance cost every planner in this repo already optimises
-    against (see ConvolutionFunctor's callers: problem.py, chomp_planner.py,
-    stomp_planner.py all build `obstacle_covariances + robot_covariances[g]`).
-    The reported distance is from the robot Gaussian's centre to the
-    `sigma`-level surface of that combined ellipsoid centred at the
-    obstacle's mean, found by bisection on the ellipsoid's principal axes
-    (ported from the FOCI paper's eval/baselines.py Environment class, which
-    only accounted for the obstacle's own extent since its baselines used a
-    fixed-radius sphere robot -- this generalises it to a robot Gaussian with
-    its own covariance).  A negative value means the robot centre is already
-    inside the combined ellipsoid (penetration estimate, not exact).
+    With `include_robot_covariance=True` (default), the two Gaussians are
+    combined via a Minkowski sum (combined_cov = robot_cov + obstacle_cov),
+    exactly matching the obstacle-avoidance cost every planner in this repo
+    already optimises against (see ConvolutionFunctor's callers: problem.py,
+    chomp_planner.py, stomp_planner.py all build
+    `obstacle_covariances + robot_covariances[g]`). The reported distance is
+    from the robot Gaussian's centre to the `sigma`-level surface of that
+    combined ellipsoid centred at the obstacle's mean, found by bisection on
+    the ellipsoid's principal axes. A negative value means the robot centre
+    is already inside the combined ellipsoid (penetration estimate, not
+    exact).
+
+    With `include_robot_covariance=False`, the robot's own extent is
+    dropped (combined_cov = obstacle_cov alone) -- this is what the FOCI
+    paper's eval/baselines.py Environment.surface_distance literally
+    measures: distance from the bare path centreline to the obstacle's
+    surface, with the robot's own size never subtracted from the reported
+    number at all (its baselines used a fixed-radius sphere robot whose
+    radius only ever fed the PLANNER's clearance constraint, never the
+    reported safety metric). True means a smaller (more conservative)
+    number than the paper's own metric would report for the same path --
+    set this False to replicate the paper's numbers exactly instead.
 
     `opacities`, when given (shape (n_obstacles,) or (n_obstacles, 1)),
     drops obstacles with opacity <= `opacity_min` before measuring, matching
@@ -338,8 +381,21 @@ def minimum_robot_environment_distance(
     over all obstacles at once, which does not extend to a per-obstacle
     bisection (60 iterations each) without becoming the triple Python loop
     this function was rewritten to avoid in the first place.
+
+    `trajectory` is resampled to `num_dense_samples` points equally spaced
+    BY ARC LENGTH (not by its native parameter index) before measuring,
+    matching the paper eval's N_DENSE=400 -- without this, a trajectory
+    with few native points could pass close to an obstacle BETWEEN two of
+    them without any sample ever landing near enough to detect it, and
+    different planners being compared at different native resolutions
+    (e.g. a 25-point FOCI/CHOMP output against a 12-point STOMP one) is not
+    even measuring them at the same density to begin with. This changes
+    the reported minimum vs reading it directly off a planner's own
+    coarse output -- it does not loosen or tighten any actual clearance.
     """
     from scipy.spatial import cKDTree
+
+    trajectory = _resample_by_arc_length(trajectory, num_dense_samples)
 
     obstacle_means = np.asarray(environment.obstacle_means, dtype=float)
     obstacle_covs = np.asarray(environment.obstacle_covariances, dtype=float)
@@ -386,7 +442,11 @@ def minimum_robot_environment_distance(
                 )[:k]].tolist()
 
             idx = np.asarray(idx)
-            combined = obstacle_covs[idx] + robot_covs[g]  # (K, 3, 3)
+            combined = (
+                obstacle_covs[idx] + robot_covs[g]
+                if include_robot_covariance
+                else obstacle_covs[idx]
+            )  # (K, 3, 3)
             eigvals, rots = np.linalg.eigh(combined)  # (K, 3), (K, 3, 3)
             stds = np.sqrt(np.maximum(eigvals, 1e-12))
 

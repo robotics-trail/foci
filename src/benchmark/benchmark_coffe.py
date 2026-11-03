@@ -163,13 +163,13 @@ def benchmark_coffee():
     # opacities=opacities drops near-transparent splats before measuring
     # clearance (opacity <= 0.5), matching the paper eval's OPACITY_MIN.
     foci_min_dist, info = minimum_robot_environment_distance(
-        robot, environment, foci_result.trajectory, opacities=opacities
+        robot, environment, foci_result.trajectory, opacities=opacities, include_robot_covariance=False
     )
     chomp_min_dist, info = minimum_robot_environment_distance(
-        robot, environment, chomp_result.trajectory, opacities=opacities
+        robot, environment, chomp_result.trajectory, opacities=opacities, include_robot_covariance=False
     )
     stomp_min_dist, info = minimum_robot_environment_distance(
-        robot, environment, stomp_result.trajectory, opacities=opacities
+        robot, environment, stomp_result.trajectory, opacities=opacities, include_robot_covariance=False
     )
 
     foci_path_length = path_length(foci_result.trajectory)

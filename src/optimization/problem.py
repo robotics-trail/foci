@@ -132,8 +132,21 @@ def build_problem(
     # --- Collision points --------------------------------------------
     q_sym = symbolic_type.sym("q", n_dof)
     n_gaussians = int(robot.collision_points(q_sym).shape[0])
+
+    # Robots whose collision geometry depends on acceleration (e.g. a
+    # standard drone's acceleration-coupled tilt) get the curve's own exact
+    # second derivative -- same family as acc_hulls below, but evaluated
+    # pointwise at each sample instead of bounded over a control interval.
+    if robot.requires_acceleration:
+        qdd_sym = symbolic_type.sym("qdd", n_dof)
+        ddcurve = time_scale ** 2 * bspline.spline_eval(num_samples, derivative_order=2)
+    else:
+        qdd_sym = None
+        ddcurve = None
+
     mapped_collision_points = build_collision_point_map(
-        robot, q_sym, n_gaussians, num_samples, curve
+        robot, q_sym, n_gaussians, num_samples, curve,
+        qdd_sym=qdd_sym, qdd_curve=ddcurve,
     )
 
     # --- Constraints -------------------------------------------------

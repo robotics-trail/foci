@@ -86,15 +86,15 @@ class MobileRobot(BaseRobot):
         """
         return cas.vertcat(q[0], q[1], self.body_center_height)
 
-    def forward_kinematics(self, q: Any) -> Any:
+    def forward_kinematics(self, q: Any, qdd: Any = None) -> Any:
         """
         For the mobile robot, FK is simply the collision points.
         """
         return self.collision_points(q)
 
-    def collision_points(self, q: Any) -> Any:
+    def collision_points(self, q: Any, qdd: Any = None) -> Any:
         """
-        Return world-frame Gaussian centers.
+        Return world-frame Gaussian centers. qdd is ignored (requires_acceleration = False).
 
         Shape:
             (n_gaussians, 3)
@@ -135,7 +135,7 @@ class MobileRobot(BaseRobot):
             axis=0,
         )
 
-    def collision_covariances_online(self, q):
+    def collision_covariances_online(self, q, qdd=None):
             yaw = q[2]
             
             c, s = cas.cos(yaw), cas.sin(yaw)

@@ -18,11 +18,19 @@ import time
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 from viser import ViserServer
 from viser.extras import ViserUrdf
 from yourdfpy import URDF
 
 from src.visualization.utils import EllipsoidFactory
+from src.robots.drone import DroneRobot, finite_difference_acceleration
+
+
+def _rotation_matrix_to_wxyz(R: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix -> quaternion in viser's (w, x, y, z) convention."""
+    x, y, z, w = Rotation.from_matrix(np.asarray(R, dtype=float)).as_quat()
+    return np.array([w, x, y, z])
 
 
 class RobotVisualizer:
@@ -33,6 +41,7 @@ class RobotVisualizer:
         follow_camera: bool = False,
         camera_offset: np.ndarray | None = None,
         camera_lookahead: float = 0.5,
+        duration: float | None = None,
     ):
         trajectory = np.asarray(trajectory, dtype=float)
 
@@ -51,6 +60,17 @@ class RobotVisualizer:
         self.robot = robot
 
         self.trajectory = trajectory
+
+        # Physical duration of the trajectory, needed to scale qdd (used by
+        # robots with requires_acceleration = True) into real units -- the
+        # unit-index-spacing fallback (duration=None) understates or
+        # overstates the tilt by whatever factor the real dt differs from 1.
+        self.duration = duration
+        self._qdd = (
+            finite_difference_acceleration(self.trajectory, dt=self._dt())
+            if getattr(robot, "requires_acceleration", False)
+            else None
+        )
 
         self.follow_camera = follow_camera
         self.camera_offset = (
@@ -104,9 +124,25 @@ class RobotVisualizer:
         #     self.server.initial_camera.look_at = target0
         
 
+    def _dt(self) -> float:
+        """
+        Seconds between consecutive trajectory samples, for scaling qdd into
+        real units. Falls back to unit index spacing (dt=1) when this
+        visualizer wasn't given the trajectory's physical duration -- that
+        fallback is almost always wrong by a large factor for robots with
+        requires_acceleration = True, so pass duration= when visualizing one.
+        """
+        if self.duration is None:
+            return 1.0
+        return self.duration / max(self.trajectory.shape[0] - 1, 1)
+
     def _compute_robot_gaussian_points(self) -> np.ndarray:
         """
         Evaluate robot.collision_points(q) for all trajectory samples.
+
+        For robots with requires_acceleration = True (e.g. a standard
+        drone), qdd is a finite-difference estimate over this trajectory --
+        a best-effort tilt for display, not a physically exact one.
 
         Returns
         -------
@@ -115,8 +151,9 @@ class RobotVisualizer:
         """
         all_points = []
 
-        for q in self.trajectory:
-            points = self.robot.collision_points(q)
+        for t, q in enumerate(self.trajectory):
+            qdd = self._qdd[t] if self._qdd is not None else None
+            points = self.robot.collision_points(q, qdd)
 
             if hasattr(points, "full"):
                 points = points.full()
@@ -315,7 +352,7 @@ class RobotVisualizer:
 
             q = self.trajectory[sample_idx]
 
-            self._update_robot(q)
+            self._update_robot(q, sample_idx)
             self._update_robot_gaussians(sample_idx)
             self._update_camera(sample_idx)
 
@@ -329,7 +366,7 @@ class RobotVisualizer:
                 else:
                     break
 
-    def _update_robot(self, q: np.ndarray):
+    def _update_robot(self, q: np.ndarray, sample_idx: int):
         """
         Update URDF if available.
 
@@ -340,17 +377,14 @@ class RobotVisualizer:
             return
 
         robot_type = self.robot.__class__.__name__
-        
-        if robot_type == "DroneRobot":
-            x, y, z, yaw = q
 
-            self.robot_frame.position = np.array([x, y, z])
-            self.robot_frame.wxyz = np.array([
-                np.cos(yaw / 2.0),
-                0.0,
-                0.0,
-                np.sin(yaw / 2.0),
-            ])
+        if isinstance(self.robot, DroneRobot):
+            qdd = self._qdd[sample_idx] if self._qdd is not None else None
+
+            self.robot_frame.position = np.array([q[0], q[1], q[2]])
+            self.robot_frame.wxyz = _rotation_matrix_to_wxyz(
+                np.asarray(self.robot._body_rotation(q, qdd), dtype=float)
+            )
 
             self.viser_urdf.update_cfg(self.urdf.zero_cfg)
 
@@ -471,6 +505,7 @@ class RobotVisualizerOnline:
         follow_camera: bool = False,
         camera_offset: np.ndarray | None = None,
         camera_lookahead: float = 0.5,
+        duration: float | None = None,
     ):
         trajectory = np.asarray(trajectory, dtype=float)
 
@@ -489,6 +524,17 @@ class RobotVisualizerOnline:
         self.robot = robot
 
         self.trajectory = trajectory
+
+        # Physical duration of the trajectory, needed to scale qdd (used by
+        # robots with requires_acceleration = True) into real units -- the
+        # unit-index-spacing fallback (duration=None) understates or
+        # overstates the tilt by whatever factor the real dt differs from 1.
+        self.duration = duration
+        self._qdd = (
+            finite_difference_acceleration(self.trajectory, dt=self._dt())
+            if getattr(robot, "requires_acceleration", False)
+            else None
+        )
 
         self.follow_camera = follow_camera
         self.camera_offset = (
@@ -544,9 +590,25 @@ class RobotVisualizerOnline:
         #     self.server.initial_camera.look_at = target0
         
 
+    def _dt(self) -> float:
+        """
+        Seconds between consecutive trajectory samples, for scaling qdd into
+        real units. Falls back to unit index spacing (dt=1) when this
+        visualizer wasn't given the trajectory's physical duration -- that
+        fallback is almost always wrong by a large factor for robots with
+        requires_acceleration = True, so pass duration= when visualizing one.
+        """
+        if self.duration is None:
+            return 1.0
+        return self.duration / max(self.trajectory.shape[0] - 1, 1)
+
     def _compute_robot_gaussian_points(self) -> np.ndarray:
         """
         Evaluate robot.collision_points(q) for all trajectory samples.
+
+        For robots with requires_acceleration = True (e.g. a standard
+        drone), qdd is a finite-difference estimate over this trajectory --
+        a best-effort tilt for display, not a physically exact one.
 
         Returns
         -------
@@ -555,8 +617,9 @@ class RobotVisualizerOnline:
         """
         all_points = []
 
-        for q in self.trajectory:
-            points = self.robot.collision_points(q)
+        for t, q in enumerate(self.trajectory):
+            qdd = self._qdd[t] if self._qdd is not None else None
+            points = self.robot.collision_points(q, qdd)
 
             if hasattr(points, "full"):
                 points = points.full()
@@ -566,11 +629,12 @@ class RobotVisualizerOnline:
 
         return np.stack(all_points, axis=0)
 
-    def _compute_robot_gaussian_covariances(self) -> np.ndarray: 
+    def _compute_robot_gaussian_covariances(self) -> np.ndarray:
         all_covariances = []
 
-        for q in self.trajectory: 
-            covs = self.robot.collision_covariances_online(q)
+        for t, q in enumerate(self.trajectory):
+            qdd = self._qdd[t] if self._qdd is not None else None
+            covs = self.robot.collision_covariances_online(q, qdd)
 
             if hasattr(covs, "full"):
                 covs = covs.full()
@@ -850,7 +914,7 @@ class RobotVisualizerOnline:
 
             q = self.trajectory[sample_idx]
 
-            self._update_robot(q)
+            self._update_robot(q, sample_idx)
             self._update_robot_gaussians(sample_idx)
             self._update_obstacles(sample_idx)
             self._update_camera(sample_idx)
@@ -865,7 +929,7 @@ class RobotVisualizerOnline:
                 else:
                     break
 
-    def _update_robot(self, q: np.ndarray):
+    def _update_robot(self, q: np.ndarray, sample_idx: int):
         """
         Update URDF if available.
 
@@ -876,17 +940,14 @@ class RobotVisualizerOnline:
             return
 
         robot_type = self.robot.__class__.__name__
-        
-        if robot_type == "DroneRobot":
-            x, y, z, yaw = q
 
-            self.robot_frame.position = np.array([x, y, z])
-            self.robot_frame.wxyz = np.array([
-                np.cos(yaw / 2.0),
-                0.0,
-                0.0,
-                np.sin(yaw / 2.0),
-            ])
+        if isinstance(self.robot, DroneRobot):
+            qdd = self._qdd[sample_idx] if self._qdd is not None else None
+
+            self.robot_frame.position = np.array([q[0], q[1], q[2]])
+            self.robot_frame.wxyz = _rotation_matrix_to_wxyz(
+                np.asarray(self.robot._body_rotation(q, qdd), dtype=float)
+            )
 
             self.viser_urdf.update_cfg(self.urdf.zero_cfg)
 

@@ -7,6 +7,83 @@ import numpy as np
 from .base import BaseRobot
 
 
+def _quat_mul(q1: Any, q2: Any) -> Any:
+    """Hamilton product q1 * q2, both [w, x, y, z] (scalar-first)."""
+    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+    return cas.vertcat(
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def _quat_to_rot(q: Any) -> Any:
+    """Rotation matrix from unit quaternion q = [w, x, y, z]."""
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    return cas.vertcat(
+        cas.horzcat(1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)),
+        cas.horzcat(2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+        cas.horzcat(2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)),
+    )
+
+
+def _rotation_matrix_from_acceleration(a: Any, yaw: Any, g: float = 9.81) -> Any:
+    """
+    Rotation matrix R_b^w of a standard (underactuated) multirotor from its
+    commanded horizontal acceleration and yaw.
+
+    a:   3-vector (ax, ay, az), the body's commanded world-frame acceleration.
+    yaw: yaw angle [rad].
+    g:   gravity magnitude [m/s^2].
+
+    The airframe tilts so that its thrust axis points along
+    xi = a + [0, 0, g] (the only direction a single rotor-thrust axis can
+    produce that acceleration), then spins about that axis by yaw. a = 0
+    (level flight) makes xi = [0, 0, g], the tilt quaternion collapses to the
+    identity, and this reduces exactly to a yaw-only rotation.
+    """
+    xi = cas.vertcat(a[0], a[1], a[2] + g)
+    xin = xi / cas.norm_2(xi)
+
+    # Hopf-fibration tilt quaternion (scalar-first); 1/sqrt(2(1+xin_z)) makes
+    # it unit-norm analytically, no extra normalization needed. Guarded
+    # against xin_z -> -1 (free-fall straight down), where the tilt is
+    # undefined.
+    wx = cas.fmax(1.0 + xin[2], 1e-6)
+    q_xi = cas.vertcat(wx, -xin[1], xin[0], 0.0) / cas.sqrt(2.0 * wx)
+
+    q_psi = cas.vertcat(cas.cos(yaw / 2), 0.0, 0.0, cas.sin(yaw / 2))
+
+    q_bw = _quat_mul(q_xi, q_psi)
+    return _quat_to_rot(q_bw)
+
+
+def finite_difference_acceleration(trajectory: np.ndarray, dt: float = 1.0) -> np.ndarray:
+    """
+    Central-difference acceleration estimate for a finished (q over time)
+    trajectory array, shape (num_samples, n_dof) in, same shape out.
+
+    Endpoints reuse their nearest interior estimate (one-sided differences
+    would otherwise need a 4th point). This is a best-effort estimate for
+    evaluating an already-produced trajectory (visualization, metrics) -- not
+    for differentiating through an optimizer, where it would need to account
+    for every sample's coupling to its neighbours.
+    """
+    trajectory = np.asarray(trajectory, dtype=float)
+    num_samples = trajectory.shape[0]
+
+    if num_samples < 3:
+        return np.zeros_like(trajectory)
+
+    accel = np.zeros_like(trajectory)
+    accel[1:-1] = (trajectory[2:] - 2.0 * trajectory[1:-1] + trajectory[:-2]) / dt**2
+    accel[0] = accel[1]
+    accel[-1] = accel[-2]
+    return accel
+
+
 @dataclass(frozen=True)
 class DroneGaussian:
     """
@@ -46,7 +123,7 @@ class DroneGaussian:
 
 class DroneRobot(BaseRobot):
     """
-    Drone model with state:
+    Omnidirectional drone model with state:
 
         q = [x, y, z, yaw]
 
@@ -56,6 +133,13 @@ class DroneRobot(BaseRobot):
     - center
     - left arm endpoint
     - right arm endpoint
+
+    Fully-actuated / omnidirectional: xyz translation and yaw are
+    independent actuator channels (e.g. a tilt-rotor hex/octocopter), so the
+    body never needs to tilt to accelerate -- collision geometry only ever
+    rotates about z, with the world-frame qdd ignored. See
+    StandardDroneRobot for an underactuated multirotor, whose roll/pitch
+    follow its commanded acceleration instead.
     """
 
     def __init__(
@@ -91,38 +175,43 @@ class DroneRobot(BaseRobot):
         """
         return cas.vertcat(q[0], q[1], q[2])
 
-    def forward_kinematics(self, q: Any) -> Any:
+    def forward_kinematics(self, q: Any, qdd: Any = None) -> Any:
         """
         For the drone, FK is simply the collision points.
         """
-        return self.collision_points(q)
+        return self.collision_points(q, qdd)
 
-    def collision_points(self, q: Any) -> Any:
+    def _body_rotation(self, q: Any, qdd: Any = None) -> Any:
+        """
+        World-frame rotation matrix R_b^w of the body, used for both
+        collision_points and collision_covariances_online so the two always
+        agree. qdd is ignored: an omnidirectional drone's body never tilts,
+        it only ever spins about z.
+        """
+        yaw = q[3]
+        c, s = cas.cos(yaw), cas.sin(yaw)
+        return cas.vertcat(
+            cas.horzcat(c, -s, 0),
+            cas.horzcat(s, c, 0),
+            cas.horzcat(0, 0, 1),
+        )
+
+    def collision_points(self, q: Any, qdd: Any = None) -> Any:
         """
         Return world-frame Gaussian centers.
+
+        qdd is ignored: an omnidirectional drone's body never tilts.
 
         Shape:
             (n_gaussians, 3)
         """
-        x, y, z, yaw = q[0], q[1], q[2], q[3]
-
-        c = cas.cos(yaw)
-        s = cas.sin(yaw)
-
-        center = cas.vertcat(x, y, z)
+        center = cas.vertcat(q[0], q[1], q[2])
+        R = self._body_rotation(q, qdd)
 
         points = []
 
         for spec in self.gaussian_specs:
-            ox, oy, oz = spec.offset
-
-            # Rotation around z-axis.
-            world_offset = cas.vertcat(
-                c * ox - s * oy,
-                s * ox + c * oy,
-                oz,
-            )
-
+            world_offset = R @ cas.DM(spec.offset)
             point = center + world_offset
             points.append(point.T)
 
@@ -140,17 +229,10 @@ class DroneRobot(BaseRobot):
             axis=0,
         )
 
-    def collision_covariances_online(self, q: Any) -> Any: 
+    def collision_covariances_online(self, q: Any, qdd: Any = None) -> Any:
+        """qdd is ignored: an omnidirectional drone's body never tilts."""
 
-        yaw = q[3]
-
-        c, s = cas.cos(yaw), cas.sin(yaw)
-        R = cas.vertcat(
-            cas.horzcat(c, -s, 0), 
-            cas.horzcat(s, c, 0), 
-            cas.horzcat(0, 0, 1), 
-        )
-
+        R = self._body_rotation(q, qdd)
         covs = []
 
         for spec in self.gaussian_specs: 
@@ -221,3 +303,42 @@ class DroneRobot(BaseRobot):
             parsed.append(gaussian)
 
         return parsed
+
+
+class StandardDroneRobot(DroneRobot):
+    """
+    Standard (underactuated) multirotor with the same state as DroneRobot:
+
+        q = [x, y, z, yaw]
+
+    Unlike DroneRobot, horizontal translation here is only achievable by
+    tilting the airframe: a single thrust axis can't produce an arbitrary
+    xyz acceleration on its own, so roll/pitch aren't free -- they're
+    whatever the commanded acceleration (plus gravity) and yaw require. See
+    _rotation_matrix_from_acceleration.
+
+    collision_points/collision_covariances_online therefore take an optional
+    qdd (the acceleration at this q): when it's available (e.g. the FOCI
+    NLP's own spline second derivative, or a finite-difference estimate from
+    a finished trajectory) the body tilts accordingly; when it's None (e.g.
+    the RRT* initializer, which only ever sees one configuration at a time
+    with no derivative context) this falls back to level flight -- the same
+    yaw-only rotation as DroneRobot.
+    """
+
+    requires_acceleration = True
+
+    def __init__(self, *args, g: float = 9.81, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.g = float(g)
+
+    def _body_rotation(self, q: Any, qdd: Any = None) -> Any:
+        """
+        World-frame rotation matrix, tilted by the acceleration implied by
+        qdd (its first 3 components; yaw'' plays no role here). qdd = None
+        falls back to a = 0 (level flight), identical to DroneRobot's
+        yaw-only rotation -- see _rotation_matrix_from_acceleration.
+        """
+        yaw = q[3]
+        a = qdd[0:3] if qdd is not None else cas.DM.zeros(3)
+        return _rotation_matrix_from_acceleration(a, yaw, self.g)

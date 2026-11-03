@@ -187,13 +187,29 @@ def estimate_duration(goal, start_task, vmax: float):
     return cas.fmax(duration, 1e-3)
 
 
-def build_collision_point_map(robot, q_sym, n_gaussians: int, num_samples: int, curve):
+def build_collision_point_map(
+    robot, q_sym, n_gaussians: int, num_samples: int, curve,
+    qdd_sym=None, qdd_curve=None,
+):
     """Map robot.collision_points over all samples in parallel.
+
+    qdd_sym/qdd_curve are only passed for robots with requires_acceleration =
+    True (e.g. StandardDroneRobot): qdd_curve is the curve's own second
+    derivative, sampled the same way as curve, so the mapped function gets
+    the exact per-sample acceleration alongside each q.
 
     Returns
     -------
     mapped_collision_points : shape (3*n_gaussians, num_samples)
     """
+    if qdd_sym is not None:
+        collision_points_raw = robot.collision_points(q_sym, qdd_sym)
+        collision_points_vec = cas.reshape(collision_points_raw.T, 3 * n_gaussians, 1)
+
+        collision_fun = cas.Function("collision_points", [q_sym, qdd_sym], [collision_points_vec])
+        collision_map = collision_fun.map(num_samples, "openmp")
+        return collision_map(curve.T, qdd_curve.T)
+
     collision_points_raw = robot.collision_points(q_sym)          # (n_gaussians, 3)
     collision_points_vec = cas.reshape(collision_points_raw.T, 3 * n_gaussians, 1)
 

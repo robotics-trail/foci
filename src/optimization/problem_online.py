@@ -71,13 +71,30 @@ def _flatten_covariances_row_major(covs_raw, n_gaussians: int):
     )
 
 
-def _build_collision_cov_map(robot, q_sym, n_gaussians: int, num_samples: int, curve):
+def _build_collision_cov_map(
+    robot, q_sym, n_gaussians: int, num_samples: int, curve,
+    qdd_sym=None, qdd_curve=None,
+):
     """Map robot.collision_covariances_online over all samples in parallel.
+
+    qdd_sym/qdd_curve are only passed for robots with requires_acceleration =
+    True (e.g. StandardDroneRobot): a non-spherical robot Gaussian must
+    rotate with the body, and for an underactuated drone the body's
+    orientation itself depends on its acceleration -- see
+    collision_covariances_online. Mirrors build_collision_point_map.
 
     Returns
     -------
     mapped_collision_covs : shape (9*n_gaussians, num_samples)
     """
+    if qdd_sym is not None:
+        covs_raw = robot.collision_covariances_online(q_sym, qdd_sym)
+        covs_vec = _flatten_covariances_row_major(covs_raw, n_gaussians)
+
+        covs_fun = cas.Function("collision_covs", [q_sym, qdd_sym], [covs_vec])
+        covs_map = covs_fun.map(num_samples, "openmp")
+        return covs_map(curve.T, qdd_curve.T)
+
     covs_raw = robot.collision_covariances_online(q_sym)
     covs_vec = _flatten_covariances_row_major(covs_raw, n_gaussians)
 
@@ -212,11 +229,23 @@ def build_problem(
     q_sym = symbolic_type.sym("q", n_dof)
     n_gaussians = int(robot.collision_points(q_sym).shape[0])
 
+    # Robots whose collision geometry depends on acceleration (e.g. a
+    # standard drone's acceleration-coupled tilt) get the curve's own exact
+    # second derivative, same as the static build_problem.
+    if robot.requires_acceleration:
+        qdd_sym = symbolic_type.sym("qdd", n_dof)
+        ddcurve = time_scale ** 2 * bspline.spline_eval(num_samples, derivative_order=2)
+    else:
+        qdd_sym = None
+        ddcurve = None
+
     mapped_collision_points = build_collision_point_map(
-        robot, q_sym, n_gaussians, num_samples, curve
+        robot, q_sym, n_gaussians, num_samples, curve,
+        qdd_sym=qdd_sym, qdd_curve=ddcurve,
     )
     mapped_collision_covs = _build_collision_cov_map(
-        robot, q_sym, n_gaussians, num_samples, curve
+        robot, q_sym, n_gaussians, num_samples, curve,
+        qdd_sym=qdd_sym, qdd_curve=ddcurve,
     )
 
     # --- Constraints -------------------------------------------------

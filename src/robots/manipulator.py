@@ -163,7 +163,7 @@ class URDFBackend:
 
         return cas.vertcat(*positions)
 
-    def forward_kinematics(self, q: Any) -> Any:
+    def forward_kinematics(self, q: Any, qdd: Any = None) -> Any:
         """
         Return flattened vector:
 
@@ -380,9 +380,10 @@ class ManipulatorRobot(BaseRobot):
         """
         return self.urdf_backend.end_effector_position(q)
 
-    def collision_points(self, q: Any) -> Any:
+    def collision_points(self, q: Any, qdd: Any = None) -> Any:
         """
-        Return user-defined Gaussian collision points.
+        Return user-defined Gaussian collision points. qdd is ignored
+        (requires_acceleration = False).
 
         Shape:
             (n_gaussians, 3)
@@ -405,7 +406,7 @@ class ManipulatorRobot(BaseRobot):
 
         return cas.vertcat(*points)
 
-    def forward_kinematics(self, q: Any) -> Any:
+    def forward_kinematics(self, q: Any, qdd: Any = None) -> Any:
         """
         Return flattened FK vector from the URDF backend.
         """
@@ -424,7 +425,7 @@ class ManipulatorRobot(BaseRobot):
             axis=0,
         )
 
-    def collision_covariances_online(self, q):
+    def collision_covariances_online(self, q, qdd=None):
 
         links = self.urdf_backend.links
         covs = []
