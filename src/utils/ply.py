@@ -9,9 +9,12 @@ def extract_splat_data(ply_file):
     plydata = ply.PlyData.read(ply_file)
     splat = plydata['vertex']
     
-    means = np.vstack([splat['x'], splat['y'], splat['z']]).T
+    # np.vstack(...).T is a transpose, so it's F-contiguous, not C-contiguous.
+    # viser's add_gaussian_splats reinterprets centers' raw bytes
+    # (.view(np.uint8)), which requires a C-contiguous last axis.
+    means = np.ascontiguousarray(np.vstack([splat['x'], splat['y'], splat['z']]).T)
     covs = np.array([np.eye(3) for _ in range(len(splat))])
-    colors = np.vstack([splat['red'], splat['green'], splat['blue']]).T / 255.0
+    colors = np.ascontiguousarray(np.vstack([splat['red'], splat['green'], splat['blue']]).T / 255.0)
     opacities = np.ones((len(splat), 1))
 
     return means, covs, colors, opacities
