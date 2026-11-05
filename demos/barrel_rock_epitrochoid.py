@@ -19,21 +19,39 @@ from src.visualization.visualizer import RobotVisualizerOnline
 # cap each at this many Gaussians so viser can render the scene smoothly.
 TARGET_MAX_POINTS = 80_000
 
-N_BARRELS = 5
+N_BARRELS = 7
 BARREL_SIZE_FRACTION = 0.10   # barrel size relative to the rock's size
 ROCK_SCALE = 2.2              # enlarge the rock beyond its raw captured size
-ORBIT_CLEARANCE = 0.4         # extra radius added beyond the rock's footprint
-ORBIT_SWEEP = np.radians(70)  # how far each barrel travels along its epitrochoid during the flight
+ORBIT_CLEARANCE = 0.25        # extra radius added beyond the rock's footprint
+ORBIT_SWEEP = np.radians(130) # how far each barrel travels along its epitrochoid during the flight
 
-# Per-barrel variety, indexed by i = 0..N_BARRELS-1, so flying straight over
-# everything at a single altitude is no longer an option: each barrel sits at
-# its own height and follows its own epitrochoid (its own orbit radius, lobe
-# count, loop sharpness and sweep direction).
-BARREL_HEIGHT_FRACTIONS = np.linspace(0.15, 1.1, N_BARRELS)   # fraction of the rock's height
-BARREL_RADIUS_FACTORS = np.linspace(0.8, 1.3, N_BARRELS)      # fraction of the base orbit radius
-BARREL_LOBES = 3 + np.arange(N_BARRELS)                       # R/r ratio -> number of lobes
-BARREL_LOOPINESS = np.linspace(0.3, 0.7, N_BARRELS)           # d/r ratio -> loop sharpness
-BARREL_SWEEP_SIGNS = np.where(np.arange(N_BARRELS) % 2 == 0, 1.0, -1.0)
+# Four barrels sit at the four corners of a rhombus around the rock --
+# front/back on the start -> goal line (so the drone meets one right after
+# takeoff and the other right before reaching the goal) and left/right
+# pulled closer to each other, completing the rhombus. Three more barrels
+# fly well above the rest: one right over the rhombus's center, one over
+# its back-left corner, one over its front-right corner. Each barrel still
+# moves on its own small epitrochoid loop around its spot (its own lobe
+# count, loop sharpness and sweep direction) instead of sitting still.
+BARREL_LINE_MARGIN = 1.95      # distance from the rock's edge to each barrel's loop center
+BARREL_SIDE_FACTOR = 0.55      # left/right barrels pulled closer together than front/back -> rhombus, not a square
+HIGH_BARREL_SPREAD = 0.4       # how far the back-left/front-right "above" barrels sit from the center one -> the three stay close together
+BARREL_LOOP_RADIUS = 0.55      # size of each barrel's local epitrochoid loop
+HIGH_BARREL_HEIGHT_FRACTION = 2.15 # shared height of the three "above" barrels (fraction of the rock's height)
+BARREL_HEIGHT_FRACTIONS = np.array([
+    0.9, 0.65, 0.775, 0.775,                                   # front, back, left, right
+    HIGH_BARREL_HEIGHT_FRACTION, HIGH_BARREL_HEIGHT_FRACTION, HIGH_BARREL_HEIGHT_FRACTION,  # center, back-left, front-right -- all above
+])
+
+# Randomized (fixed seed, so the scene is still reproducible) per-barrel loop
+# shape instead of a smooth progression -- lobe count, loop sharpness,
+# starting phase and sweep direction all vary unevenly, so the barrels don't
+# look like they're all tracing the same loop a beat apart.
+_barrel_rng = np.random.default_rng(42)
+BARREL_LOBES = _barrel_rng.integers(3, 9, size=N_BARRELS)             # R/r ratio -> number of lobes
+BARREL_LOOPINESS = _barrel_rng.uniform(0.3, 0.8, size=N_BARRELS)      # d/r ratio -> loop sharpness
+BARREL_PHASE = _barrel_rng.uniform(0.0, 2 * np.pi, size=N_BARRELS)    # starting angle along each barrel's loop
+BARREL_SWEEP_SIGNS = _barrel_rng.choice([-1.0, 1.0], size=N_BARRELS)
 
 NUM_SAMPLES = 24
 
@@ -50,7 +68,7 @@ POINT_SIGMA = 0.01
 # covariance when approximating a splat as a single Gaussian obstacle for
 # planning -- otherwise the optimizer would see a "safe" region that is
 # actually still inside the object.
-OBSTACLE_INFLATION = 3.0
+OBSTACLE_INFLATION = 3.5
 
 
 def _splat_size(means: np.ndarray) -> float:
@@ -152,8 +170,6 @@ def barrel_rock_epitrochoid_demo():
     )
     rock_height = float(rock_means[:, 2].max())
 
-    base_orbit_R = rock_half_extent_xy + ORBIT_CLEARANCE
-
     # --- Simplified Gaussian obstacles for planning (the dense splats above
     # are for display only -- far too many points to hand to the online
     # planner directly). ---
@@ -163,21 +179,37 @@ def barrel_rock_epitrochoid_demo():
 
     barrel_obstacle_mean_local, barrel_obstacle_cov = _fit_obstacle_gaussian(barrel_means)
 
+    line_offset = rock_half_extent_xy + ORBIT_CLEARANCE + BARREL_LINE_MARGIN
+    side_offset = line_offset * BARREL_SIDE_FACTOR
+    # Front/back stay on the start -> goal line; left/right are pulled closer
+    # to each other, so the four barrels form a rhombus around the rock
+    # instead of a square. The three "above" barrels sit near the rhombus's
+    # center -- the back-left/front-right ones pulled in by HIGH_BARREL_SPREAD
+    # so all three stay close together -- their height (in
+    # BARREL_HEIGHT_FRACTIONS) is what places them above the rest.
+    barrel_square_centers = np.array([
+        [-line_offset, 0.0],                                         # front
+        [line_offset, 0.0],                                          # back
+        [0.0, -side_offset],                                         # left
+        [0.0, side_offset],                                          # right
+        [0.0, 0.0],                                                  # center, above
+        [line_offset * HIGH_BARREL_SPREAD, -side_offset * HIGH_BARREL_SPREAD],  # back-left, above
+        [-line_offset * HIGH_BARREL_SPREAD, side_offset * HIGH_BARREL_SPREAD],  # front-right, above
+    ])
+
     barrel_base_xyz = []
     barrel_trajectories = []
     barrel_obstacles = []
-    max_orbit_reach = 0.0
 
     for i in range(N_BARRELS):
-        orbit_R = base_orbit_R * float(BARREL_RADIUS_FACTORS[i])
-        orbit_r = orbit_R / float(BARREL_LOBES[i])
+        orbit_r = BARREL_LOOP_RADIUS / float(BARREL_LOBES[i])
         orbit_d = orbit_r * float(BARREL_LOOPINESS[i])
         height = float(BARREL_HEIGHT_FRACTIONS[i]) * rock_height
 
-        theta0 = i * 2.0 * np.pi / N_BARRELS
         sweep = float(BARREL_SWEEP_SIGNS[i]) * ORBIT_SWEEP
-        thetas = theta0 + np.linspace(0.0, sweep, NUM_SAMPLES)
-        xy = np.array([_epitrochoid_point(theta, orbit_R, orbit_r, orbit_d) for theta in thetas])
+        thetas = float(BARREL_PHASE[i]) + np.linspace(0.0, sweep, NUM_SAMPLES)
+        xy = np.array([_epitrochoid_point(theta, BARREL_LOOP_RADIUS, orbit_r, orbit_d) for theta in thetas])
+        xy += barrel_square_centers[i]
 
         base_xyz = np.array([xy[0, 0], xy[0, 1], height])
         trajectory = np.column_stack([xy[:, 0] - xy[0, 0], xy[:, 1] - xy[0, 1], np.zeros(NUM_SAMPLES)])
@@ -187,7 +219,6 @@ def barrel_rock_epitrochoid_demo():
         barrel_obstacles.append(
             MobileObstacle(barrel_obstacle_mean_local + base_xyz, barrel_obstacle_cov, trajectory)
         )
-        max_orbit_reach = max(max_orbit_reach, orbit_R + orbit_r + orbit_d)
 
     environment = GaussianEnvironmentOnline(obstacles=[rock_obstacle] + barrel_obstacles)
 
@@ -210,28 +241,32 @@ def barrel_rock_epitrochoid_demo():
         num_control_points=12,
         num_samples=NUM_SAMPLES,
         weights={
-            "goal": 10.0,
-            "obstacle": 2.0,
-            "jerk": 0.01,
-            "virtual_jerk": 0.01,
+            "goal": 8.0,
+            "obstacle": 4.5,
+            "jerk": 0.03,
+            "virtual_jerk": 0.05,
         },
         vmax=2.0,
         linear_solver="mumps",
     )
 
-    # Start and goal sit on opposite sides of the rock, beyond the widest
-    # barrel orbit, at the obstacle course's median height -- cruising
-    # straight across at that altitude runs into the rock and several
-    # barrels, so the drone actually has to weave between them.
-    flight_radius = max_orbit_reach + 1.0
-    flight_height = 0.5 * rock_height
-    start = np.array([-flight_radius, 0.0, flight_height, 0.0])
+    # Start and goal sit on opposite sides of the rock, beyond both barrel
+    # loops, at the obstacle course's median height -- cruising straight
+    # across at that altitude runs into the rock and both barrels, so the
+    # drone actually has to weave between them.
+    flight_radius = line_offset + BARREL_LOOP_RADIUS + 1.4
+    flight_height = 0.7 * rock_height
+    # Start noticeably above the median course height so the drone can't just
+    # duck under the rock and barrels at a low, trivial altitude -- it has to
+    # come down into the obstacle course to reach the goal.
+    start_height = 1.1 * rock_height
+    start = np.array([-flight_radius, 0.0, start_height, 0.0])
     goal = np.array([flight_radius, 0.0, flight_height])
 
     result = planner.plan(start=start, goal=goal)
     duration = max(float(np.linalg.norm(goal - start[:3])) / planner.vmax, 1e-3)
 
-    print(f"\n--- StandardDroneRobot through the rock + {N_BARRELS}-barrel epitrochoid ring ---")
+    print(f"\n--- StandardDroneRobot through the rock + {N_BARRELS} barrels on the flight line ---")
     print(f"Success: {result.success}  ({result.solver_stats.get('return_status')})")
     print(f"Solve time: {result.timings['solve']:.3f} s")
 
