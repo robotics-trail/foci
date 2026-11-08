@@ -18,16 +18,17 @@ FOCI is a novel method to compute orientation aware trajectories for robots usin
 
 ## Authors
 
-- Mario Gomez Andreu\*^1
-- Maximum Wilder-Smith\*1
-- Victor Klemm1
-- Vaishakh Patil1
-- Jesus Tordesillas2
-- Marco Hutter1
+- Mario Gomez Andreu\*<sup>1</sup>
+- Carlos Martínez\*<sup>2</sup>
+- Maximum Wilder-Smith\*<sup>1</sup>
+- Victor Klemm<sup>1</sup>
+- Vaishakh Patil<sup>1</sup>
+- Jesus Tordesillas<sup>2</sup>
+- Marco Hutter<sup>1</sup>
 
-\*Equal contribution  
-1 Robotic Systems Lab, ETH Zurich  
-2 Comillas Pontifical University
+\*Equal contribution
+<br><sup>1</sup> Robotic Systems Lab, ETH Zurich
+<br><sup>2</sup> Comillas Pontifical University
 
 ## Citation
 
