@@ -32,7 +32,7 @@ FOCI is a novel method to compute orientation aware trajectories for robots usin
 
 ## Citation
 
-When using FOCI, please cite [MADER: Trajectory Planner in Multi-Agent and Dynamic Environments](https://arxiv.org/abs/2010.11061) ([pdf](https://arxiv.org/abs/2010.11061), [video](https://www.youtube.com/watch?v=aoSoiZDfxGE)):
+When using FOCI, please cite [TODO]
 
 ```bibtex
 @misc{andreu2025focitrajectoryoptimizationgaussian,
@@ -51,10 +51,6 @@ When using FOCI, please cite [MADER: Trajectory Planner in Multi-Agent and Dynam
       title={FOCI: Trajectory Optimization on Gaussian Splats for Gaussian Robots}, 
       author={Mario Gomez Andreu and Carlos MartÍnez Cuenca and Maximum Wilder-Smith and Victor Klemm and Vaishakh Patil and Jesus Tordesillas and Marco Hutter},
       year={2026},
-      #eprint={2505.08510},
-      #archivePrefix={arXiv},
-      #primaryClass={cs.RO},
-      #url={https://arxiv.org/abs/2505.08510}
 }
 ```
 
